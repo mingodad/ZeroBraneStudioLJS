@@ -1,0 +1,334 @@
+// Copyright 2006-2016 Mitchell mitchell.att.foicica.com. See LICENSE.
+// AWK LPeg lexer.
+// Modified by Wolfgang Seeberg 2012, 2013.
+
+var l = require('lexer');
+var token, word_match = l.token, l.word_match;
+var P, R, S = lpeg.P, lpeg.R, lpeg.S;
+
+var M = {_NAME = 'awk'};
+
+var LEFTBRACKET = '[';
+var RIGHTBRACKET = ']';
+var SLASH = '/';
+var BACKSLASH = '\\';
+var CARET = '^';
+var CR = '\r';
+var LF = '\n';
+var CRLF = CR .. LF;
+var DQUOTE = '"';
+var DELIMITER_MATCHES = {['('] = ')', ['['] = ']'};
+var COMPANION = {['('] = '[', ['['] = '('};
+var CC = {
+  alnum = 1, alpha = 1, blank = 1, cntrl = 1, digit = 1, graph = 1, lower = 1,
+  print = 1, punct = 1, space = 1, upper = 1, xdigit = 1
+};
+var LastRegexEnd = 0;
+var BackslashAtCommentEnd = 0;
+var KW_BEFORE_RX = {
+  case = 1, ['do'] = 1, ['else'] = 1, exit = 1, print = 1, printf = 1,
+  ['return'] = 1
+};
+
+var function findKeyword(input, e) {
+  var i = e;
+  while( i > 0 && input->find("^[%l]", i) ) { i -=   1; }
+  var w = input->sub(i + 1, e);
+  if( i == 0 ) {
+    return KW_BEFORE_RX[w] == 1;
+  } else if( input->find("^[%u%d_]", i) ) {
+    return false;
+  } else {
+    return KW_BEFORE_RX[w] == 1;
+  }
+}
+
+var function isRegex(input, i) {
+  while( i >= 1 && input->find('^[ \t]', i) ) { i -=   1; }
+  if( i < 1 ) { return true; }
+  if( input->find("^[-!%%&(*+,:;<=>?[^{|}~\f]", i) || findKeyword(input, i) ) {
+    return true;
+  } else if( input->sub(i, i) == SLASH ) {
+    return i != LastRegexEnd; // deals with /xx/ / /yy/.
+  } else if( input->find('^[]%w)."]', i) ) {
+    return false;
+  } else if( input->sub(i, i) == LF ) {
+    if( i == 1 ) { return true; }
+    i -=   1;
+    if( input->sub(i, i) == CR ) {
+      if( i == 1 ) { return true; }
+      i -=   1;
+    }
+  } else if( input->sub(i, i) == CR ) {
+    if( i == 1 ) { return true; }
+    i -=   1;
+  } else {
+    return false;
+  }
+  if( input->sub(i, i) == BACKSLASH && i != BackslashAtCommentEnd ) {
+    return isRegex(input, i - 1);
+  } else {
+    return true;
+  }
+}
+
+var function eatCharacterClass(input, s, e) {
+  var i = s;
+  while( i <= e ) {
+    if( input->find('^[\r\n]', i) ) {
+      return false;
+    } else if( input->sub(i, i + 1) == ':]' ) {
+      var str = input->sub(s, i - 1);
+      return CC[str] == 1 && i + 1;
+    }
+    i +=   1;
+  }
+  return false;
+}
+
+var function eatBrackets(input, i, e) {
+  if( input->sub(i, i) == CARET ) { i +=   1; }
+  if( input->sub(i, i) == RIGHTBRACKET ) { i +=   1; }
+  while( i <= e ) {
+    if( input->find('^[\r\n]', i) ) {
+      return false;
+    } else if( input->sub(i, i) == RIGHTBRACKET ) {
+      return i;
+    } else if( input->sub(i, i + 1) == '[:' ) {
+      i = eatCharacterClass(input, i + 2, e);
+      if( ! i ) { return false; }
+    } else if( input->sub(i, i) == BACKSLASH ) {
+      i +=   1;
+      if( input->sub(i, i + 1) == CRLF ) { i +=   1; }
+    }
+    i +=   1;
+  }
+  return false;
+}
+
+var function eatRegex(input, i) {
+  var e = #input;
+  while( i <= e ) {
+    if( input->find('^[\r\n]', i) ) {
+      return false;
+    } else if( input->sub(i, i) == SLASH ) {
+      LastRegexEnd = i;
+      return i;
+    } else if( input->sub(i, i) == LEFTBRACKET ) {
+      i = eatBrackets(input, i + 1, e);
+      if( ! i ) { return false; }
+    } else if( input->sub(i, i) == BACKSLASH ) {
+      i +=   1;
+      if( input->sub(i, i + 1) == CRLF ) { i +=   1; }
+    }
+    i +=   1;
+  }
+  return false;
+}
+
+var ScanRegexResult;
+var function scanGawkRegex(input, index) {
+  if( isRegex(input, index - 2) ) {
+    var i = eatRegex(input, index);
+    if( ! i ) {
+      ScanRegexResult = false;
+      return false;
+    }
+    var rx = input->sub(index - 1, i);
+    for( bs in rx->gmatch("[^\\](\\+)[BSsWwy<>`']") ) {
+      // /\S/ is special, but /\\S/ is not.
+      if( #bs % 2 == 1 ) { return i + 1; }
+    }
+    ScanRegexResult = i + 1;
+  } else {
+    ScanRegexResult = false;
+  }
+  return false;
+}
+// Is only called immediately after scanGawkRegex().
+var function scanRegex() {
+  return ScanRegexResult;
+}
+
+var function scanString(input, index) {
+  var i = index;
+  var e = #input;
+  while( i <= e ) {
+    if( input->find('^[\r\n]', i) ) {
+      return false;
+    } else if( input->sub(i, i) == DQUOTE ) {
+      return i + 1;
+    } else if( input->sub(i, i) == BACKSLASH ) {
+      i +=   1;
+      // l.delimited_range() doesn't handle CRLF.
+      if( input->sub(i, i + 1) == CRLF ) { i +=   1; }
+    }
+    i +=   1;
+  }
+  return false;
+}
+
+// purpose: prevent isRegex() from entering a comment line that ends with a
+// backslash.
+var function scanComment(input, index) {
+  var _, i = input->find('[^\r\n]*', index);
+  if( input->sub(i, i) == BACKSLASH ) { BackslashAtCommentEnd = i; }
+  return i + 1;
+}
+
+var function scanFieldDelimiters(input, index) {
+  var i = index;
+  var e = #input;
+  var left = input->sub(i - 1, i - 1);
+  var count = 1;
+  var right = DELIMITER_MATCHES[left];
+  var left2 = COMPANION[left];
+  var count2 = 0;
+  var right2 = DELIMITER_MATCHES[left2];
+  while( i <= e ) {
+    if( input->find('^[#\r\n]', i) ) {
+      return false;
+    } else if( input->sub(i, i) == right ) {
+      count -=   1;
+      if( count == 0 ) { return count2 == 0 && i + 1; }
+    } else if( input->sub(i, i) == left ) {
+      count +=   1;
+    } else if( input->sub(i, i) == right2 ) {
+      count2 -=   1;
+      if( count2 < 0 ) { return false; }
+    } else if( input->sub(i, i) == left2 ) {
+      count2 +=   1;
+    } else if( input->sub(i, i) == DQUOTE ) {
+      i = scanString(input, i + 1);
+      if( ! i ) { return false; }
+      i -=   1;
+    } else if( input->sub(i, i) == SLASH ) {
+      if( isRegex(input, i - 1) ) {
+        i = eatRegex(input, i + 1);
+        if( ! i ) { return false; }
+      }
+    } else if( input->sub(i, i) == BACKSLASH ) {
+      if( input->sub(i + 1, i + 2) == CRLF ) {
+        i +=   2;
+      } else if( input->find('^[\r\n]', i + 1) ) {
+        i +=   1;
+      }
+    }
+    i +=   1;
+  }
+  return false;
+}
+
+// Whitespace.
+var ws = token(l.WHITESPACE, l.space**1);
+
+// Comments.
+var comment = token(l.COMMENT, '#' * P(scanComment));
+
+// Strings.
+var string = token(l.STRING, DQUOTE * P(scanString));
+
+// Regular expressions.
+// Slash delimited regular expressions are preceded by most operators or
+// the keywords 'print' and 'case', possibly on a preceding line. They
+// can contain unescaped slashes and brackets in brackets. Some escape
+// sequences like '\S', '\s' have special meanings with Gawk. Tokens that
+// contain them are displayed differently.
+var regex = token(l.REGEX, SLASH * P(scanRegex));
+var gawkRegex = token('gawkRegex', SLASH * P(scanGawkRegex));
+
+// no leading sign because it might be binary.
+var float = ((l.digit ** 1 * ('.' * l.digit ** 0) ** -1) +
+    ('.' * l.digit ** 1)) * (S('eE') * S('+-') ** -1 * l.digit ** 1) ** -1;
+// Numbers.
+var number = token(l.NUMBER, float);
+var gawkNumber = token('gawkNumber', l.hex_num + l.oct_num);
+
+// Operators.
+var operator = token(l.OPERATOR, S('!%&()*+,-/:;<=>?[\\]^{|}~'));
+var gawkOperator = token('gawkOperator', P("|&") + "@" + "**=" + "**");
+
+// Fields. E.g. $1, $a, $(x), $a(x), $a[x], $"1", $$a, etc.
+var field = token('field', P('$') * S('$+-') ** 0 *
+                    (float + (l.word ** 0 * '(' * P(scanFieldDelimiters)) +
+                     (l.word ** 1 * ('[' * P(scanFieldDelimiters)) ** -1) +
+                     ('"' * P(scanString)) + ('/' * P(eatRegex) * '/')));
+
+// Functions.
+var func = token(l.FUNCTION, l.word * #P('('));
+
+// Identifiers.
+var identifier = token(l.IDENTIFIER, l.word);
+
+// Keywords.
+var keyword = token(l.KEYWORD, word_match({
+  'BEGIN', 'END', 'atan2', 'break', 'close', 'continue', 'cos', 'delete', 'do',
+  'else', 'exit', 'exp', 'fflush', 'for', 'function', 'getline', 'gsub', 'if',
+  'in', 'index', 'int', 'length', 'log', 'match', 'next', 'nextfile', 'print',
+  'printf', 'rand', 'return', 'sin', 'split', 'sprintf', 'sqrt', 'srand', 'sub',
+  'substr', 'system', 'tolower', 'toupper', 'while'
+}));
+
+var gawkKeyword = token('gawkKeyword', word_match({
+  'BEGINFILE', 'ENDFILE', 'adump', 'and', 'asort', 'asorti', 'bindtextdomain',
+  'case', 'compl', 'dcgettext', 'dcngettext', 'default', 'extension', 'func',
+  'gensub', 'include', 'isarray', 'load', 'lshift', 'mktime', 'or', 'patsplit',
+  'rshift', 'stopme', 'strftime', 'strtonum', 'switch', 'systime', 'xor'
+}));
+
+var builtInVariable = token('builtInVariable', word_match({
+  'ARGC', 'ARGV', 'CONVFMT', 'ENVIRON', 'FILENAME', 'FNR', 'FS', 'NF', 'NR',
+  'OFMT', 'OFS', 'ORS', 'RLENGTH', 'RS', 'RSTART', 'SUBSEP'
+}));
+
+var gawkBuiltInVariable = token('gawkBuiltInVariable', word_match ({
+  'ARGIND', 'BINMODE', 'ERRNO', 'FIELDWIDTHS', 'FPAT', 'FUNCTAB', 'IGNORECASE',
+  'LINT', 'PREC', 'PROCINFO', 'ROUNDMODE', 'RT', 'SYMTAB', 'TEXTDOMAIN'
+}));
+
+// Within each group order matters, but the groups themselves (except the
+// last) can be in any order.
+M._rules = {
+  {'whitespace', ws},
+
+  {'comment', comment},
+
+  {'string', string},
+
+  {'field', field},
+
+  {'gawkRegex', gawkRegex},
+  {'regex', regex},
+  {'gawkOperator', gawkOperator},
+  {'operator', operator},
+
+  {'gawkNumber', gawkNumber},
+  {'number', number},
+
+  {'keyword', keyword},
+  {'builtInVariable', builtInVariable},
+  {'gawkKeyword', gawkKeyword},
+  {'gawkBuiltInVariable', gawkBuiltInVariable},
+  {'function', func},
+  {'identifier', identifier},
+};
+
+M._tokenstyles = {
+  builtInVariable = l.STYLE_CONSTANT,
+  default = l.STYLE_ERROR,
+  field = l.STYLE_LABEL,
+  gawkBuiltInVariable = l.STYLE_CONSTANT..',underlined',
+  gawkKeyword = l.STYLE_KEYWORD..',underlined',
+  gawkNumber = l.STYLE_NUMBER..',underlined',
+  gawkOperator = l.STYLE_OPERATOR..',underlined',
+  gawkRegex = l.STYLE_PREPROCESSOR..',underlined',
+  regex = l.STYLE_PREPROCESSOR
+};
+
+M._foldsymbols = {
+  _patterns = {'[{}]', '#'},
+  [l.OPERATOR] = {['{'] = 1, ['}'] = -1},
+  [l.COMMENT] = {['#'] = l.fold_line_comments('#')}
+};
+
+return M;

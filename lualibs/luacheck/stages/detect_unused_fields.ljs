@@ -1,0 +1,81 @@
+var core_utils = require ("luacheck.core_utils");
+
+var stage = {};
+
+var function unused_field_value_message_format(warning) {
+   var target = warning.index && "index" || "field";
+   return "value assigned to " .. target .. " {field!} is overwritten on line {overwritten_line} before use";
+}
+
+stage.warnings = {
+   ["314"] = {message_format = unused_field_value_message_format,
+      fields = {"field", "index", "overwritten_line","overwritten_column", "overwritten_end_column"}}
+};
+
+var function warn_unused_field_value(chstate, node, field_repr, is_index, overwriting_node) {
+   chstate->warn_range("314", node, {
+      field = field_repr,
+      index = is_index,
+      overwritten_line = overwriting_node.line,
+      overwritten_column = chstate->offset_to_column(overwriting_node.line, overwriting_node.offset),
+      overwritten_end_column = chstate->offset_to_column(overwriting_node.line, overwriting_node.end_offset)
+   });
+}
+
+var function check_table(chstate, node) {
+   var array_index = 1.0;
+   var key_value_to_node = {};
+   var key_node_to_repr = {};
+   var index_key_nodes = {};
+
+   for( _, pair in ipairs(node) ) {
+      var key_value;
+      var key_repr;
+      var key_node;
+
+      if( pair.tag == "Pair" ) {
+         key_node = pair[1];
+         key_value, key_repr = core_utils.eval_const_node(key_node);
+      } else {
+         key_node = pair;
+         key_value = array_index;
+         key_repr = tostring(math.floor(key_value));
+         array_index +=   1.0;
+      }
+
+      if( key_value ) {
+         var prev_key_node = key_value_to_node[key_value];
+         var prev_key_repr = key_node_to_repr[prev_key_node];
+         var prev_key_is_index = index_key_nodes[prev_key_node];
+
+         if( prev_key_node ) {
+            warn_unused_field_value(chstate, prev_key_node, prev_key_repr, prev_key_is_index, key_node);
+         }
+
+         key_value_to_node[key_value] = key_node;
+         key_node_to_repr[key_node] = key_repr;
+
+         if( pair.tag != "Pair" ) {
+            index_key_nodes[key_node] = true;
+         }
+      }
+   }
+}
+
+var function check_nodes(chstate, nodes) {
+   for( _, node in ipairs(nodes) ) {
+      if( type(node) == "table" ) {
+         if( node.tag == "Table" ) {
+            check_table(chstate, node);
+         }
+
+         check_nodes(chstate, node);
+      }
+   }
+}
+
+function stage.run(chstate) {
+   check_nodes(chstate, chstate.ast);
+}
+
+return stage;

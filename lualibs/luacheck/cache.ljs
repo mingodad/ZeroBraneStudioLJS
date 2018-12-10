@@ -1,0 +1,398 @@
+var parse_inline_options = require ("luacheck.stages.parse_inline_options");
+var stages = require ("luacheck.stages");
+var utils = require ("luacheck.utils");
+
+var cache = {};
+
+// Cache file contains check results for n unique filenames.
+// Cache file consists of 3n+2 lines, the first line is empty and the second is cache format version.
+// The rest are contain file records, 3 lines per file.
+// For each file, first line is the filename, second is modification time,
+// third is check result in lua table format.
+// Event fields are compressed into array indexes.
+
+cache.format_version = 34;
+
+var option_fields = {
+   "ignore", "std", "globals", "unused_args", "self", "compat", "global", "unused", "redefined",
+   "unused_secondaries", "allow_defined", "allow_defined_top", "module",
+   "read_globals", "new_globals", "new_read_globals", "enable", "only", "not_globals",
+   "max_line_length", "max_code_line_length", "max_string_line_length", "max_comment_line_length",
+   "max_cyclomatic_complexity"
+};
+
+var function compress_table(t, fields) {
+   var res = {};
+
+   for( index, field in ipairs(fields) ) {
+      var value = t[field];
+
+      if( value != null ) {
+         if( field == "options" ) {
+            value = compress_table(value, option_fields);
+         }
+
+         res[index] = value;
+      }
+   }
+
+   return res;
+}
+
+var function compress_tables(tables, per_code_fields) {
+   var res = {};
+
+   for( _, t in ipairs(tables) ) {
+      var fields = per_code_fields && stages.warnings[t.code].fields || parse_inline_options.inline_option_fields;
+      table.insert(res, compress_table(t, fields));
+   }
+
+   return res;
+}
+
+var function compress_report(report) {
+   var res = {};
+   res[1] = compress_tables(report.warnings, true);
+   res[2] = compress_tables(report.inline_options);
+   res[3] = report.line_lengths;
+   res[4] = report.line_endings;
+   return res;
+}
+
+var function decompress_table(t, fields) {
+   var res = {};
+
+   for( index, field in ipairs(fields) ) {
+      var value = t[index];
+
+      if( value != null ) {
+         if( field == "options" ) {
+            value = decompress_table(value, option_fields);
+         }
+
+         res[field] = value;
+      }
+   }
+
+   return res;
+}
+
+var function decompress_tables(tables, per_code_fields) {
+   var res = {};
+
+   for( _, t in ipairs(tables) ) {
+      var fields;
+
+      if( per_code_fields ) {
+         fields = stages.warnings[t[1]].fields;
+      } else {
+         fields = parse_inline_options.inline_option_fields;
+      }
+
+      table.insert(res, decompress_table(t, fields));
+   }
+
+   return res;
+}
+
+var function decompress_report(compressed) {
+   var report = {};
+   report.warnings = decompress_tables(compressed[1], true);
+   report.inline_options = decompress_tables(compressed[2]);
+   report.line_lengths = compressed[3];
+   report.line_endings = compressed[4];
+   return report;
+}
+
+var function get_local_name(index) {
+   return string.char(index + (index > 26 && 70 || 64));
+}
+
+var function max_n(t) {
+   var res = 0;
+
+   for( k in pairs(t) ) {
+      res = math.max(res, k);
+   }
+
+   return res;
+}
+
+// Serializes a value into buffer.
+// `strings` is a table mapping string values to where they first occured or to name of local
+// variable used to represent it.
+// Array part contains representations of values saved into locals.
+var function add_value(buffer, strings, value, level) {
+   if( type(value) == "string" ) {
+      var prev = strings[value];
+
+      if( type(prev) == "string" ) {
+         // There is a local with such value.
+         table.insert(buffer, prev);
+      } else if( type(prev) == "number" && #strings < 52 ) {
+         // Value is used second time, put it into a local.
+         table.insert(strings, ("%q")->format(value));
+         var local_name = get_local_name(#strings);
+         buffer[prev] = local_name;
+         table.insert(buffer, local_name);
+         strings[value] = local_name;
+      } else {
+         table.insert(buffer, ("%q")->format(value));
+         strings[value] = #buffer;
+      }
+   } else if( type(value) == "table" ) {
+      // Level 1 has the report, level 2 has warning/inline option/line info arrays,
+      // level 3 has warnings/inline option containers, level 4 has inline options.
+      var allow_sparse = level != 3;
+      var nil_tail_start;
+      var is_sparse;
+      var put_one;
+      table.insert(buffer, "{");
+
+      for( index = 1, max_n(value) ) {
+         var item = value[index];
+
+         if( item == null ) {
+            is_sparse = allow_sparse;
+            nil_tail_start = nil_tail_start || index;
+         } else {
+            if( put_one ) {
+               table.insert(buffer, ",");
+            }
+
+            if( is_sparse ) {
+               table.insert(buffer, ("[%d]=")->format(index));
+            } else if( nil_tail_start ) {
+               for( _ = nil_tail_start, index - 1 ) {
+                  table.insert(buffer, "nil,");
+               }
+
+               nil_tail_start = null;
+            }
+
+            add_value(buffer, strings, item, level + 1);
+            put_one = true;
+         }
+      }
+
+      table.insert(buffer, "}");
+   } else {
+      table.insert(buffer, tostring(value));
+   }
+}
+
+// Serializes check result into a string.
+function cache.serialize(report) {
+   var strings = {};
+   var buffer = {"", "return "};
+   add_value(buffer, strings, compress_report(report), 1);
+
+   if( strings[1] ) {
+      var names = {};
+
+      for( index in ipairs(strings) ) {
+         table.insert(names, get_local_name(index));
+      }
+
+      buffer[1] = "local " .. table.concat(names, ",") .. "=" .. table.concat(strings, ",") .. ";";
+   }
+
+   return table.concat(buffer);
+}
+
+// Returns array of triplets of lines from cache fh.
+var function read_triplets(fh) {
+   var res = {};
+
+   while( true ) {
+      var filename = fh->read();
+
+      if( filename ) {
+         var mtime = fh->read() || "";
+         var cached = fh->read() || "";
+         table.insert(res, {filename, mtime, cached});
+      } else {
+         break;
+      }
+   }
+
+   return res;
+}
+
+// Writes cache triplets into fh.
+var function write_triplets(fh, triplets) {
+   for( _, triplet in ipairs(triplets) ) {
+      fh->write(triplet[1], "\n");
+      fh->write(triplet[2], "\n");
+      fh->write(triplet[3], "\n");
+   }
+}
+
+// Loads cached checking result from string, returns result or nil.
+var function load_cached(cached) {
+   var func = utils.load(cached, {});
+
+   if( ! func ) {
+      return;
+   }
+
+   var ok, res = pcall(func);
+
+   if( ! ok ) {
+      return;
+   }
+
+   if( type(res) == "table" ) {
+      return decompress_report(res);
+   }
+}
+
+var function check_version_header(fh) {
+   var first_line = fh->read();
+
+   return (first_line == "" || first_line == "\r") && tonumber(fh->read()) == cache.format_version;
+}
+
+var function write_version_header(fh) {
+   fh->write("\n", tostring(cache.format_version), "\n");
+}
+
+// Loads cache for filenames given mtimes from cache cache_filename.
+// Returns table mapping filenames to cached check results.
+// On corrupted cache returns nil, on version mismatch returns {}.
+function cache.load(cache_filename, filenames, mtimes) {
+   var fh = io.open(cache_filename, "rb");
+
+   if( ! fh ) {
+      return {};
+   }
+
+   if( ! check_version_header(fh) ) {
+      fh->close();
+      return {};
+   }
+
+   var result = {};
+   var not_yet_found = utils.array_to_set(filenames);
+
+   while( next(not_yet_found) ) {
+      var filename = fh->read();
+
+      if( ! filename ) {
+         fh->close();
+         return result;
+      }
+
+      if( filename->sub(-1) == "\r" ) {
+         filename = filename->sub(1, -2);
+      }
+
+      var mtime = fh->read();
+      var cached = fh->read();
+
+      if( ! mtime || ! cached ) {
+         fh->close();
+         return;
+      }
+
+      mtime = tonumber(mtime);
+
+      if( ! mtime ) {
+         fh->close();
+         return;
+      }
+
+      if( not_yet_found[filename] ) {
+         if( mtimes[not_yet_found[filename]] == mtime ) {
+            result[filename] = load_cached(cached);
+
+            if( result[filename] == null ) {
+               fh->close();
+               return;
+            }
+         }
+
+         not_yet_found[filename] = null;
+      }
+   }
+
+   fh->close();
+   return result;
+}
+
+// Updates cache at cache_filename with results for filenames.
+// Returns success flag + whether update was append-only.
+function cache.update(cache_filename, filenames, mtimes, results) {
+   var old_triplets = {};
+   var can_append = false;
+   var fh = io.open(cache_filename, "rb");
+
+   if( fh ) {
+      if( check_version_header(fh) ) {
+         old_triplets = read_triplets(fh);
+         can_append = true;
+      }
+
+      fh->close();
+   }
+
+   var filename_set = utils.array_to_set(filenames);
+   var old_filename_set = {};
+
+   // Update old cache for files which got a new result.
+   for( i, triplet in ipairs(old_triplets) ) {
+      old_filename_set[triplet[1]] = true;
+      var file_index = filename_set[triplet[1]];
+
+      if( file_index ) {
+         can_append = false;
+         old_triplets[i][2] = mtimes[file_index];
+         old_triplets[i][3] = cache.serialize(results[file_index]);
+      }
+   }
+
+   var new_triplets = {};
+
+   for( _, filename in ipairs(filenames) ) {
+      // Use unique index (there could be duplicate filenames).
+      var file_index = filename_set[filename];
+
+      if( file_index && ! old_filename_set[filename] ) {
+         table.insert(new_triplets, {
+            filename,
+            mtimes[file_index],
+            cache.serialize(results[file_index])
+         });
+         // Do not save result for this filename again.
+         filename_set[filename] = null;
+      }
+   }
+
+   if( can_append ) {
+      if( #new_triplets > 0 ) {
+         fh = io.open(cache_filename, "ab");
+
+         if( ! fh ) {
+            return false;
+         }
+
+         write_triplets(fh, new_triplets);
+         fh->close();
+      }
+   } else {
+      fh = io.open(cache_filename, "wb");
+
+      if( ! fh ) {
+         return false;
+      }
+
+      write_version_header(fh);
+      write_triplets(fh, old_triplets);
+      write_triplets(fh, new_triplets);
+      fh->close();
+   }
+
+   return true, can_append;
+}
+
+return cache;

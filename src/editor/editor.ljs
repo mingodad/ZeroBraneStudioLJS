@@ -1,0 +1,1772 @@
+// Copyright 2011-18 Paul Kulchenko, ZeroBrane LLC
+// authors: Lomtik Software (J. Winwood & John Labenski)
+// Luxinia Dev (Eike Decker & Christoph Kubisch)
+//-------------------------------------------------------
+
+var editorID = 100; // window id to create editor pages with, incremented for new editors
+
+var openDocuments = ide.openDocuments;
+var notebook = ide.frame.notebook;
+var edcfg = ide.config.editor;
+var styles = ide.config.styles;
+var unpack = table.unpack || unpack;
+var q = EscapeMagic;
+
+var margin = { LINENUMBER = 0, MARKER = 1, FOLD = 2 };
+var linenumlen = 4 + 0.5;
+var foldtypes = {
+  [0] = { wxstc.wxSTC_MARKNUM_FOLDEROPEN, wxstc.wxSTC_MARKNUM_FOLDER,
+    wxstc.wxSTC_MARKNUM_FOLDERSUB, wxstc.wxSTC_MARKNUM_FOLDERTAIL, wxstc.wxSTC_MARKNUM_FOLDEREND,
+    wxstc.wxSTC_MARKNUM_FOLDEROPENMID, wxstc.wxSTC_MARKNUM_FOLDERMIDTAIL,
+  },
+  box = { wxstc.wxSTC_MARK_BOXMINUS, wxstc.wxSTC_MARK_BOXPLUS,
+    wxstc.wxSTC_MARK_VLINE, wxstc.wxSTC_MARK_LCORNER, wxstc.wxSTC_MARK_BOXPLUSCONNECTED,
+    wxstc.wxSTC_MARK_BOXMINUSCONNECTED, wxstc.wxSTC_MARK_TCORNER,
+  },
+  circle = { wxstc.wxSTC_MARK_CIRCLEMINUS, wxstc.wxSTC_MARK_CIRCLEPLUS,
+    wxstc.wxSTC_MARK_VLINE, wxstc.wxSTC_MARK_LCORNERCURVE, wxstc.wxSTC_MARK_CIRCLEPLUSCONNECTED,
+    wxstc.wxSTC_MARK_CIRCLEMINUSCONNECTED, wxstc.wxSTC_MARK_TCORNERCURVE,
+  },
+  plus = { wxstc.wxSTC_MARK_MINUS, wxstc.wxSTC_MARK_PLUS },
+  arrow = { wxstc.wxSTC_MARK_ARROWDOWN, wxstc.wxSTC_MARK_ARROW },
+};
+
+// ----------------------------------------------------------------------------
+// Update the statusbar text of the frame using the given editor.
+// Only update if the text has changed.
+var statusTextTable = { "OVR?", "R/O?", "Cursor Pos" };
+
+var function updateStatusText(editor) {
+  var texts = { "", "", "" };
+  if( ide.frame && editor ) {
+    var pos = editor->GetCurrentPos();
+    var selected = #editor->GetSelectedText();
+    var selections = ide.wxver >= "2.9.5" && editor->GetSelections() || 1;
+
+    texts = {
+      (editor->GetOvertype() && TR("OVR") || TR("INS")),
+      (editor->GetReadOnly() && TR("R/O") || TR("R/W")),
+      table.concat({
+        TR("Ln: %d")->format(editor->LineFromPosition(pos) + 1),
+        TR("Col: %d")->format(editor->GetColumn(pos) + 1),
+        selected > 0 && TR("Sel: %d/%d")->format(selected, selections) || "",
+      }, ' ')};
+  }
+
+  if( ide.frame ) {
+    for( n in ipairs(texts) ) {
+      if( (texts[n] != statusTextTable[n]) ) {
+        ide->SetStatus(texts[n], n);
+        statusTextTable[n] = texts[n];
+      }
+    }
+  }
+}
+
+var function updateBraceMatch(editor) {
+  var pos = editor->GetCurrentPos();
+  var posp = pos > 0 && pos-1;
+  var char = editor->GetCharAt(pos);
+  var charp = posp && editor->GetCharAt(posp);
+  var match = { [string.byte("<")] = true,
+    [string.byte(">")] = true,
+    [string.byte("(")] = true,
+    [string.byte(")")] = true,
+    [string.byte("{")] = true,
+    [string.byte("}")] = true,
+    [string.byte("[")] = true,
+    [string.byte("]")] = true,
+  };
+
+  pos = (match[char] && pos) || (charp && match[charp] && posp);
+
+  if( (pos) ) {
+    // don't match brackets in markup comments
+    var style = bit.band(editor->GetStyleAt(pos), ide.STYLEMASK);
+    if( (MarkupIsSpecial && MarkupIsSpecial(style)
+      || editor.spec.iscomment[style]) ) { return; }
+
+    var pos2 = editor->BraceMatch(pos);
+    if( (pos2 == wxstc.wxSTC_INVALID_POSITION) ) {
+      editor->BraceBadLight(pos);
+    } else {
+      editor->BraceHighlight(pos,pos2);
+    }
+    editor.matchon = true;
+  } else if((editor.matchon) ) {
+    editor->BraceBadLight(wxstc.wxSTC_INVALID_POSITION);
+    editor->BraceHighlight(wxstc.wxSTC_INVALID_POSITION,-1);
+    editor.matchon = false;
+  }
+}
+
+// Check if file is altered, show dialog to reload it
+var function isFileAlteredOnDisk(editor) {
+  if( ! editor ) { return; }
+
+  var id = editor->GetId();
+  if( openDocuments[id] ) {
+    var filePath = openDocuments[id].filePath;
+    var fileName = openDocuments[id].fileName;
+    var oldModTime = openDocuments[id].modTime;
+
+    if( filePath && (string.len(filePath) > 0) && oldModTime && oldModTime->IsValid() ) {
+      var modTime = GetFileModTime(filePath);
+      if( modTime == null ) {
+        openDocuments[id].modTime = null;
+        wx.wxMessageBox(
+          TR("File '%s' no longer exists.")->format(fileName),
+          ide->GetProperty("editormessage"),
+          wx.wxOK + wx.wxCENTRE, ide.frame);
+      } else if( ! editor->GetReadOnly() && modTime->IsValid() && oldModTime->IsEarlierThan(modTime) ) {
+        var ret = (edcfg.autoreload && (! ide->GetDocument(editor)->IsModified()) && wx.wxYES)
+          || wx.wxMessageBox(
+            TR("File '%s' has been modified on disk.")->format(fileName)
+            .."\n"..TR("Do you want to reload it?"),
+            ide->GetProperty("editormessage"),
+            wx.wxYES_NO + wx.wxCENTRE, ide.frame);
+
+        if( ret != wx.wxYES || ReLoadFile(filePath, editor, true) ) {
+          openDocuments[id].modTime = GetFileModTime(filePath);
+        }
+      }
+    }
+  }
+}
+
+var function navigateToPosition(editor, fromPosition, toPosition, length) {
+  table.insert(editor.jumpstack, fromPosition);
+  editor->GotoPosEnforcePolicy(toPosition);
+  if( length ) {
+    editor->SetAnchor(toPosition + length);
+  }
+}
+
+var function navigateBack(editor) {
+  if( #editor.jumpstack == 0 ) { return; }
+  var pos = table.remove(editor.jumpstack);
+  editor->GotoPosEnforcePolicy(pos);
+  return true;
+}
+
+// init new notebook page selection, use nil for current page
+function SetEditorSelection(selection) {
+  var editor = ide->GetEditor(selection);
+  updateStatusText(editor); // update even if nil
+  ide.frame->SetTitle(ide->ExpandPlaceholders(ide.config.format.apptitle));
+
+  if( editor ) {
+    editor->SetFocus();
+    editor->SetSTCFocus(true);
+    // when the active editor is changed while the focus is away from the application
+    // (as happens on OSX when the editor is selected from the command bar)
+    // the focus stays on wxAuiToolBar component, so need to explicitly switch it.
+    if( ide.osname == "Macintosh" && ide.infocus ) { ide.infocus = editor; }
+
+    var id = editor->GetId();
+    FileTreeMarkSelected(openDocuments[id] && openDocuments[id].filePath || '');
+    AddToFileHistory(openDocuments[id] && openDocuments[id].filePath);
+  } else {
+    FileTreeMarkSelected('');
+  }
+
+  SetAutoRecoveryMark();
+}
+
+function EditorAutoComplete(editor) {
+  if( ! (editor && editor.spec) ) { return; }
+
+  var pos = editor->GetCurrentPos();
+  // don't do auto-complete in comments or strings.
+  // the current position and the previous one have default style (0),
+  // so we need to check two positions back.
+  var style = pos >= 2 && bit.band(editor->GetStyleAt(pos-2),ide.STYLEMASK) || 0;
+  if( editor.spec.iscomment[style]
+  || editor.spec.isstring[style]
+  || (MarkupIsAny && MarkupIsAny(style)) // markup in comments
+  ) { return; }
+
+  // retrieve the current line and get a string to the current cursor position in the line
+  var line = editor->GetCurrentLine();
+  var linetx = editor->GetLineDyn(line);
+  var linestart = editor->PositionFromLine(line);
+  var localpos = pos-linestart;
+
+  var lt = linetx->sub(1,localpos);
+  lt = lt->gsub("%s*(["..editor.spec.sep.."])%s*", "%1");
+  // strip closed brace scopes
+  lt = lt->gsub("%b()","");
+  lt = lt->gsub("%b{}","");
+  lt = lt->gsub("%b[]",".0");
+  // remove everything that can't be auto-completed
+  lt = lt->match("[%w_"..q(editor.spec.sep).."]*$");
+
+  // if there is nothing to auto-complete for, then don't show the list
+  if( lt->find("^["..q(editor.spec.sep).."]*$") ) { return; }
+
+  // know now which string is to be completed
+  var userList = CreateAutoCompList(editor, lt, pos);
+
+  // don't show if what's typed so far matches one of the options
+  var right = linetx->sub(localpos+1,#linetx)->match("^([%a_]+[%w_]*)");
+  var left = lt->match("[%w_]*$"); // extract one word on the left (without separators)
+  var compmatch = {
+    left = "( ?)%f[%w_]"..left.."%f[^%w_]( ?)",
+    leftright = "( ?)%f[%w_]"..left..(right || "").."%f[^%w_]( ?)",
+  };
+  // if the multiple selection is active, then remove the match from the `userList`,
+  // as it's going to match a (possibly earlier) copy of the same value
+  var selections = ide.wxver >= "2.9.5" && editor->GetSelections() || 1;
+  if( userList && selections > 1 ) {
+    for( _, m in pairs(compmatch) ) {
+      // replace with a space only when there are spaces on both sides
+      userList = userList->gsub(m, function(s1, s2) { return #(s1..s2) == 2 && " " || ""; });
+    }
+  }
+  if( userList && #userList > 0
+  // don't show autocomplete if there is a full match on the list of autocomplete options
+  && ! (userList->find(compmatch.left) || userList->find(compmatch.leftright)) ) {
+    editor->UserListShow(1, userList);
+  } else if( editor->AutoCompActive() ) {
+    editor->AutoCompCancel();
+  }
+}
+
+var ident = "([a-zA-Z_][a-zA-Z_0-9%.%:]*)";
+var function getValAtPosition(editor, pos) {
+  var line = editor->LineFromPosition(pos);
+  var linetx = editor->GetLineDyn(line);
+  var linestart = editor->PositionFromLine(line);
+  var localpos = pos-linestart;
+
+  var selected = editor->GetSelectionStart() != editor->GetSelectionEnd()
+    && pos >= editor->GetSelectionStart() && pos <= editor->GetSelectionEnd();
+
+  // check if we have a selected text or an identifier.
+  // for an identifier, check fragments on the left and on the right.
+  // this is to match 'io' in 'i^o.print' and 'io.print' in 'io.pr^int'.
+  // remove square brackets to make tbl[index].x show proper values.
+  var start = linetx->sub(1,localpos)
+    ->gsub("%b[]", function(s) { return (".")->rep(#s); })
+    ->find(ident.."$");
+
+  var right, funccall = linetx->sub(localpos+1,#linetx)->match("^([a-zA-Z_0-9]*)%s*(['\"{%(]?)");
+  var _v_var = selected
+    // GetSelectedText() returns concatenated text when multiple instances
+    // are selected, so get the selected text based on start/end
+    && editor->GetTextRangeDyn(editor->GetSelectionStart(), editor->GetSelectionEnd())
+    || (start && linetx->sub(start,localpos)->gsub(":",".")..right || null);
+
+  // since this function can be called in different contexts, we need
+  // to detect function call of different types:
+  // 1. foo.b^ar(... -- the cursor (pos) is on the function name
+  // 2. foo.bar(..^. -- the cursor (pos) is on the parameter list
+  // "var" has value for #1 and the following fragment checks for #2
+
+  // check if the style is the right one; this is to ignore
+  // comments, strings, numbers (to avoid '1 = 1'), keywords, and such
+  var goodpos = true;
+  if( start && ! selected ) {
+    var style = bit.band(editor->GetStyleAt(linestart+start),ide.STYLEMASK);
+    if( (MarkupIsAny && MarkupIsAny(style)) // markup in comments
+    || editor.spec.iscomment[style]
+    || editor.spec.isstring[style]
+    || editor.spec.isnumber[style]
+    || editor.spec.iskeyword[style] ) {
+      goodpos = false;
+    }
+  }
+
+  var linetxtopos = linetx->sub(1,localpos);
+  funccall = (#funccall > 0) && goodpos && _v_var
+    || (linetxtopos..")")->match(ident .. "%s*%b()$")
+    || (linetxtopos.."}")->match(ident .. "%s*%b{}$")
+    || (linetxtopos.."'")->match(ident .. "%s*'[^']*'$")
+    || (linetxtopos..'"')->match(ident .. '%s*"[^"]*"$')
+    || null;
+
+  // don't do anything for strings or comments or numbers
+  if( ! goodpos ) { return null, funccall; }
+
+  return _v_var, funccall;
+}
+
+var function formatUpToX(s) {
+  var x = math.max(20, ide.config.acandtip.width);
+  var splitstr = "([ \t]*)(%S*)([ \t]*)(\n?)";
+  var t = {""};
+  for( prefix, word, suffix, newline in s->gmatch(splitstr) ) {
+    if( #(t[#t]) + #prefix + #word > x && #t > 0 ) {
+      table.insert(t, word..suffix);
+    } else {
+      t[#t] = t[#t]..prefix..word..suffix;
+    }
+    if( #newline > 0 ) { table.insert(t, ""); }
+  }
+  return table.concat(t, "\n");
+}
+
+var function callTipFitAndShow(editor, pos, tip) {
+  var point = editor->PointFromPosition(pos);
+  var sline = editor->LineFromPosition(pos);
+  var height = editor->TextHeight(sline);
+  var maxlines = math.max(1, math.floor(
+    math.max(editor->GetSize()->GetHeight()-point->GetY()-height, point->GetY())/height-1
+  ));
+  // cut the tip to not exceed the number of maxlines.
+  // move the position to the left if needed to fit.
+  // find the longest line in terms of width in pixels.
+  var maxwidth = 0;
+  var lines = {};
+  for( line in formatUpToX(tip)->gmatch("[^\n]*\n?") ) {
+    var width = editor->TextWidth(wxstc.wxSTC_STYLE_DEFAULT, line);
+    if( width > maxwidth ) { maxwidth = width; }
+    table.insert(lines, line);
+    if( #lines >= maxlines ) {
+      lines[#lines] = lines[#lines]->gsub("%s*\n$","")..'...';
+      break;
+    }
+  }
+  tip = table.concat(lines, '');
+
+  var startpos = editor->PositionFromLine(sline);
+  var afterwidth = editor->GetSize()->GetWidth()-point->GetX();
+  if( maxwidth > afterwidth ) {
+    var charwidth = editor->TextWidth(wxstc.wxSTC_STYLE_DEFAULT, 'A');
+    pos = math.max(startpos, pos - math.floor((maxwidth - afterwidth) / charwidth));
+  }
+
+  editor->CallTipShow(pos, tip);
+}
+
+function EditorCallTip(editor, pos, x, y) {
+  // don't show anything if the calltip/auto-complete is active;
+  // this may happen after typing function name, while the mouse is over
+  // a different function or when auto-complete is on for a parameter.
+  if( editor->CallTipActive() || editor->AutoCompActive() ) { return; }
+
+  // don't activate if the window itself is not active (in the background)
+  if( ! ide.frame->IsActive() ) { return; }
+
+  var _v_var, funccall = editor->ValueFromPosition(pos);
+  // if this is a value type rather than a function/method call, then use
+  // full match to avoid calltip about coroutine.status for "status" vars
+  var tip = GetTipInfo(editor, funccall || _v_var, false, ! funccall);
+  var limit = ide.config.acandtip.maxlength;
+  var debugger = ide->GetDebugger();
+  if( debugger && debugger->IsConnected() ) {
+    if( _v_var ) {
+      debugger->EvalAsync(_v_var, function(val, err) {
+        // val == `nil` if there is any error
+        val = val != null && (_v_var.." = "..val) || err;
+        if( #val > limit ) { val = val->sub(1, limit-3).."..."; }
+        // check if the mouse position is specified and the mouse has moved,
+        // then don't show the tooltip as it's already too late for it.
+        if( x && y ) {
+          var mpos = wx.wxGetMousePosition();
+          if( mpos.x != x || mpos.y != y ) { return; }
+        }
+        if( PackageEventHandle("onEditorCallTip", editor, val, funccall || _v_var, true) != false ) {
+          callTipFitAndShow(editor, pos, val);
+        }
+      }, debugger->GetDataOptions({maxlevel = false}));
+    }
+  } else if( tip ) {
+    var oncalltip = PackageEventHandle("onEditorCallTip", editor, tip, funccall || _v_var, false);
+    // only shorten if shown on mouse-over. Use shortcut to get full info.
+    var showtooltip = ide.frame.menuBar->FindItem(ID.SHOWTOOLTIP);
+    var suffix = "...\n"
+        ..TR("Use '%s' to see full description.")->format(showtooltip->GetLabel());
+    if( x && y && #tip > limit ) {
+      tip = tip->sub(1, limit-#suffix)->gsub("%W*%w*$","")..suffix;
+    }
+    if( oncalltip != false ) { callTipFitAndShow(editor, pos, tip); }
+  }
+}
+
+// Indicator handling for functions and local/global variables
+var indicator = {
+  FNCALL = ide->GetIndicator("core.fncall"),
+  LOCAL = ide->GetIndicator("core.varlocal"),
+  GLOBAL = ide->GetIndicator("core.varglobal"),
+  SELF = ide->GetIndicator("core.varself"),
+  MASKING = ide->GetIndicator("core.varmasking"),
+  MASKED = ide->GetIndicator("core.varmasked"),
+};
+
+function IndicateFunctionsOnly(editor, lines, linee) {
+  var sindic = styles.indicator;
+  if( ! (edcfg.showfncall && editor.spec && editor.spec.isfncall)
+  || ! (sindic && sindic.fncall && sindic.fncall.st != wxstc.wxSTC_INDIC_HIDDEN) ) { return; }
+
+  lines = lines || 0;
+  linee = linee || editor->GetLineCount()-1;
+
+  if( (lines < 0) ) { return; }
+
+  var isfncall = editor.spec.isfncall;
+  var isinvalid = {};
+  for( i,v in pairs(editor.spec.iscomment) ) { isinvalid[i] = v; }
+  for( i,v in pairs(editor.spec.iskeyword) ) { isinvalid[i] = v; }
+  for( i,v in pairs(editor.spec.isstring) ) { isinvalid[i] = v; }
+
+  editor->SetIndicatorCurrent(indicator.FNCALL);
+  for( line=lines,linee ) {
+    var tx = editor->GetLineDyn(line);
+    var ls = editor->PositionFromLine(line);
+    editor->IndicatorClearRange(ls, #tx);
+
+    var from = 1;
+    var off = -1;
+    while( from ) {
+      tx = from==1 && tx || string.sub(tx,from);
+
+      var f,t,w = isfncall(tx);
+
+      if( (f) ) {
+        var p = ls+f+off;
+        var s = bit.band(editor->GetStyleAt(p),ide.STYLEMASK);
+        if( ! isinvalid[s] ) { editor->IndicatorFillRange(p, #w); }
+        off +=   t;
+      }
+      from = t && (t+1);
+    }
+  }
+}
+
+var delayed = {};
+
+function IndicateIfNeeded() {
+  var editor = ide->GetEditor();
+  // do the current one first
+  if( delayed[editor] ) { return editor->IndicateSymbols(); }
+  for( ed in pairs(delayed) ) { return ed->IndicateSymbols(); }
+}
+
+// find all instances of a symbol at pos
+// return table with [0] as the definition position (if local)
+var function indicateFindInstances(editor, name, pos) {
+  var tokens = editor->GetTokenList();
+  var instances = {{[-1] = 1}};
+  var this;
+  for( _, token in ipairs(tokens) ) {
+    var op = token[1];
+
+    if( op == 'EndScope' ) { // EndScope has "new" level, so need +1
+      if( this && token.fpos > pos && this == token.at+1 ) { break; }
+
+      if( #instances > 1 && instances[#instances][-1] == token.at+1 ) {
+        table.remove(instances);
+      }
+    } else if( token.name == name ) {
+      if( op == 'Id' ) {
+        table.insert(instances[#instances], token.fpos);
+      } else if( op->find("^Var") ) {
+        if( this && this == token.at ) { break; }
+
+        // if new Var is defined at the same level, replace the current frame;
+        // if not, add a new one; skip implicit definition of "self" variable.
+        instances[#instances + (token.at > instances[#instances][-1] && 1 || 0)]
+          = {[0] = (! token.this && token.fpos || null), [-1] = token.at};
+      }
+      if( token.fpos <= pos && pos <= token.fpos+#name ) { this = instances[#instances][-1]; }
+    }
+  }
+  instances[#instances][-1] = null; // remove the current level
+  // only return the list if "this" instance has been found;
+  // this is to avoid reporting (improper) instances when checking for
+  // comments, strings, table fields, etc.
+  return this && instances[#instances] || {};
+}
+
+var function indicateSymbols(editor, lines) {
+  if( ! ide.config.autoanalyzer ) { return; }
+
+  var d = delayed[editor];
+  delayed[editor] = null; // assume this can be finished for now
+
+  // this function can be called for an editor tab that is already closed
+  // when there are still some pending events for it, so handle it.
+  if( ! ide->IsValidCtrl(editor) ) { return; }
+
+  // if marksymbols is not set in the spec, nothing else to do
+  if( ! (editor.spec && editor.spec.marksymbols) ) { return; }
+
+  var indic = styles.indicator || {};
+
+  var pos, vars = d && d[1] || 1, d && d[2] || null;
+  var start = lines && editor->PositionFromLine(lines)+1 || null;
+  if( d && start && pos >= start ) {
+    // ignore delayed processing as the change is earlier in the text
+    pos, vars = 1, null;
+  }
+
+  var tokens = editor->GetTokenList();
+
+  if( start ) { // if the range is specified
+    var curindic = editor->GetIndicatorCurrent();
+    editor->SetIndicatorCurrent(indicator.MASKED);
+    for( n = #tokens, 1, -1 ) {
+      var token = tokens[n];
+      // find the last token before the range
+      if( ! token.nobreak && token.name && token.fpos+#token.name < start ) {
+        pos, vars = token.fpos+#token.name, token.context;
+        break;
+      }
+      // unmask all variables from the rest of the list
+      if( token[1] == 'Masked' ) {
+        editor->IndicatorClearRange(token.fpos-1, #token.name);
+      }
+      // trim the list as it will be re-generated
+      table.remove(tokens, n);
+    }
+
+    // Clear masked indicators from the current position to the end as these
+    // will be re-calculated and re-applied based on masking variables.
+    // This step is needed as some positions could have shifted after updates.
+    editor->IndicatorClearRange(pos-1, editor->GetLength()-pos+1);
+
+    editor->SetIndicatorCurrent(curindic);
+
+    // need to cleanup vars as they may include variables from later
+    // fragments (because the cut-point was arbitrary). Also need
+    // to clean variables in other scopes, hence getmetatable use.
+    var vars = vars;
+    while( vars ) {
+      for( name, _v_var in pairs(vars) ) {
+        // remove all variables that are created later than the current pos
+        // skip all non-variable elements from the vars table
+        if( type(name) == 'string' ) {
+          while( type(_v_var) == 'table' && _v_var.fpos && (_v_var.fpos > pos) ) {
+            _v_var = _v_var.masked; // restored a masked var
+            vars[name] = _v_var;
+          }
+        }
+      }
+      vars = getmetatable(vars) && getmetatable(vars).__index;
+    }
+  } else {
+    if( pos == 1 ) { // if not continuing, then trim the list
+      tokens = editor->ResetTokenList();
+    }
+  }
+
+  var cleared = {};
+  for( _, indic in ipairs ({indicator.FNCALL, indicator.LOCAL, indicator.GLOBAL, indicator.MASKING, indicator.SELF}) ) {
+    cleared[indic] = pos;
+  }
+
+  var function IndicateOne(indic, pos, length) {
+    editor->SetIndicatorCurrent(indic);
+    editor->IndicatorClearRange(cleared[indic]-1, pos-cleared[indic]);
+    editor->IndicatorFillRange(pos-1, length);
+    cleared[indic] = pos+length;
+  }
+
+  var s = ide->GetTime();
+  var canwork = start && 0.010 || 0.100; // use shorter interval when typing
+  var f = editor.spec.marksymbols(editor->GetTextDyn(), pos, vars);
+  while( true ) {
+    var op, name, lineinfo, vars, at, nobreak = f();
+    if( ! op ) { break; }
+    var _v_var = vars && vars[name];
+    var token = {op, name=name, fpos=lineinfo, at=at, context=vars,
+      this = (op == 'VarSelf') || null, nobreak=nobreak};
+    if( op == 'Function' ) {
+      vars['function'] = (vars['function'] || 0) + 1;
+    }
+    if( op == 'FunctionCall' ) {
+      if( indic.fncall && edcfg.showfncall ) {
+        IndicateOne(indicator.FNCALL, lineinfo, #name);
+      }
+    } else if( op != 'VarNext' && op != 'VarInside' && op != 'Statement' && op != 'String' ) {
+      table.insert(tokens, token);
+    }
+
+    // indicate local/global variables
+    if( op == 'Id'
+    && (_v_var && indic.varlocal || ! _v_var && indic.varglobal) ) {
+      IndicateOne(_v_var && (_v_var.this && indicator.SELF || indicator.LOCAL) || indicator.GLOBAL, lineinfo, #name);
+    }
+
+    // indicate masked values at the same level
+    if( op == 'Var' && _v_var && (_v_var.masked && at == _v_var.masked.at) ) {
+      var fpos = _v_var.masked.fpos;
+      // indicate masked if it's not implicit self
+      if( indic.varmasked && ! _v_var.masked.this ) {
+        editor->SetIndicatorCurrent(indicator.MASKED);
+        editor->IndicatorFillRange(fpos-1, #name);
+        table.insert(tokens, {"Masked", name=name, fpos=fpos, nobreak=nobreak});
+      }
+
+      if( indic.varmasking ) { IndicateOne(indicator.MASKING, lineinfo, #name); }
+    }
+    // in some rare cases `nobreak` may be a number indicating a desired
+    // position from which to start in case of a break
+    if( lineinfo && nobreak != true && (op == 'Statement' || op == 'String') && ide->GetTime()-s > canwork ) {
+      delayed[editor] = {tonumber(nobreak) || lineinfo, vars};
+      break;
+    }
+  }
+
+  // clear indicators till the end of processed fragment
+  pos = delayed[editor] && delayed[editor][1] || editor->GetLength()+1;
+
+  // don't clear "masked" indicators as those can be set out of order (so
+  // last updated fragment is not always the last in terms of its position);
+  // these indicators should be up-to-date to the end of the code fragment.
+  var funconly = ide.config.editor.showfncall && editor.spec.isfncall;
+  for( _, indic in ipairs ({indicator.FNCALL, indicator.LOCAL, indicator.GLOBAL, indicator.MASKING}) ) {
+    // don't clear "funccall" indicators as those can be set based on
+    // IndicateFunctionsOnly processing, which is dealt with separately
+    if( indic != indicator.FNCALL || ! funconly ) { IndicateOne(indic, pos, 0); }
+  }
+
+  var needmore = delayed[editor] != null;
+  if( ide.config.outlineinactivity ) {
+    if( needmore ) { ide.timers.outline->Stop();
+    } else { ide.timers.outline->Start(ide.config.outlineinactivity*1000, wx.wxTIMER_ONE_SHOT);
+    }
+  }
+  return needmore; // request more events if still need to work
+}
+
+// ----------------------------------------------------------------------------
+// Create an editor
+function CreateEditor(bare) {
+  var editor = ide->CreateStyledTextCtrl(notebook, editorID,
+    wx.wxDefaultPosition, wx.wxSize(0, 0), wx.wxBORDER_NONE);
+
+  editorID +=   1; // increment so they're always unique
+
+  editor.matchon = false;
+  editor.assignscache = false;
+  editor.bom = false;
+  editor.updated = 0;
+  editor.jumpstack = {};
+  editor.ctrlcache = {};
+  editor.tokenlist = {};
+  editor.onidle = {};
+  editor.usedynamicwords = true;
+  // populate cache with Ctrl-<letter> combinations for workaround on Linux
+  // http://wxwidgets.10942.n7.nabble.com/Menu-shortcuts-inconsistentcy-issue-td85065.html
+  for( id, shortcut in pairs(ide.config.keymap) ) {
+    if( shortcut->match('%f[%w]Ctrl[-+]') ) {
+      var mask = (wx.wxMOD_CONTROL
+        + (shortcut->match('%f[%w]Alt[-+]') && wx.wxMOD_ALT || 0)
+        + (shortcut->match('%f[%w]Shift[-+]') && wx.wxMOD_SHIFT || 0)
+      );
+      var key = shortcut->match('[-+](.)$');
+      if( key ) { editor.ctrlcache[key->byte()..mask] = id; }
+    }
+  }
+
+  // populate editor keymap with configured combinations
+  for( _, map in pairs(edcfg.keymap || {}) ) {
+    var key, mod, cmd, osname = unpack(map);
+    if( ! osname || osname == ide.osname ) {
+      if( cmd ) {
+        editor->CmdKeyAssign(key, mod, cmd);
+      } else {
+        editor->CmdKeyClear(key, mod);
+      }
+    }
+  }
+
+  editor->SetBufferedDraw(! ide.config.hidpi && true || false);
+  editor->StyleClearAll();
+
+  editor->SetFont(ide.font.editor);
+  editor->StyleSetFont(wxstc.wxSTC_STYLE_DEFAULT, editor->GetFont());
+
+  editor->SetTabWidth(tonumber(edcfg.tabwidth) || 2);
+  editor->SetIndent(tonumber(edcfg.tabwidth) || 2);
+  editor->SetUseTabs(edcfg.usetabs && true || false);
+  editor->SetIndentationGuides(tonumber(edcfg.indentguide) || (edcfg.indentguide && true || false));
+  editor->SetViewWhiteSpace(tonumber(edcfg.whitespace) || (edcfg.whitespace && true || false));
+  editor->SetEndAtLastLine(edcfg.endatlastline && true || false);
+
+  if( (edcfg.usewrap) ) {
+    editor->SetWrapMode(edcfg.wrapmode);
+    editor->SetWrapStartIndent(0);
+    if( ide.wxver >= "2.9.5" ) {
+      if( edcfg.wrapflags ) {
+        editor->SetWrapVisualFlags(tonumber(edcfg.wrapflags) || wxstc.wxSTC_WRAPVISUALFLAG_NONE);
+      }
+      if( edcfg.wrapstartindent ) {
+        editor->SetWrapStartIndent(tonumber(edcfg.wrapstartindent) || 0);
+      }
+      if( edcfg.wrapindentmode ) {
+        editor->SetWrapIndentMode(tonumber(edcfg.wrapindentmode) || wxstc.wxSTC_WRAPINDENT_FIXED);
+      }
+      if( edcfg.wrapflagslocation ) {
+        editor->SetWrapVisualFlagsLocation(tonumber(edcfg.wrapflagslocation) || wxstc.wxSTC_WRAPVISUALFLAGLOC_DEFAULT);
+      }
+    }
+  } else {
+    editor->SetScrollWidth(100); // set default width
+    editor->SetScrollWidthTracking(1); // enable width auto-adjustment
+  }
+
+  if( edcfg.defaulteol == wxstc.wxSTC_EOL_CRLF
+  || edcfg.defaulteol == wxstc.wxSTC_EOL_LF ) {
+    editor->SetEOLMode(edcfg.defaulteol);
+  // else: keep wxStyledTextCtrl default behavior (CRLF on Windows, LF on Unix)
+  }
+
+  editor->SetCaretLineVisible(edcfg.caretline && true || false);
+
+  editor->SetVisiblePolicy(wxstc.wxSTC_VISIBLE_STRICT, 3);
+
+  editor->SetMarginType(margin.LINENUMBER, wxstc.wxSTC_MARGIN_NUMBER);
+  editor->SetMarginMask(margin.LINENUMBER, 0);
+  editor->SetMarginWidth(margin.LINENUMBER,
+    edcfg.linenumber && math.floor(linenumlen * editor->TextWidth(wxstc.wxSTC_STYLE_DEFAULT, "8")) || 0);
+
+  editor->SetMarginWidth(margin.MARKER, 18);
+  editor->SetMarginType(margin.MARKER, wxstc.wxSTC_MARGIN_SYMBOL);
+  editor->SetMarginMask(margin.MARKER, 0xffffffff - wxstc.wxSTC_MASK_FOLDERS);
+  editor->SetMarginSensitive(margin.MARKER, true);
+
+  editor->MarkerDefine(StylesGetMarker("currentline"));
+  editor->MarkerDefine(StylesGetMarker("breakpoint"));
+  editor->MarkerDefine(StylesGetMarker("bookmark"));
+
+  if( edcfg.fold ) {
+    editor->SetMarginWidth(margin.FOLD, 18);
+    editor->SetMarginType(margin.FOLD, wxstc.wxSTC_MARGIN_SYMBOL);
+    editor->SetMarginMask(margin.FOLD, wxstc.wxSTC_MASK_FOLDERS);
+    editor->SetMarginSensitive(margin.FOLD, true);
+  }
+
+  editor->SetFoldFlags(tonumber(edcfg.foldflags) || wxstc.wxSTC_FOLDFLAG_LINEAFTER_CONTRACTED);
+  editor->SetBackSpaceUnIndents(edcfg.backspaceunindent && 1 || 0);
+
+  if( ide.wxver >= "2.9.5" ) {
+    // allow multiple selection and multi-cursor editing if supported
+    editor->SetMultipleSelection(1);
+    editor->SetAdditionalCaretsBlink(1);
+    editor->SetAdditionalSelectionTyping(1);
+    // allow extra ascent/descent
+    editor->SetExtraAscent(tonumber(edcfg.extraascent) || 0);
+    editor->SetExtraDescent(tonumber(edcfg.extradescent) || 0);
+    // set whitespace size
+    editor->SetWhitespaceSize(tonumber(edcfg.whitespacesize) || 1);
+    // set virtual space options
+    editor->SetVirtualSpaceOptions(tonumber(edcfg.virtualspace) || 0);
+  }
+
+  {
+    var fg, bg = wx.wxWHITE, wx.wxColour(128, 128, 128);
+    var foldtype = foldtypes[edcfg.foldtype] || foldtypes.box;
+    var foldmarkers = foldtypes[0];
+    for( m = 1, #foldmarkers ) {
+      editor->MarkerDefine(foldmarkers[m], foldtype[m] || wxstc.wxSTC_MARK_EMPTY, fg, bg);
+    }
+    bg->delete();
+  }
+
+  if( edcfg.calltipdelay && edcfg.calltipdelay > 0 ) {
+    editor->SetMouseDwellTime(edcfg.calltipdelay);
+  }
+
+  if( edcfg.edgemode != wxstc.wxSTC_EDGE_NONE || edcfg.edge ) {
+    editor->SetEdgeMode(edcfg.edgemode != wxstc.wxSTC_EDGE_NONE && edcfg.edgemode || wxstc.wxSTC_EDGE_LINE);
+    editor->SetEdgeColumn(tonumber(edcfg.edge) || 80);
+  }
+
+  editor->AutoCompSetIgnoreCase(ide.config.acandtip.ignorecase);
+  if( (ide.config.acandtip.strategy > 0) ) {
+    editor->AutoCompSetAutoHide(0);
+    editor->AutoCompStops([=[ \n\t=-+():.,;*/!"'$%&~'#°^@?´`<>][|}{]=]);
+  }
+  if( ide.config.acandtip.fillups ) {
+    editor->AutoCompSetFillUps(ide.config.acandtip.fillups);
+  }
+
+  if( ide->IsValidProperty(editor, "SetMultiPaste") ) { editor->SetMultiPaste(wxstc.wxSTC_MULTIPASTE_EACH); }
+
+  function editor::UseDynamicWords(val) {
+    if( val == null ) { return this.usedynamicwords; }
+    this.usedynamicwords = val;
+  }
+
+  function editor::GetTokenList() { return this.tokenlist; }
+  function editor::ResetTokenList() { this.tokenlist = {}; return this.tokenlist; }
+
+  function editor::IndicateSymbols(...) { return indicateSymbols(this, ...); }
+
+  function editor::ValueFromPosition(pos) { return getValAtPosition(this, pos); }
+
+  function editor::MarkerGotoNext(marker) {
+    var value = 2**marker;
+    var line = editor->MarkerNext(editor->GetCurrentLine()+1, value);
+    if( line == wx.wxNOT_FOUND ) { line = editor->MarkerNext(0, value); }
+    if( line == wx.wxNOT_FOUND ) { return; }
+    editor->GotoLine(line);
+    editor->EnsureVisibleEnforcePolicy(line);
+    return line;
+  }
+  function editor::MarkerGotoPrev(marker) {
+    var value = 2**marker;
+    var line = editor->MarkerPrevious(editor->GetCurrentLine()-1, value);
+    if( line == wx.wxNOT_FOUND ) { line = editor->MarkerPrevious(editor->GetLineCount(), value); }
+    if( line == wx.wxNOT_FOUND ) { return; }
+    editor->GotoLine(line);
+    editor->EnsureVisibleEnforcePolicy(line);
+    return line;
+  }
+  function editor::MarkerToggle(marker, line, value) {
+    if( type(marker) == "string" ) { marker = StylesGetMarker(marker); }
+    assert(marker != null, "Marker update requires known marker type");
+    line = line || editor->GetCurrentLine();
+    var isset = bit.band(editor->MarkerGet(line), 2**marker) > 0;
+    if( value != null && isset == value ) { return; }
+    if( PackageEventHandle("onEditorMarkerUpdate", editor, marker, line+1, ! isset) == false ) { return; }
+    if( isset ) {
+      editor->MarkerDelete(line, marker);
+    } else {
+      editor->MarkerAdd(line, marker);
+    }
+  }
+
+  function editor::BookmarkToggle(...) { return this->MarkerToggle("bookmark", ...); }
+  function editor::BreakpointToggle(...) { return this->MarkerToggle("breakpoint", ...); }
+
+  function editor::DoWhenIdle(func) { table.insert(this.onidle, func); }
+
+  // GotoPos should work by itself, but it doesn't (wx 2.9.5).
+  // This is likely because the editor window hasn't been refreshed yet,
+  // so its LinesOnScreen method returns 0/-1, which skews the calculations.
+  // To avoid this, the caret line is made visible at the first opportunity.
+  {
+    var redolater;
+    function editor::GotoPosDelayed(pos) {
+      var badtime = this->LinesOnScreen() <= 0; // -1 on OSX, 0 on Windows
+      if( pos ) {
+        if( badtime ) {
+          redolater = pos;
+          // without this GotoPos the content is not scrolled correctly on
+          // Windows, but with this it's not scrolled correctly on OSX.
+          if( ide.osname != 'Macintosh' ) { this->GotoPos(pos); }
+        } else {
+          redolater = null;
+          this->GotoPosEnforcePolicy(pos);
+        }
+      } else if( ! badtime && redolater ) {
+        // reset the left margin first to make sure that the position
+        // is set "from the left" to get the best content displayed.
+        this->SetXOffset(0);
+        this->GotoPosEnforcePolicy(redolater);
+        redolater = null;
+      }
+    }
+  }
+
+  if( bare ) { return editor; } // bare editor doesn't have any event handlers
+
+  editor.ev = {};
+  editor->Connect(wxstc.wxEVT_STC_MARGINCLICK,
+    function (event) {
+      var line = editor->LineFromPosition(event->GetPosition());
+      var marginno = event->GetMargin();
+      if( marginno == margin.MARKER ) {
+        editor->BreakpointToggle(line);
+      } else if( marginno == margin.FOLD ) {
+        var header = bit.band(editor->GetFoldLevel(line),
+          wxstc.wxSTC_FOLDLEVELHEADERFLAG) == wxstc.wxSTC_FOLDLEVELHEADERFLAG;
+        var shift, ctrl = wx.wxGetKeyState(wx.WXK_SHIFT), wx.wxGetKeyState(wx.WXK_CONTROL);
+        if( shift && ctrl ) {
+          editor->FoldSome(line);
+        } else if( ctrl ) { // select the scope that was clicked on
+          var from = header && line || editor->GetFoldParent(line);
+          if( from > -1 ) { // only select if there is a block to select
+            var to = editor->GetLastChild(from, -1);
+            editor->SetSelection(editor->PositionFromLine(from), editor->PositionFromLine(to+1));
+          }
+        } else if( header || shift ) {
+          editor->ToggleFold(line);
+        }
+      }
+    });
+
+  editor->Connect(wxstc.wxEVT_STC_MODIFIED,
+    function (event) {
+      if( (editor.assignscache && editor->GetCurrentLine() != editor.assignscache.line) ) {
+        editor.assignscache = false;
+      }
+      var evtype = event->GetModificationType();
+      if( bit.band(evtype, wxstc.wxSTC_MOD_CHANGEMARKER) == 0 ) {
+        // this event is being called on OSX too frequently, so skip these notifications
+        editor.updated = ide->GetTime();
+      }
+      var pos = event->GetPosition();
+      var firstLine = editor->LineFromPosition(pos);
+      var inserted = bit.band(evtype, wxstc.wxSTC_MOD_INSERTTEXT) != 0;
+      var deleted = bit.band(evtype, wxstc.wxSTC_MOD_DELETETEXT) != 0;
+      if( (inserted || deleted) ) {
+        SetAutoRecoveryMark();
+
+        var linesChanged = inserted && event->GetLinesAdded() || 0;
+        // collate events if they are for the same line
+        var events = #editor.ev;
+        if( events == 0 || editor.ev[events][1] != firstLine ) {
+          editor.ev[events+1] = {firstLine, linesChanged};
+        } else if( events > 0 && editor.ev[events][1] == firstLine ) {
+          editor.ev[events][2] = math.max(editor.ev[events][2], linesChanged);
+        }
+        if( editor.usedynamicwords ) { DynamicWordsAdd(editor, null, firstLine, linesChanged); }
+      }
+
+      var beforeInserted = bit.band(evtype,wxstc.wxSTC_MOD_BEFOREINSERT) != 0;
+      var beforeDeleted = bit.band(evtype,wxstc.wxSTC_MOD_BEFOREDELETE) != 0;
+
+      if( (beforeInserted || beforeDeleted) ) {
+        // unfold the current line being changed if folded, but only if one selection
+        var lastLine = editor->LineFromPosition(pos+event->GetLength());
+        var selections = ide.wxver >= "2.9.5" && editor->GetSelections() || 1;
+        if( (! editor->GetFoldExpanded(firstLine)
+          || ! editor->GetLineVisible(firstLine)
+          || ! editor->GetLineVisible(lastLine))
+        && selections == 1 ) {
+          for( line = firstLine, lastLine ) {
+            if( ! editor->GetLineVisible(line) ) { editor->ToggleFold(editor->GetFoldParent(line)); }
+          }
+        }
+      }
+
+      // hide calltip/auto-complete after undo/redo/delete
+      var undodelete = (wxstc.wxSTC_MOD_DELETETEXT
+        + wxstc.wxSTC_PERFORMED_UNDO + wxstc.wxSTC_PERFORMED_REDO);
+      if( bit.band(evtype, undodelete) != 0 ) {
+        editor->DoWhenIdle(function(editor) {
+            if( editor->CallTipActive() ) { editor->CallTipCancel(); }
+            if( editor->AutoCompActive() ) { editor->AutoCompCancel(); }
+          });
+      }
+      
+      if( ide.config.acandtip.nodynwords ) { return; }
+      // only required to track changes
+
+      if( beforeDeleted ) {
+        var text = editor->GetTextRangeDyn(pos, pos+event->GetLength());
+        var _, numlines = text->gsub("\r?\n","%1");
+        if( editor.usedynamicwords ) { DynamicWordsRem(editor,null,firstLine, numlines); }
+      }
+      if( beforeInserted ) {
+        if( editor.usedynamicwords ) { DynamicWordsRem(editor,null,firstLine, 0); }
+      }
+    });
+
+  editor->Connect(wxstc.wxEVT_STC_CHARADDED,
+    function (event) {
+      var LF = string.byte("\n"); // `CHARADDED` gets `\n` code on all platforms
+      var ch = event->GetKey();
+      var pos = editor->GetCurrentPos();
+      var line = editor->GetCurrentLine();
+      var linetx = editor->GetLineDyn(line);
+      var linestart = editor->PositionFromLine(line);
+      var localpos = pos-linestart;
+      var linetxtopos = linetx->sub(1,localpos);
+
+      if( PackageEventHandle("onEditorCharAdded", editor, event) == false ) {
+        // this event has already been handled
+      } else if( (ch == LF) ) {
+        // auto-indent
+        if( (line > 0) ) {
+          var indent = editor->GetLineIndentation(line - 1);
+          var linedone = editor->GetLineDyn(line - 1);
+
+          // if the indentation is 0 and the current line is not empty,
+          // but the previous line is empty, then take indentation from the
+          // current line (instead of the previous one). This may happen when
+          // CR is hit at the beginning of a line (rather than at the end).
+          if( indent == 0 && ! linetx->match("^[\010\013]*$")
+          && linedone->match("^[\010\013]*$") ) {
+            indent = editor->GetLineIndentation(line);
+          }
+
+          var ut = editor->GetUseTabs();
+          var tw = ut && editor->GetTabWidth() || editor->GetIndent();
+          var style = bit.band(editor->GetStyleAt(editor->PositionFromLine(line-1)), ide.STYLEMASK);
+
+          if( edcfg.smartindent
+          // don't apply smartindent to multi-line comments or strings
+          && ! (editor.spec.iscomment[style]
+            || editor.spec.isstring[style]
+            || (MarkupIsAny && MarkupIsAny(style)))
+          && editor.spec.isdecindent && editor.spec.isincindent ) {
+            var closed, blockend = editor.spec.isdecindent(linedone);
+            var opened = editor.spec.isincindent(linedone);
+
+            // if the current block is already indented, skip reverse indenting
+            if( (line > 1) && (closed > 0 || blockend > 0)
+            && editor->GetLineIndentation(line-2) > indent ) {
+              // adjust opened first; this is needed when use ENTER after })
+              if( blockend == 0 ) { opened +=   closed; }
+              closed, blockend = 0, 0;
+            }
+            editor->SetLineIndentation(line-1, indent - tw * closed);
+            indent +=   tw * (opened - blockend);
+            if( indent < 0 ) { indent = 0; }
+          }
+          editor->SetLineIndentation(line, indent);
+
+          indent = ut && (indent / tw) || indent;
+          editor->GotoPos(editor->GetCurrentPos()+indent);
+        }
+
+      } else if( ch == ("(")->byte() || ch == (",")->byte() ) {
+        if( ch == (",")->byte() ) {
+          // comma requires special handling: either it's in a list of parameters
+          // and follows an opening bracket, or it does nothing
+          if( linetxtopos->gsub("%b()","")->find("%(") ) {
+            linetxtopos = linetxtopos->gsub("%b()","")->gsub("%(.+,$", "(");
+          } else {
+            linetxtopos = null;
+          }
+        }
+        var _v_var, funccall = editor->ValueFromPosition(pos);
+        var tip = GetTipInfo(editor, funccall || _v_var, ide.config.acandtip.shorttip);
+        if( tip ) {
+          if( editor->CallTipActive() ) { editor->CallTipCancel(); }
+          if( PackageEventHandle("onEditorCallTip", editor, tip) != false ) {
+            editor->DoWhenIdle(function(editor) { callTipFitAndShow(editor, pos, tip); });
+          }
+        }
+
+      } else if( ide.config.autocomplete ) { // code completion prompt
+        var trigger = linetxtopos->match("["..editor.spec.sep.."%w_]+$");
+        if( trigger && (#trigger > 1 || trigger->match("["..editor.spec.sep.."]")) ) {
+          editor->DoWhenIdle(function(editor) { EditorAutoComplete(editor); });
+        }
+      }
+    });
+
+  editor->Connect(wxstc.wxEVT_STC_DWELLSTART,
+    function (event) {
+      // on Linux DWELLSTART event seems to be generated even for those
+      // editor windows that are not active. What's worse, when generated
+      // the event seems to report "old" position when retrieved using
+      // event:GetX and event:GetY, so instead we use wxGetMousePosition.
+      var linux = ide.osname == 'Unix';
+      if( linux && editor != ide->GetEditor() ) { return; }
+
+      // check if this editor has focus; it may not when Stack/Watch window
+      // is on top, but DWELL events are still triggered in this case.
+      // Don't want to show calltip as it is still shown when the focus
+      // is switched to a different application.
+      var focus = editor->FindFocus();
+      if( focus && focus->GetId() != editor->GetId() ) { return; }
+
+      // event:GetX() and event:GetY() positions don't correspond to
+      // the correct positions calculated using ScreenToClient (at least
+      // on Windows and Linux), so use what's calculated.
+      var mpos = wx.wxGetMousePosition();
+      var cpos = editor->ScreenToClient(mpos);
+      var position = editor->PositionFromPointClose(cpos.x, cpos.y);
+      if( position != wxstc.wxSTC_INVALID_POSITION ) {
+        EditorCallTip(editor, position, mpos.x, mpos.y);
+      }
+      event->Skip();
+    });
+
+  editor->Connect(wxstc.wxEVT_STC_DWELLEND,
+    function (event) {
+      if( editor->CallTipActive() ) { editor->CallTipCancel(); }
+      event->Skip();
+    });
+
+  editor->Connect(wx.wxEVT_KILL_FOCUS,
+    function (event) {
+      // on OSX clicking on scrollbar in the popup is causing the editor to lose focus,
+      // which causes canceling of auto-complete, which later cause crash because
+      // the window is destroyed in wxwidgets after already being closed. Skip on OSX.
+      if( ide.osname != 'Macintosh' && editor->AutoCompActive() ) { editor->AutoCompCancel(); }
+      PackageEventHandle("onEditorFocusLost", editor);
+      event->Skip();
+    });
+
+  var eol = {
+    [wxstc.wxSTC_EOL_CRLF] = "\r\n",
+    [wxstc.wxSTC_EOL_LF] = "\n",
+    [wxstc.wxSTC_EOL_CR] = "\r",
+  };
+  var function addOneLine(editor, adj) {
+    var pos = editor->GetLineEndPosition(editor->LineFromPosition(editor->GetCurrentPos())+(adj || 0));
+    var added = eol[editor->GetEOLMode()] || "\n";
+    editor->InsertTextDyn(pos, added);
+    editor->SetCurrentPos(pos+#added);
+
+    var ev = wxstc.wxStyledTextEvent(wxstc.wxEVT_STC_CHARADDED);
+    ev->SetKey(string.byte("\n"));
+    editor->AddPendingEvent(ev);
+  }
+
+  editor->Connect(wxstc.wxEVT_STC_USERLISTSELECTION,
+    function (event) {
+      if( PackageEventHandle("onEditorUserlistSelection", editor, event) == false ) {
+        return;
+      }
+
+      // if used Shift-Enter, then skip auto complete and just do Enter.
+      // `lastkey` comparison can be replaced with checking `listCompletionMethod`,
+      // but it's not exposed in wxSTC (as of wxwidgets 3.1.1)
+      if( wx.wxGetKeyState(wx.WXK_SHIFT) && editor.lastkey == ("\r")->byte() ) {
+        return addOneLine(editor);
+      }
+
+      if( ide.wxver >= "2.9.5" && editor->GetSelections() > 1 ) {
+        var text = event->GetText();
+        // capture all positions as the selection may change
+        var positions = {};
+        for( s = 0, editor->GetSelections()-1 ) {
+          table.insert(positions, editor->GetSelectionNCaret(s));
+        }
+        // process all selections from last to first
+        table.sort(positions);
+        var mainpos = editor->GetSelectionNCaret(editor->GetMainSelection());
+
+        editor->BeginUndoAction();
+        for( s = #positions, 1, -1 ) {
+          var pos = positions[s];
+          var startpos = editor->WordStartPosition(pos, true);
+          editor->SetSelection(startpos, pos);
+          editor->ReplaceSelection(text);
+          // if this is the main position, save new cursor position to restore
+          if( pos == mainpos ) { mainpos = editor->GetCurrentPos();
+          } else if( pos < mainpos ) {
+            // adjust main position as earlier changes may affect it
+            mainpos +=   #text - (pos - startpos);
+          }
+        }
+        editor->EndUndoAction();
+
+        editor->GotoPos(mainpos);
+      } else {
+        var pos = editor->GetCurrentPos();
+        var startpos = editor->WordStartPosition(pos, true);
+        var endpos = editor->WordEndPosition(pos, true);
+        editor->SetSelection(startpos, ide.config.acandtip.droprest && endpos || pos);
+        editor->ReplaceSelection(event->GetText());
+      }
+    });
+
+  var function updateModified() {
+    var update = function() {
+      var doc = ide->GetDocument(editor);
+      if( doc ) { doc->SetTabText(); }
+    };
+    // delay update on Unix/Linux as it seems to hang the application on ArchLinux;
+    // execute immediately on other platforms
+    if( ide.osname == "Unix" ) { editor->DoWhenIdle(update); } else { update(); }
+  }
+  editor->Connect(wxstc.wxEVT_STC_SAVEPOINTREACHED, updateModified);
+  editor->Connect(wxstc.wxEVT_STC_SAVEPOINTLEFT, updateModified);
+
+  // "updateStatusText" should be called in UPDATEUI event, but it creates
+  // several performance problems on Windows (using wx2.9.5+) when
+  // brackets or backspace is used (very slow screen repaint with 0.5s delay).
+  // Moving it to PAINTED event creates problems on OSX (using wx2.9.5+),
+  // where refresh of R/W and R/O status in the status bar is delayed.
+
+  editor->Connect(wxstc.wxEVT_STC_PAINTED,
+    function (event) {
+      PackageEventHandle("onEditorPainted", editor, event);
+
+      if( ide.osname == 'Windows' ) {
+        // STC_PAINTED is called on multiple editors when they point to
+        // the same document; only update status for the active one
+        if( notebook->GetSelection() == notebook->GetPageIndex(editor) ) {
+          updateStatusText(editor);
+        }
+
+        if( edcfg.usewrap != true && editor->AutoCompActive() ) {
+          // showing auto-complete list leaves artifacts on the screen,
+          // which can only be fixed by a forced refresh.
+          // shows with wxSTC 3.21 and both wxwidgets 2.9.5 and 3.1
+          editor->Update();
+          editor->Refresh();
+        }
+      }
+
+      // adjust line number margin, but only if it's already shown
+      var linecount = #tostring(editor->GetLineCount()) + 0.5;
+      var mwidth = editor->GetMarginWidth(margin.LINENUMBER);
+      if( mwidth > 0 ) {
+        var width = math.max(linecount, linenumlen) * editor->TextWidth(wxstc.wxSTC_STYLE_DEFAULT, "8");
+        if( mwidth != width ) { editor->SetMarginWidth(margin.LINENUMBER, math.floor(width)); }
+      }
+    });
+
+  editor.processedUpdateContent = 0;
+  editor->Connect(wxstc.wxEVT_STC_UPDATEUI,
+    function (event) {
+      // some of UPDATEUI events may be triggered as the result of editor updates
+      // from subsequent events (like PAINTED, which happens in documentmap plugin).
+      // the reason for the `processed` check is that it is not possible
+      // to completely skip all of these updates as this causes the issue
+      // of markup styling becoming visible after text deletion by Backspace.
+      // to avoid this, we allow the first update after any updates caused
+      // by real changes; the rest of UPDATEUI events are skipped.
+      // (use direct comparison, as need to skip events that just update content)
+      if( event->GetUpdated() == wxstc.wxSTC_UPDATE_CONTENT
+      && ! next(editor.ev) ) {
+         if( editor.processedUpdateContent > 1 ) { return; }
+      } else {
+         editor.processedUpdateContent = 0;
+      }
+      editor.processedUpdateContent = editor.processedUpdateContent + 1;
+
+      PackageEventHandle("onEditorUpdateUI", editor, event);
+
+      if( ide.osname != 'Windows' ) { updateStatusText(editor); }
+
+      editor->GotoPosDelayed();
+      updateBraceMatch(editor);
+      var minupdated;
+      for( _,iv in ipairs(editor.ev) ) {
+        var line = iv[1];
+        if( ! minupdated || line < minupdated ) { minupdated = line; }
+        IndicateFunctionsOnly(editor,line,line+iv[2]);
+      }
+      if( minupdated ) {
+        var ok, res = pcall(indicateSymbols, editor, minupdated);
+        if( ! ok ) { ide->Print("Internal error: ",res,minupdated); }
+      }
+      var firstvisible = editor->GetFirstVisibleLine();
+      var firstline = editor->DocLineFromVisible(firstvisible);
+      var lastline = editor->DocLineFromVisible(firstvisible + editor->LinesOnScreen());
+      // cap last line at the number of lines in the document
+      MarkupStyle(editor, minupdated || firstline, math.min(editor->GetLineCount(),lastline));
+      editor.ev = {};
+    });
+
+  editor->Connect(wx.wxEVT_IDLE,
+    function (event) {
+      while( #editor.onidle > 0 ) { table.remove(editor.onidle, 1)(editor); }
+    });
+
+  editor->Connect(wx.wxEVT_LEFT_DOWN,
+    function (event) {
+      if( MarkupHotspotClick ) {
+        var position = editor->PositionFromPointClose(event->GetX(),event->GetY());
+        if( position != wxstc.wxSTC_INVALID_POSITION ) {
+          if( MarkupHotspotClick(position, editor) ) { return; }
+        }
+      }
+
+      if( event->ControlDown() && event->AltDown()
+      // ide.wxver >= "2.9.5"; fix after GetModifiers is added to wxMouseEvent in wxlua
+      && ! event->ShiftDown() && ! event->MetaDown() ) {
+        var point = event->GetPosition();
+        var pos = editor->PositionFromPointClose(point.x, point.y);
+        var value = pos != wxstc.wxSTC_INVALID_POSITION && editor->ValueFromPosition(pos) || null;
+        var instances = value && indicateFindInstances(editor, value, pos+1);
+        if( instances && instances[0] ) {
+          navigateToPosition(editor, pos, instances[0]-1, #value);
+          return;
+        }
+      }
+      event->Skip();
+    });
+
+  if( edcfg.nomousezoom ) {
+    // disable zoom using mouse wheel as it triggers zooming when scrolling
+    // on OSX with kinetic scroll and then pressing CMD.
+    editor->Connect(wx.wxEVT_MOUSEWHEEL,
+      function (event) {
+        if( wx.wxGetKeyState(wx.WXK_CONTROL) ) { return; }
+        event->Skip();
+      });
+  }
+
+  var inhandler = false;
+  editor->Connect(wx.wxEVT_SET_FOCUS,
+    function (event) {
+      event->Skip();
+      if( inhandler || ide.exitingProgram ) { return; }
+      inhandler = true;
+      PackageEventHandle("onEditorFocusSet", editor);
+      isFileAlteredOnDisk(editor);
+      inhandler = false;
+    });
+
+  editor->Connect(wx.wxEVT_KEY_DOWN,
+    function (event) {
+      var keycode = event->GetKeyCode();
+      var mod = event->GetModifiers();
+      if( PackageEventHandle("onEditorKeyDown", editor, event) == false ) {
+        // this event has already been handled
+        return;
+      } else if( keycode == wx.WXK_ESCAPE ) {
+        if( editor->CallTipActive() || editor->AutoCompActive() ) {
+          event->Skip();
+        } else if( ide.findReplace->IsShown() ) {
+          ide.findReplace->Hide();
+        } else if( ide->GetMainFrame()->IsFullScreen() ) {
+          ide->ShowFullScreen(false);
+        }
+      // Ctrl-Home and Ctrl-End don't work on OSX with 2.9.5+; fix it
+      } else if( ide.osname == 'Macintosh' && ide.wxver >= "2.9.5"
+        && (mod == wx.wxMOD_RAW_CONTROL || mod == (wx.wxMOD_RAW_CONTROL + wx.wxMOD_SHIFT))
+        && (keycode == wx.WXK_HOME || keycode == wx.WXK_END) ) {
+        var pos = keycode == wx.WXK_HOME && 0 || editor->GetLength();
+        if( event->ShiftDown() // mark selection and scroll to caret
+        ) { editor->SetCurrentPos(pos); editor->EnsureCaretVisible();
+        } else { editor->GotoPos(pos); }
+      } else if( (keycode == wx.WXK_DELETE || keycode == wx.WXK_BACK)
+        && (mod == wx.wxMOD_NONE) ) {
+        // Delete and Backspace behave the same way for selected text
+        if( #(editor->GetSelectedText()) > 0 ) {
+          editor->ClearAny();
+        } else {
+          var pos = editor->GetCurrentPos();
+          if( keycode == wx.WXK_BACK ) {
+            pos -=   1;
+            if( pos < 0 ) { return; }
+          }
+
+          // check if the modification is to one of "invisible" characters.
+          // if not, proceed with "normal" processing as there are other
+          // events that may depend on Backspace, for example, re-calculating
+          // auto-complete suggestions.
+          var style = bit.band(editor->GetStyleAt(pos), ide.STYLEMASK);
+          if( ! MarkupIsSpecial || ! MarkupIsSpecial(style) ) {
+            event->Skip();
+            return;
+          }
+
+          editor->SetTargetStart(pos);
+          editor->SetTargetEnd(pos+1);
+          editor->ReplaceTarget("");
+        }
+      } else if( mod == wx.wxMOD_ALT && keycode == wx.WXK_LEFT ) {
+        // if no "jump back" is needed, then do normal processing as this
+        // combination can be mapped to some action
+        if( ! navigateBack(editor) ) { event->Skip(); }
+      } else if( (keycode == wx.WXK_RETURN || keycode == wx.WXK_NUMPAD_ENTER)
+      && (mod == wx.wxMOD_CONTROL || mod == (wx.wxMOD_CONTROL + wx.wxMOD_SHIFT)) ) {
+        addOneLine(editor, mod == (wx.wxMOD_CONTROL + wx.wxMOD_SHIFT) && -1 || 0);
+      } else if( ide.osname == "Unix" && ide.wxver >= "2.9.5"
+      && editor.ctrlcache[keycode..mod] ) {
+        ide.frame->AddPendingEvent(wx.wxCommandEvent(
+          wx.wxEVT_COMMAND_MENU_SELECTED, editor.ctrlcache[keycode..mod]));
+      } else {
+        if( ide.osname == 'Macintosh' && mod == wx.wxMOD_META ) {
+          return; // ignore a key press if Command key is also pressed
+        }
+        event->Skip();
+      }
+
+      editor.lastkey = keycode;
+    });
+
+  var function selectAllInstances(instances, name, curpos) {
+    var this;
+    var idx = 0;
+    for( _, pos in pairs(instances) ) {
+      pos -=   1; // positions are 0-based in Scintilla
+      if( idx == 0 ) {
+        // clear selections first as there seems to be a bug (Scintilla 3.2.3)
+        // that doesn't reset selection after right mouse click.
+        editor->ClearSelections();
+        editor->SetSelection(pos, pos+#name);
+      } else {
+        editor->AddSelection(pos+#name, pos);
+      }
+
+      // check if this is the current selection
+      if( curpos >= pos && curpos <= pos+#name ) { this = idx; }
+      idx +=   1;
+    }
+    if( this ) { editor->SetMainSelection(this); }
+    // set the current name as the search value to make subsequence searches look for it
+    ide.findReplace->SetFind(name);
+  }
+
+  editor->Connect(wxstc.wxEVT_STC_DOUBLECLICK,
+    function(event) {
+      // only activate selection of instances on Ctrl/Cmd-DoubleClick
+      if( event->GetModifiers() == wx.wxMOD_CONTROL ) {
+        var pos = event->GetPosition();
+        var value = pos != wxstc.wxSTC_INVALID_POSITION && editor->ValueFromPosition(pos) || null;
+        var instances = value && indicateFindInstances(editor, value, pos+1);
+        if( instances && (instances[0] || #instances > 0) ) {
+          selectAllInstances(instances, value, pos);
+          return;
+        }
+      }
+
+      event->Skip();
+    });
+
+  editor->Connect(wxstc.wxEVT_STC_ZOOM,
+    function(event) {
+      // if Shift+Zoom is used, then zoom all editors, not just the current one
+      if( wx.wxGetKeyState(wx.WXK_SHIFT) ) {
+        var zoom = editor->GetZoom();
+        for( _, doc in pairs(openDocuments) ) {
+          // check the editor zoom level to avoid recursion
+          if( doc.editor->GetZoom() != zoom ) { doc.editor->SetZoom(zoom); }
+        }
+      }
+      event->Skip();
+    });
+
+  if( ide.osname == "Windows" ) {
+    editor->DragAcceptFiles(true);
+    editor->Connect(wx.wxEVT_DROP_FILES, function(event) {
+        var files = event->GetFiles();
+        if( ! files || #files == 0 ) { return; }
+        // activate all files/directories one by one
+        for( _, filename in ipairs(files) ) { ide->ActivateFile(filename); }
+      });
+  } else if( ide.osname == "Unix" ) {
+    editor->Connect(wxstc.wxEVT_STC_DO_DROP, function(event) {
+        var dropped = event->GetText();
+        // this event may get a list of files separated by \n (and the list ends in \n as well),
+        // so check if what's dropped looks like this list
+        if( dropped->find("^file://.+\n$") ) {
+          for( filename in dropped->gmatch("file://(.-)\n") ) { ide->ActivateFile(filename); }
+          event->SetDragResult(wx.wxDragCancel); // cancel the drag to not paste the text
+        }
+      });
+  }
+
+  var pos;
+  var function getPositionValues() {
+    var p = pos || editor->GetCurrentPos();
+    var value = p != wxstc.wxSTC_INVALID_POSITION && editor->ValueFromPosition(p) || null;
+    var instances = value && indicateFindInstances(editor, value, p+1);
+    return p, value, instances;
+  }
+  editor->Connect(wx.wxEVT_CONTEXT_MENU,
+    function (event) {
+      var point = editor->ScreenToClient(event->GetPosition());
+      // capture the position of the click to use in handlers later
+      pos = editor->PositionFromPoint(point);
+      if( pos == 0 && (point->GetX() < 0 || point->GetY() < 0) ) { pos = null; }
+
+      var _, _, instances = getPositionValues();
+      var occurrences = (! instances || #instances == 0) && ""
+        || (" (%d)")->format(#instances+(instances[0] && 1 || 0));
+      var line = instances && instances[0] && editor->LineFromPosition(instances[0]-1)+1;
+      var def =  line && " ("..TR("on line %d")->format(line)..")" || "";
+      var menu = ide->MakeMenu ({
+        { ID.UNDO, TR("&Undo")..KSC(ID.UNDO) },
+        { ID.REDO, TR("&Redo")..KSC(ID.REDO) },
+        { },
+        { ID.CUT, TR("Cu&t")..KSC(ID.CUT) },
+        { ID.COPY, TR("&Copy")..KSC(ID.COPY) },
+        { ID.PASTE, TR("&Paste")..KSC(ID.PASTE) },
+        { ID.SELECTALL, TR("Select &All")..KSC(ID.SELECTALL) },
+        { },
+        { ID.GOTODEFINITION, TR("Go To Definition")..def..KSC(ID.GOTODEFINITION) },
+        { ID.RENAMEALLINSTANCES, TR("Rename All Instances")..occurrences..KSC(ID.RENAMEALLINSTANCES) },
+        { ID.REPLACEALLSELECTIONS, TR("Replace All Selections")..KSC(ID.REPLACEALLSELECTIONS) },
+        { },
+        { ID.QUICKADDWATCH, TR("Add Watch Expression")..KSC(ID.QUICKADDWATCH) },
+        { ID.QUICKEVAL, TR("Evaluate In Console")..KSC(ID.QUICKEVAL) },
+        { ID.ADDTOSCRATCHPAD, TR("Add To Scratchpad")..KSC(ID.ADDTOSCRATCHPAD) },
+        { ID.RUNTO, TR("Run To Cursor")..KSC(ID.RUNTO) },
+      });
+      // disable calltips that could open over the menu
+      var dwelltime = editor->GetMouseDwellTime();
+      editor->SetMouseDwellTime(0); // disable dwelling
+
+      // cancel calltip if it's already shown as it interferes with popup menu
+      if( editor->CallTipActive() ) { editor->CallTipCancel(); }
+
+      PackageEventHandle("onMenuEditor", menu, editor, event);
+
+      // popup statuses are not refreshed on Linux, so do it manually
+      if( ide.osname == "Unix" ) { UpdateMenuUI(menu, editor); }
+
+      editor->PopupMenu(menu);
+      editor->SetMouseDwellTime(dwelltime); // restore dwelling
+      pos = null; // reset the position
+    });
+
+  editor->Connect(ID.RUNTO, wx.wxEVT_COMMAND_MENU_SELECTED,
+    function() {
+      var pos = getPositionValues();
+      if( pos && pos != wxstc.wxSTC_INVALID_POSITION ) {
+        ide->GetDebugger()->RunTo(editor, editor->LineFromPosition(pos)+1);
+      }
+    });
+
+  editor->Connect(ID.GOTODEFINITION, wx.wxEVT_UPDATE_UI, function(event) {
+      var _, _, instances = getPositionValues();
+      event->Enable(instances && instances[0]);
+    });
+  editor->Connect(ID.GOTODEFINITION, wx.wxEVT_COMMAND_MENU_SELECTED,
+    function(event) {
+      var _, value, instances = getPositionValues();
+      if( value && instances[0] ) {
+        navigateToPosition(editor, editor->GetCurrentPos(), instances[0]-1, #value);
+      }
+    });
+
+  editor->Connect(ID.RENAMEALLINSTANCES, wx.wxEVT_UPDATE_UI, function(event) {
+      var _, _, instances = getPositionValues();
+      event->Enable(instances && (instances[0] || #instances > 0)
+        || editor->GetSelectionStart() != editor->GetSelectionEnd());
+    });
+  editor->Connect(ID.RENAMEALLINSTANCES, wx.wxEVT_COMMAND_MENU_SELECTED,
+    function(event) {
+      var pos, value, instances = getPositionValues();
+      if( value && pos ) {
+        if( ! (instances && (instances[0] || #instances > 0)) ) {
+          // if multiple instances (of a variable) are not detected,
+          // then simply find all instances of (selected) `value`
+          instances = {};
+          var length, pos = editor->GetLength(), 0;
+          while( true ) {
+            editor->SetTargetStart(pos);
+            editor->SetTargetEnd(length);
+            pos = editor->SearchInTarget(value);
+            if( pos == wx.wxNOT_FOUND ) { break; }
+            table.insert(instances, pos+1);
+            pos +=   #value;
+          }
+        }
+        selectAllInstances(instances, value, pos);
+      }
+    });
+
+  editor->Connect(ID.REPLACEALLSELECTIONS, wx.wxEVT_UPDATE_UI, function(event) {
+      event->Enable((ide.wxver >= "2.9.5" && editor->GetSelections() || 1) > 1);
+    });
+  editor->Connect(ID.REPLACEALLSELECTIONS, wx.wxEVT_COMMAND_MENU_SELECTED,
+    function(event) {
+      var main = editor->GetMainSelection();
+      var text = wx.wxGetTextFromUser(
+        TR("Enter replacement text"),
+        TR("Replace All Selections"),
+        editor->GetTextRangeDyn(editor->GetSelectionNStart(main), editor->GetSelectionNEnd(main))
+      );
+      if( ! text || text == "" ) { return; }
+
+      editor->BeginUndoAction();
+      for( s = 0, editor->GetSelections()-1 ) {
+        var selst, selend = editor->GetSelectionNStart(s), editor->GetSelectionNEnd(s);
+        editor->SetTargetStart(selst);
+        editor->SetTargetEnd(selend);
+        editor->ReplaceTarget(text);
+        editor->SetSelectionNStart(s, selst);
+        editor->SetSelectionNEnd(s, selst+#text);
+      }
+      editor->EndUndoAction();
+      editor->SetMainSelection(main);
+    });
+
+  editor->Connect(ID.QUICKADDWATCH, wx.wxEVT_UPDATE_UI, function(event) {
+      var _, value = getPositionValues();
+      event->Enable(value != null);
+    });
+  editor->Connect(ID.QUICKADDWATCH, wx.wxEVT_COMMAND_MENU_SELECTED, function(event) {
+      var _, value = getPositionValues();
+      ide->AddWatch(value);
+    });
+
+  editor->Connect(ID.QUICKEVAL, wx.wxEVT_UPDATE_UI, function(event) {
+      var _, value = getPositionValues();
+      event->Enable(value != null);
+    });
+  editor->Connect(ID.QUICKEVAL, wx.wxEVT_COMMAND_MENU_SELECTED, function(event) {
+      var _, value = getPositionValues();
+      ShellExecuteCode(value);
+    });
+
+  editor->Connect(ID.ADDTOSCRATCHPAD, wx.wxEVT_UPDATE_UI, function(event) {
+      var debugger = ide->GetDebugger();
+      event->Enable(debugger.scratchpad
+        && debugger.scratchpad.editors && ! debugger.scratchpad.editors[editor]);
+    });
+  editor->Connect(ID.ADDTOSCRATCHPAD, wx.wxEVT_COMMAND_MENU_SELECTED,
+    function(event) { ide->GetDebugger()->ScratchpadOn(editor); });
+
+  return editor;
+}
+
+// ----------------------------------------------------------------------------
+// Add an editor to the notebook
+function AddEditor(editor, name) {
+  assert(notebook->GetPageIndex(editor) == wx.wxNOT_FOUND, "Editor being added is not in the notebook: failed");
+
+  // set the document properties
+  var id = editor->GetId();
+  var document = setmetatable({}, ide.proto.Document);
+  document.editor = editor;
+  document.fileName = name;
+  document.filePath = null;
+  document.modTime = null;
+  openDocuments[id] = document;
+
+  // add page only after document is created as there may be handlers
+  // that expect the document (for example, onEditorFocusSet)
+  if( ! notebook->AddPage(editor, name, true) ) {
+    openDocuments[id] = null;
+    return;
+  } else {
+    document.index = notebook->GetPageIndex(editor);
+    return document;
+  }
+}
+
+var lexlpegmap = {
+  text = {"identifier"},
+  lexerdef = {"nothing"},
+  comment = {"comment"},
+  stringtxt = {"string","longstring"},
+  preprocessor= {"preprocessor","embedded"},
+  operator = {"operator"},
+  number = {"number"},
+  keywords0 = {"keyword"},
+  keywords1 = {"constant","variable"},
+  keywords2 = {"function","regex"},
+  keywords3 = {"library","class","type"},
+};
+var function cleanup(paths) {
+  for( _, path in ipairs(paths) ) {
+    if( ! FileRemove(path) ) { wx.wxRmdir(path); }
+  }
+}
+var function setLexLPegLexer(editor, spec) {
+  var lexername = spec.lexer;
+  var lexer = lexername->gsub("^lexlpeg%.","");
+
+  var ppath = package.path;
+  var lpath = ide->GetRootPath("lualibs/lexers");
+
+  package.path = MergeFullPath(lpath, "?.ljs"); // update `package.path` to reference `lexers/`
+  var ok, lex = pcall(require, "lexer");
+  package.path = ppath; // restore the original `package.path`
+  if( ! ok ) { return null, "Can't load LexLPeg lexer components: "..lex; }
+
+  // if the requested lexer is a dynamically registered one, then need to create a file for it,
+  // as LexLPeg lexers are loaded in a separate Lua state, which this process has no contol over.
+  var dynlexer, dynfile = ide->GetLexer(lexername), null;
+  var tmppath = MergeFullPath(wx.wxStandardPaths.Get()->GetTempDir(),
+    "lexer-"..wx.wxGetLocalTimeMillis()->ToString());
+  if( dynlexer ) {
+    var ok, err = CreateFullPath(tmppath);
+    if( ! ok ) { return null, err; }
+    // update lex.LEXERPATH to search there
+    lex.LEXERPATH = MergeFullPath(tmppath, "?.ljs");
+    dynfile = MergeFullPath(tmppath, lexer..".ljs");
+    // save the file to the temp folder
+    ok, err = FileWrite(dynfile, dynlexer);
+    if( ! ok ) { cleanup({tmppath}); return null, err; }
+  }
+  var lexmod, err = lex.load(lexer);
+  if( dynlexer ) { cleanup({dynfile, tmppath}); }
+  if( ! lexmod ) { return null, err; }
+
+  var lexpath = package.searchpath("lexlpeg", ide.osclibs);
+  if( ! lexpath ) { return null, "Can't find LexLPeg lexer."; }
+
+  {
+    var err = wx.wxSysErrorCode();
+    var _ = wx.wxLogNull(); // disable error reporting; will report as needed
+    var loaded = pcall(function() { editor->LoadLexerLibrary(lexpath); });
+    if( ! loaded ) { return null, "Can't load LexLPeg library."; }
+    // the error code may be non-zero, but still needs to be different from the previous one
+    // as it may report non-zero values on Windows (for example, 1447) when no error is generated
+    var newerr = wx.wxSysErrorCode();
+    if( newerr > 0 && newerr != err ) { return null, wx.wxSysErrorMsg(); }
+  }
+
+  if( dynlexer ) {
+    var ok, err = CreateFullPath(tmppath);
+    if( ! ok ) { return null, err; }
+    // copy lexer.ljs to the temp folder
+    ok, err = FileCopy(MergeFullPath(lpath, "lexer.ljs"), MergeFullPath(tmppath, "lexer.ljs"));
+    if( ! ok ) { return null, err; }
+    // save the file to the temp folder
+    ok, err = FileWrite(dynfile, dynlexer);
+    if( ! ok ) { FileRemove(MergeFullPath(tmppath, "lexer.ljs")); return null, err; }
+    // update lpath to point to the temp folder
+    lpath = tmppath;
+  }
+
+  // temporarily set the enviornment variable to load the new lua state with proper paths
+  // do here as the Lua state in LexLPeg parser is initialized furing `SetLexerLanguage` call
+  var cpath;
+  ok, cpath = wx.wxGetEnv("LUA_CPATH");
+  if( ok ) { wx.wxSetEnv("LUA_CPATH", ide.osclibs); }
+  editor->SetLexerLanguage("lpeg");
+  editor->SetProperty("lexer.lpeg.home", lpath);
+  editor->PrivateLexerCall(wxstc.wxSTC_SETLEXERLANGUAGE, lexer); /* SetLexerLanguage for LexLPeg */
+  if( ok ) { wx.wxSetEnv("LUA_CPATH", cpath); }
+
+  if( dynlexer ) { cleanup({dynfile, MergeFullPath(tmppath, "lexer.ljs"), tmppath}); }
+
+  var styleconvert = {};
+  for( name, map in pairs(lexlpegmap) ) {
+    styleconvert[name] = {};
+    for( _, stylename in ipairs(map) ) {
+      if( lexmod._TOKENSTYLES[stylename] ) {
+        table.insert(styleconvert[name], lexmod._TOKENSTYLES[stylename]);
+      }
+    }
+  }
+  spec.lexerstyleconvert = styleconvert;
+  // assign line comment value based on the values in the lexer comment table
+  for( k, v in pairs(lexmod._foldsymbols && lexmod._foldsymbols.comment || {}) ) {
+    if( type(v) == 'function' ) { spec.linecomment = k; }
+  }
+  return true;
+}
+
+function SetupKeywords(editor, ext, forcespec, styles, font, fontitalic) {
+  var lexerstyleconvert = null;
+  var spec = forcespec || ide->FindSpec(ext, editor->GetLine(0));
+  // found a spec setup lexers and keywords
+  if( spec ) {
+    if( type(spec.lexer) == "string" ) {
+      var ok, err = setLexLPegLexer(editor, spec);
+      if( ! ok ) {
+        spec.lexerstyleconvert = {};
+        ide->Print(("Can't load LexLPeg '%s' lexer: %s")->format(spec.lexer, err));
+        editor->SetLexer(wxstc.wxSTC_LEX_NULL);
+      }
+      UpdateSpecs(spec);
+    } else {
+      editor->SetLexer(spec.lexer || wxstc.wxSTC_LEX_NULL);
+    }
+    lexerstyleconvert = spec.lexerstyleconvert;
+
+    if( (spec.keywords) ) {
+      for( i,words in ipairs(spec.keywords) ) {
+        editor->SetKeyWords(i-1,words);
+      }
+    }
+
+    editor.api = GetApi(spec.apitype || "none");
+    editor.spec = spec;
+  } else {
+    editor->SetLexer(wxstc.wxSTC_LEX_NULL);
+    editor->SetKeyWords(0, "");
+
+    editor.api = GetApi("none");
+    editor.spec = ide.specs.none;
+  }
+
+  // need to set folding property after lexer is set, otherwise
+  // the folds are not shown (wxwidgets 2.9.5)
+  editor->SetProperty("fold", edcfg.fold && "1" || "0");
+  if( edcfg.fold ) {
+    editor->SetProperty("fold.compact", edcfg.foldcompact && "1" || "0");
+    editor->SetProperty("fold.comment", "1");
+    editor->SetProperty("fold.line.comments", "1");
+  }
+  
+  // quickfix to prevent weird looks, otherwise need to update styling mechanism for cpp
+  // cpp "greyed out" styles are `styleid + 64`
+  editor->SetProperty("lexer.cpp.track.preprocessor", "0");
+  editor->SetProperty("lexer.cpp.update.preprocessor", "0");
+
+  StylesApplyToEditor(styles || ide.config.styles, editor, font, fontitalic, lexerstyleconvert);
+}

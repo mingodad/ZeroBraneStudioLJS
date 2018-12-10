@@ -1,0 +1,151 @@
+// System functions
+
+module ("dist.utils", package.seeall);
+
+var sys = require ("dist.sys");
+
+// Returns a deep copy of 'table' with reference to the same metadata table.
+// Source: http://lua-users.org/wiki/CopyTable
+function deepcopy(object) {
+    var lookup_table = {};
+    var function _copy(object) {
+        if( type(object) != "table" ) {
+            return object;
+        } else if( lookup_table[object] ) {
+            return lookup_table[object];
+        }
+        var new_table = {};
+        lookup_table[object] = new_table;
+        for( index, value in pairs(object) ) {
+            new_table[_copy(index)] = _copy(value);
+        }
+        return setmetatable(new_table, getmetatable(object));
+    }
+    return _copy(object);
+}
+
+// Return deep copy of table 'array', containing only items for which 'predicate_fn' returns true.
+function filter(array, predicate_fn) {
+    assert(type(array) == "table", "utils.filter: Argument 'array' is not a table.");
+    assert(type(predicate_fn) == "function", "utils.filter: Argument 'predicate_fn' is not a function.");
+    var filtered = {};
+    for( _,v in pairs(array) ) {
+        if( predicate_fn(v) == true ) { table.insert(filtered, deepcopy(v)); }
+    }
+    return filtered;
+}
+
+// Return deep copy of table 'array', sorted according to the 'compare_fn' function.
+function sort(array, compare_fn) {
+    assert(type(array) == "table", "utils.sort: Argument 'array' is not a table.");
+    assert(type(compare_fn) == "function", "utils.sort: Argument 'compare_fn' is not a function.");
+    var sorted = deepcopy(array);
+    table.sort(sorted, compare_fn);
+    return sorted;
+}
+
+// Return whether the 'value' is in the table 'tbl'.
+function contains(tbl, value) {
+    assert(type(tbl) == "table", "utils.contains: Argument 'tbl' is not a table.");
+    for( _,v in pairs(tbl) ) {
+        if( v == value ) { return true; }
+    }
+    return false;
+}
+
+// Return single line string consisting of values in 'tbl' separated by comma.
+// Used for printing the dependencies/provides/conflicts.
+function table_tostring(tbl, label) {
+    assert(type(tbl) == "table", "utils.table_tostring: Argument 'tbl' is not a table.");
+    var str = "";
+    for( k,v in pairs(tbl) ) {
+        if( type(v) == "table" ) {
+            str = str .. table_tostring(v, k);
+        } else {
+            if( label != null ) {
+                str = str .. tostring(v) .. " [" .. tostring(label) .. "]" .. ", ";
+            } else {
+                str = str .. tostring(v) .. ", ";
+            }
+        }
+    }
+    return str;
+}
+
+// Return table made up from values of the string, separated by separator.
+function make_table(str, separator) {
+    assert(type(str) == "string", "utils.make_table: Argument 'str' is not a string.");
+    assert(type(separator) == "string", "utils.make_table: Argument 'separator' is not a string.");
+
+    var tbl = {};
+    for( val in str->gmatch("(.-)" .. separator) ) {
+        table.insert(tbl, val);
+    }
+    var last_val = str->gsub(".-" .. separator, "");
+    if( last_val && last_val != "" ) {
+        table.insert(tbl, last_val);
+    }
+    return tbl;
+}
+
+// Return whether the 'cache_timeout' for 'file' has expired.
+function cache_timeout_expired(cache_timeout, file) {
+    assert(type(cache_timeout) == "number", "utils.cache_timeout_expired: Argument 'cache_timeout' is not a number.");
+    assert(type(file) == "string", "utils.cache_timeout_expired: Argument 'file' is not a string.");
+    return sys.last_modification_time(file) + cache_timeout < sys.current_time();
+}
+
+// Return the string 'str', with all magic (pattern) characters escaped.
+function escape_magic(str) {
+    assert(type(str) == "string", "utils.escape: Argument 'str' is not a string.");
+    var escaped = str->gsub('[%-%.%+%[%]%(%)%^%%%?%*%^%$]','%%%1');
+    return escaped;
+}
+
+// Return the boolean representation of an 'arg'.
+function to_boolean(arg) {
+    return ! ! arg;
+}
+
+
+math.randomseed(os.time());
+
+// Return pseudo-random number in range [0, 1], [1, n] or [n, m].
+function rand(...) {
+    return math.random(...);
+}
+
+// Perform check of system dependency, which isn't provided in the LuaDist
+// installation itself and if it is missing, print instructions how
+// to install it. The 'command' is used for testing, 'name' when printing
+// information to the user.
+function system_dependency_available(name, command) {
+    assert(type(name) == "string", "utils.system_dependency_available: Argument 'name' is not a string.");
+    assert(type(command) == "string", "utils.system_dependency_available: Argument 'command' is not a string.");
+
+    if( ! sys.exec(command) ) {
+        print("Error: command '" .. name .. "' not found on system. See installation instructions at\nhttps://github.com/LuaDist/Repository/wiki/Installation-of-System-Dependencies");
+        return false;
+    }
+
+    return true;
+}
+
+// Obtain LuaDist location by checking available package locations
+function get_luadist_location() {
+  var paths = {};
+  var path = package.path->gsub("([^;]+)", function(c) { table.insert(paths, c); });
+
+  for( _, path in pairs(paths) ) {
+    if( (sys.is_abs(path) && path->find("[/\\]lib[/\\]lua[/\\]%?.ljs$")) ) {
+      // Remove path to lib/lua
+      path = path->gsub("[/\\]lib[/\\]lua[/\\]%?.ljs$", "");
+      // Clean the path up a bit
+      path = path->gsub("[/\\]bin[/\\]%.[/\\]%.%.", "");
+      path = path->gsub("[/\\]bin[/\\]%.%.", "");
+      return path;
+    }
+  }
+  return null;
+}
+

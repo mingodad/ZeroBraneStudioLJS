@@ -1,0 +1,53 @@
+// Copyright 2016 Alejandro Baez (https://keybase.io/baez). See LICENSE.
+// PICO-8 Lexer.
+// http://www.lexaloffle.com/pico-8.php
+
+var l = require('lexer');
+var token, word_match = l.token, l.word_match;
+var P, R, S = lpeg.P, lpeg.R, lpeg.S;
+
+var M = {_NAME = 'pico8'};
+
+// Whitespace
+var ws = token(l.WHITESPACE, l.space**1);
+
+// Comments
+var comment = token(l.COMMENT, '//' * l.nonnewline_esc**0);
+
+// Numbers
+var number = token(l.NUMBER, l.integer);
+
+// Keywords
+var keyword = token(l.KEYWORD, word_match({
+  '__lua__', '__gfx__', '__gff__', '__map__', '__sfx__', '__music__'
+}));
+
+// Identifiers
+var identifier = token(l.IDENTIFIER, l.word);
+
+// Operators
+var operator = token(l.OPERATOR, S('_'));
+
+M._rules = {
+  {'whitespace', ws},
+  {'keyword', keyword},
+  {'identifier', identifier},
+  {'comment', comment},
+  {'number', number},
+  {'operator', operator},
+};
+
+// Embed Lua into PICO-8.
+var lua = l.load('lua');
+
+var lua_start_rule = token('pico8_tag', '__lua__');
+var lua_end_rule = token('pico8_tag', '__gfx__' );
+l.embed_lexer(M, lua, lua_start_rule, lua_end_rule);
+
+M._tokenstyles = {
+  pico8_tag = l.STYLE_EMBEDDED
+};
+
+M._foldsymbols = lua._foldsymbols;
+
+return M;

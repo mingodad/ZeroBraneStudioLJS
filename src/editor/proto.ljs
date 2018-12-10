@@ -1,0 +1,94 @@
+// Copyright 2013-17 Paul Kulchenko, ZeroBrane LLC
+//-------------------------------------------------------
+
+var q = EscapeMagic;
+var modpref = ide.MODPREF;
+
+ide.proto.Document = {__index = {
+  GetFileName = function(this) { return this.fileName; },
+  GetFilePath = function(this) { return this.filePath; },
+  GetFileExt = function(this) { return GetFileExt(this.fileName); },
+  GetFileModifiedTime = function(this) { return this.modTime; },
+  GetEditor = function(this) { return this.editor; },
+  GetTabIndex = function(this) { return this.index; },
+  SetTabIndex = function(this, index) { this.index = index; },
+  IsModified = function(this) { return this.editor->GetModify(); },
+  IsNew = function(this) { return this.filePath == null; },
+  SetFilePath = function(this, path) { this.filePath = path; },
+  SetFileModifiedTime = function(this, modtime) { this.modTime = modtime; },
+  SetModified = function(this, modified) {
+    if( modified == false ) { this.editor->SetSavePoint(); }
+  },
+  SetTabText = function(this, text) {
+    var modpref = ide.config.editor.modifiedprefix || modpref;
+    ide->GetEditorNotebook()->SetPageText(this.index,
+      (this->IsModified() && modpref || '')..(text || this->GetTabText()));
+  },
+  GetTabText = function(this) {
+    if( this.index == null ) { return this.fileName; }
+    var modpref = ide.config.editor.modifiedprefix || modpref;
+    return ide->GetEditorNotebook()->GetPageText(this.index)->gsub("^"..q(modpref), "");
+  },
+  SetActive = function(this) { SetEditorSelection(this.index); },
+  Save = function(this) { return SaveFile(this.editor, this.filePath); },
+  Close = function(this) { return ClosePage(this.index); },
+  CloseAll = function(this) { return CloseAllPagesExcept(-1); },
+  CloseAllExcept = function(this) { return CloseAllPagesExcept(this.index); },
+}};
+
+ide.proto.Plugin = {__index = {
+  GetName = function(this) { return this.name; },
+  GetFileName = function(this) { return this.fname; },
+  GetFilePath = function(this) { return MergeFullPath(GetPathWithSep(ide.editorFilename), this.fpath); },
+  GetConfig = function(this) { return rawget(ide.config,this.fname) || {}; },
+  GetSettings = function(this) { return SettingsRestorePackage(this.fname); },
+  SetSettings = function(this, settings, opts) { SettingsSavePackage(this.fname, settings, opts); },
+}};
+
+ide.proto.Interpreter = {__index = {
+  GetName = function(this) { return this.name; },
+  GetFileName = function(this) { return this.fname; },
+  GetExePath = function(this, ...) { return this->fexepath(...); },
+  GetAPI = function(this) { return this.api; },
+  GetCommandLineArg = function(this, name) {
+    return ide.config.arg && (ide.config.arg.any || ide.config.arg[name || this.fname]);
+  },
+  UpdateStatus = function(this) {
+    var cla = this.takeparameters && this->GetCommandLineArg();
+    ide->SetStatus(this.name..(cla && #cla > 0 && ": "..cla || ""), 4);
+  },
+  fprojdir = function(this,wfilename) {
+    return wfilename->GetPath(wx.wxPATH_GET_VOLUME);
+  },
+  fworkdir = function(this,wfilename) {
+    var proj = ide->GetProject();
+    return proj && proj->gsub("[\\/]$","") || wfilename->GetPath(wx.wxPATH_GET_VOLUME);
+  },
+  fattachdebug = function(this) { ide->GetDebugger()->SetOptions(); },
+}};
+
+ide.proto.Debugger = {__index = {
+  IsRunning = function(this) { return this.running; },
+  IsConnected = function(this) { return this.server; },
+  IsListening = function(this) { return this.listening; },
+  GetHostName = function(this) { return this.hostname; },
+  GetPortNumber = function(this) { return this.portnumber; },
+  GetConsole = function(this) {
+    var debugger = this;
+    return function(...) { return debugger->shell(...); };
+  },
+  GetDataOptions = function(this, options) {
+    var cfg = ide.config.debugger;
+    var params = {
+      comment = false, nocode = true, numformat = cfg.numformat, metatostring = cfg.showtostring,
+      maxlevel = cfg.maxdatalevel, maxnum = cfg.maxdatanum, maxlength = cfg.maxdatalength,
+    };
+    for( k, v in pairs(options || {}) ) { params[k] = v; }
+    return params;
+  },
+}};
+
+ide.proto.ID = {
+  __index = function(_, id) { return _G['ID_'..id]; },
+  __call = function(_, id) { return IDgen(id); },
+};

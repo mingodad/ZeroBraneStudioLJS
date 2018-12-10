@@ -1,0 +1,69 @@
+// Copyright 2015-2016 David B. Lamkins <david@lamkins.net>. See LICENSE.
+// APL LPeg lexer.
+
+var l = require('lexer');
+var token, word_match = l.token, l.word_match;
+var P, R, S = lpeg.P, lpeg.R, lpeg.S;
+
+var M = {_NAME = 'apl'};
+
+// Whitespace.
+var ws = token(l.WHITESPACE, l.space**1);
+
+// Comments.
+var comment = token(l.COMMENT, (P('⍝') + P('#')) * l.nonnewline**0);
+
+// Strings.
+var sq_str = l.delimited_range("'", false, true);
+var dq_str = l.delimited_range('"');
+
+var string = token(l.STRING, sq_str + dq_str);
+
+// Numbers.
+var dig = R('09');
+var rad = P('.');
+var exp = S('eE');
+var img = S('jJ');
+var sgn = P('¯')**-1;
+var float = sgn * (dig**0 * rad * dig**1 + dig**1 * rad * dig**0 + dig**1) *
+              (exp * sgn *dig**1)**-1;
+var number = token(l.NUMBER, float * img * float + float);
+
+// Keywords.
+var keyword = token(l.KEYWORD, P('⍞') + P('χ') + P('⍺') + P('⍶') + P('⍵') +
+                                 P('⍹') + P('⎕') * R('AZ', 'az')**0);
+
+// Names.
+var n1l = R('AZ', 'az');
+var n1b = P('_') + P('∆') + P('⍙');
+var n2l = n1l + R('09');
+var n2b = n1b + P('¯');
+var n1 = n1l + n1b;
+var n2 = n2l + n2b;
+var name = n1 * n2**0;
+
+// Labels.
+var label = token(l.LABEL, name * P(':'));
+
+// Variables.
+var variable = token(l.VARIABLE, name);
+
+// Special.
+var special = token(l.TYPE, S('{}[]();') + P('←') + P('→') + P('◊'));
+
+// Nabla.
+var nabla = token(l.PREPROCESSOR, P('∇') + P('⍫'));
+
+M._rules = {
+  {'whitespace', ws},
+  {'comment', comment},
+  {'string', string},
+  {'number', number},
+  {'keyword', keyword},
+  {'label', label},
+  {'variable', variable},
+  {'special', special},
+  {'nabla', nabla},
+};
+
+return M;

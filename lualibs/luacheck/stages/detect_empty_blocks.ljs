@@ -1,0 +1,36 @@
+var core_utils = require ("luacheck.core_utils");
+
+var stage = {};
+
+stage.warnings = {
+   ["541"] = {message_format = "empty do..end block", fields = {}},
+   ["542"] = {message_format = "empty if branch", fields = {}}
+};
+
+var function check_block(chstate, block, code) {
+   if( #block == 0 ) {
+      chstate->warn_range(code, block);
+   }
+}
+
+
+var function check_node(chstate, node) {
+   if( node.tag == "Do" ) {
+      check_block(chstate, node, "541");
+      return;
+   }
+
+   for( index = 2, #node, 2 ) {
+      check_block(chstate, node[index], "542");
+   }
+
+   if( #node % 2 == 1 ) {
+      check_block(chstate, node[#node], "542");
+   }
+}
+
+function stage.run(chstate) {
+   core_utils.each_statement(chstate, {"Do", "If"}, check_node);
+}
+
+return stage;

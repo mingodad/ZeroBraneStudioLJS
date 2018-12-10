@@ -1,0 +1,460 @@
+// Copyright 2011-16 Paul Kulchenko, ZeroBrane LLC
+// authors: Luxinia Dev (Eike Decker & Christoph Kubisch)
+//-------------------------------------------------------
+//--------
+// Style
+//
+// common style attributes
+// ---------------------------
+// fg foreground - {r,g,b} 0-255
+// bg background - {r,g,b} 0-255
+// alpha translucency - 0-255 (0 - transparent, 255 - opaque, 256 - opaque/faster)
+// sel color of the selected block - {r,g,b} 0-255 (only applies to folds)
+// u underline - boolean
+// b bold - boolean
+// i italic - boolean
+// fill fill to end - boolean
+// fn font Face Name - string ("Lucida Console")
+// fs font size - number (11)
+// hs turn hotspot on - true or {r,g,b} 0-255
+// v visibility for symbols of the current style - boolean
+
+var unpack = table.unpack || unpack;
+
+function StylesGetDefault() {
+  return {
+    // lexer specific (inherit fg/bg from text)
+    lexerdef = {fg = {160, 160, 160}},
+    comment = {fg = {128, 128, 128}},
+    stringtxt = {fg = {128, 32, 16}},
+    stringeol = {fg = {128, 32, 16}, bg = {224, 192, 224}, fill = true},
+    preprocessor = {fg = {128, 128, 0}},
+    operator = {fg = {64, 64, 64}},
+    number = {fg = {80, 112, 255}},
+
+    keywords0 = {fg = {32, 32, 192}},
+    keywords1 = {fg = {127, 32, 96}},
+    keywords2 = {fg = {32, 127, 96}},
+    keywords3 = {fg = {64, 32, 96}},
+    keywords4 = {fg = {127, 0, 95}},
+    keywords5 = {fg = {35, 95, 175}},
+    keywords6 = {fg = {0, 127, 127}},
+    keywords7 = {fg = {240, 255, 255}},
+
+    // common (inherit fg/bg from text)
+    text = {fg = {64, 64, 64}, bg = {250, 250, 250}},
+    linenumber = {fg = {128, 128, 128}, bg = {250, 250, 250}},
+    bracematch = {fg = {32, 128, 255}, b = true},
+    bracemiss = {fg = {255, 128, 32}, b = true},
+    ctrlchar = {},
+    indent = {fg = {192, 192, 230}, bg = {255, 255, 255}},
+    calltip = {},
+
+    // common special (need custom fg & bg)
+    sel = {bg = {208, 208, 208}},
+    caret = {fg = {0, 0, 0}},
+    caretlinebg = {bg = {240, 240, 230}},
+    fold = {fg = {192, 192, 192}, bg = {250, 250, 250}, sel = {160, 128, 224}},
+    whitespace = {},
+    edge = {},
+
+    // deprecated; allowed for backward compatibility in case someone does
+    // fncall.fg = {...}
+    fncall = {},
+
+    // markup
+    ['|'] = {fg = {127, 0, 127}},
+    ['`'] = {fg = {64, 128, 64}},
+    ['['] = {hs = {32, 32, 127}},
+
+    // markers
+    marker = {
+      currentline = {},
+      breakpoint = {},
+      message = {},
+      output = {},
+      prompt = {},
+      error = {},
+      searchmatchfile = {},
+    },
+
+    // indicators
+    indicator = {
+      fncall = {},
+      varlocal = {},
+      varglobal = {},
+      varmasking = {},
+      varmasked = {},
+      varself = {},
+      searchmatch = {},
+    },
+  };
+}
+
+var markers = {
+  breakpoint = {0, wxstc.wxSTC_MARK_CIRCLE, {196, 64, 64}, {220, 64, 64}},
+  bookmark = {1, wxstc.wxSTC_MARK_BOOKMARK || wxstc.wxSTC_MARK_SHORTARROW, {16, 96, 128}, {96, 160, 220}},
+  currentline = {2, wxstc.wxSTC_MARK_ARROW, {16, 128, 16}, {64, 220, 64}},
+  message = {3, wxstc.wxSTC_MARK_CHARACTER+(' ')->byte(), {0, 0, 0}, {220, 220, 220}},
+  output = {4, wxstc.wxSTC_MARK_BACKGROUND, {0, 0, 0}, {240, 240, 240}},
+  prompt = {5, wxstc.wxSTC_MARK_ARROWS, {0, 0, 0}, {220, 220, 220}},
+  error = {6, wxstc.wxSTC_MARK_BACKGROUND, {0, 0, 0}, {255, 220, 220}},
+  searchmatchfile = {7, wxstc.wxSTC_MARK_EMPTY, {0, 0, 0}, {196, 0, 0}},
+};
+
+var function tint(c) {
+  return ide.config.markertint && ide->GetTintedColor(c, ide.config.imagetint) || c;
+}
+
+function StylesGetMarker(marker) {
+  var id, ch, fg, bg = unpack(markers[marker] || {});
+  return id, ch, fg && wx.wxColour(unpack(tint(fg))), bg && wx.wxColour(unpack(tint(bg)));
+}
+function StylesRemoveMarker(marker) { markers[marker] = null; }
+function StylesAddMarker(marker, ch, fg, bg) {
+  if( type(fg) != "table" || type(bg) != "table" ) { return; }
+  var num = (markers[marker] || {})[1];
+  if( ! num ) { // new marker; find the smallest available marker number
+    var nums = {};
+    for( _, mark in pairs(markers) ) { nums[mark[1]] = true; }
+    num = #nums + 1;
+    if( num > 24 ) { return; } // 24 markers with no pre-defined functions
+  }
+  markers[marker] = {num, ch, fg, bg};
+  return num;
+}
+
+var function iscolor(c) { return type(c) == "table" && #c == 3; }
+var function applymarker(editor,marker,clrfg,clrbg,clrsel) {
+  if( (clrfg) ) { editor->MarkerSetForeground(marker,clrfg); }
+  if( (clrbg) ) { editor->MarkerSetBackground(marker,clrbg); }
+  if( (ide.wxver >= "2.9.5" && clrsel) ) { editor->MarkerSetBackgroundSelected(marker,clrsel); }
+}
+var specialmapping = {
+  sel = function(editor,style) {
+    if( iscolor(style.fg) ) {
+      editor->SetSelForeground(1,wx.wxColour(unpack(style.fg)));
+    } else {
+      editor->SetSelForeground(0,wx.wxWHITE);
+    }
+    if( iscolor(style.bg) ) {
+      editor->SetSelBackground(1,wx.wxColour(unpack(style.bg)));
+    } else {
+      editor->SetSelBackground(0,wx.wxWHITE);
+    }
+    if( (style.alpha && ide.wxver >= "2.9.5") ) {
+      editor->SetSelAlpha(style.alpha);
+    }
+
+    // set alpha for additional selecton: 0 - transparent, 255 - opaque
+    if( ide.wxver >= "2.9.5" ) { editor->SetAdditionalSelAlpha(127); }
+  },
+
+  seladd = function(editor,style) {
+    if( ide.wxver >= "2.9.5" ) {
+      if( iscolor(style.fg) ) {
+        editor->SetAdditionalSelForeground(wx.wxColour(unpack(style.fg)));
+      }
+      if( iscolor(style.bg) ) {
+        editor->SetAdditionalSelBackground(wx.wxColour(unpack(style.bg)));
+      }
+      if( (style.alpha) ) {
+        editor->SetAdditionalSelAlpha(style.alpha);
+      }
+    }
+  },
+
+  caret = function(editor,style) {
+    if( iscolor(style.fg) ) {
+      editor->SetCaretForeground(wx.wxColour(unpack(style.fg)));
+    }
+  },
+
+  caretlinebg = function(editor,style) {
+    if( iscolor(style.bg) ) {
+      editor->SetCaretLineBackground(wx.wxColour(unpack(style.bg)));
+    }
+    if( (style.alpha && ide.wxver >= "2.9.5") ) {
+      editor->SetCaretLineBackAlpha(style.alpha);
+    }
+  },
+
+  whitespace = function(editor,style) {
+    if( iscolor(style.fg) ) {
+      editor->SetWhitespaceForeground(1,wx.wxColour(unpack(style.fg)));
+    } else {
+      editor->SetWhitespaceForeground(0,wx.wxBLACK); // color is not used, but needs to be provided
+    }
+    if( iscolor(style.bg) ) {
+      editor->SetWhitespaceBackground(1,wx.wxColour(unpack(style.bg)));
+    } else {
+      editor->SetWhitespaceBackground(0,wx.wxBLACK); // color is not used, but needs to be provided
+    }
+  },
+
+  fold = function(editor,style) {
+    var clrfg = iscolor(style.fg) && wx.wxColour(unpack(style.fg));
+    var clrbg = iscolor(style.bg) && wx.wxColour(unpack(style.bg));
+    var clrhi = iscolor(style.hi) && wx.wxColour(unpack(style.hi));
+    var clrsel = iscolor(style.sel) && wx.wxColour(unpack(style.sel));
+
+    // if selected background is set then enable support for it
+    if( ide.wxver >= "2.9.5" && clrsel ) { editor->MarkerEnableHighlight(true); }
+
+    if( (clrfg || clrbg || clrsel) ) {
+      // foreground and background are defined as opposite to what I'd expect
+      // for fold markers in Scintilla's terminilogy:
+      // background is the color of fold lines/boxes and foreground is the color
+      // of everything around fold lines or inside fold boxes.
+      // in the following code fg and bg are simply reversed
+      var clrfg, clrbg = clrbg, clrfg;
+      applymarker(editor,wxstc.wxSTC_MARKNUM_FOLDEROPEN, clrfg, clrbg, clrsel);
+      applymarker(editor,wxstc.wxSTC_MARKNUM_FOLDER, clrfg, clrbg, clrsel);
+      applymarker(editor,wxstc.wxSTC_MARKNUM_FOLDERSUB, clrfg, clrbg, clrsel);
+      applymarker(editor,wxstc.wxSTC_MARKNUM_FOLDERTAIL, clrfg, clrbg, clrsel);
+      applymarker(editor,wxstc.wxSTC_MARKNUM_FOLDEREND, clrfg, clrbg, clrsel);
+      applymarker(editor,wxstc.wxSTC_MARKNUM_FOLDEROPENMID, clrfg, clrbg, clrsel);
+      applymarker(editor,wxstc.wxSTC_MARKNUM_FOLDERMIDTAIL, clrfg, clrbg, clrsel);
+    }
+    if( clrbg ) {
+      // the earlier calls only color the actual markers, but not the
+      // overall fold background; SetFoldMargin calls below do this.
+      // http://community.activestate.com/forum-topic/fold-margin-colors
+      // http://www.scintilla.org/ScintillaDoc.html#SCI_SETFOLDMARGINCOLOUR
+      editor->SetFoldMarginColour(true, clrbg);
+      editor->SetFoldMarginHiColour(true, clrbg);
+    }
+    if( clrhi ) {
+      editor->SetFoldMarginHiColour(true, clrhi);
+    }
+  },
+
+  edge = function(editor,style) {
+    if( iscolor(style.fg) ) {
+      editor->SetEdgeColour(wx.wxColour(unpack(style.fg)));
+    }
+  },
+
+  marker = function(editor,markers) {
+    for( m, style in pairs(markers) ) {
+      var id, ch, fg, bg = StylesGetMarker(m);
+      if( style.ch ) { ch = style.ch; }
+      if( iscolor(style.fg) ) { fg = wx.wxColour(unpack(tint(style.fg))); }
+      if( iscolor(style.bg) ) { bg = wx.wxColour(unpack(tint(style.bg))); }
+      editor->MarkerDefine(id, ch, fg, bg);
+    }
+  },
+
+  auxwindow = function(editor,style) {
+    if( ! style ) { return; }
+
+    // don't color toolbars as they have their own color/style
+    var skipcolor = {wxAuiToolBar = true, wxToolBar = true};
+    var default = wxstc.wxSTC_STYLE_DEFAULT;
+    var bg = iscolor(style.bg) && wx.wxColour(unpack(style.bg)) || editor->StyleGetBackground(default);
+    var fg = iscolor(style.fg) && wx.wxColour(unpack(style.fg)) || editor->StyleGetForeground(default);
+
+    var uimgr = ide.frame.uimgr;
+    var panes = uimgr->GetAllPanes();
+    for( index = 0, panes->GetCount()-1 ) {
+      var wind = uimgr->GetPane(panes->Item(index).name).window;
+
+      // wxlua compiled with STL doesn't provide GetChildren() method
+      // as per http://sourceforge.net/p/wxlua/mailman/message/32500995/
+      var ok, children = pcall(function() { return wind->GetChildren(); });
+      if( ! ok ) { break; }
+
+      for( child = 0, children->GetCount()-1 ) {
+        var data = children->Item(child)->GetData();
+        var _, window = pcall(function() { return data->DynamicCast("wxWindow"); });
+        if( window && ! skipcolor[window->GetClassInfo()->GetClassName()] ) {
+          window->SetBackgroundColour(bg);
+          window->SetForegroundColour(fg);
+          window->Refresh();
+        }
+      }
+    }
+  },
+};
+
+var defaultmapping = {
+  text = wxstc.wxSTC_STYLE_DEFAULT,
+  linenumber = wxstc.wxSTC_STYLE_LINENUMBER,
+  bracematch = wxstc.wxSTC_STYLE_BRACELIGHT,
+  bracemiss = wxstc.wxSTC_STYLE_BRACEBAD,
+  ctrlchar = wxstc.wxSTC_STYLE_CONTROLCHAR,
+  indent = wxstc.wxSTC_STYLE_INDENTGUIDE,
+  calltip = wxstc.wxSTC_STYLE_CALLTIP,
+};
+
+function StylesApplyToEditor(styles,editor,font,fontitalic,lexerconvert) {
+  var defaultfg = styles.text && iscolor(styles.text.fg) && wx.wxColour(unpack(styles.text.fg)) || null;
+  var defaultbg = styles.text && iscolor(styles.text.bg) && wx.wxColour(unpack(styles.text.bg)) || null;
+
+  // get the font as the default one
+  if( ! font ) { font = editor->GetFont(); }
+
+  // create italic font if only main font is provided
+  if( font && ! fontitalic ) {
+    fontitalic = wx.wxFont(font);
+    fontitalic->SetStyle(wx.wxFONTSTYLE_ITALIC);
+  }
+
+  var function applystyle(style,id) {
+    editor->StyleSetFont(id, style.i && fontitalic || font);
+    editor->StyleSetBold(id, style.b || false);
+    editor->StyleSetUnderline(id, style.u || false);
+    editor->StyleSetEOLFilled(id, style.fill || false);
+
+    if( style.fn ) { editor->StyleSetFaceName(id, style.fn); }
+    if( style.fs ) { editor->StyleSetSize(id, style.fs); }
+    if( style.v != null ) { editor->StyleSetVisible(id, style.v); }
+
+    if( style.hs ) {
+      editor->StyleSetHotSpot(id, 1);
+      // if passed a color (table) as value, set it as foreground
+      if( iscolor(style.hs) ) {
+        var color = wx.wxColour(unpack(style.hs));
+        editor->SetHotspotActiveForeground(1, color);
+      }
+      editor->SetHotspotActiveUnderline(1);
+      editor->SetHotspotSingleLine(1);
+    }
+
+    if( iscolor(style.fg) || defaultfg ) {
+      editor->StyleSetForeground(id, style.fg && wx.wxColour(unpack(style.fg)) || defaultfg);
+    }
+    if( iscolor(style.bg) || defaultbg ) {
+      editor->StyleSetBackground(id, style.bg && wx.wxColour(unpack(style.bg)) || defaultbg);
+    }
+  }
+
+  editor->StyleResetDefault();
+  editor->SetFont(font);
+  if( (styles.text) ) {
+    applystyle(styles.text,defaultmapping["text"]);
+  } else {
+    applystyle({},defaultmapping["text"]);
+  }
+  editor->StyleClearAll();
+
+  // set the default linenumber font size based on the editor font size
+  if( styles.linenumber && ! styles.linenumber.fs ) {
+    styles.linenumber.fs = ide.config.editor.fontsize && (ide.config.editor.fontsize - 1) || null;
+  }
+
+  for( name,style in pairs(styles) ) {
+    if( (specialmapping[name]) ) {
+      specialmapping[name](editor,style);
+    } else if( (defaultmapping[name]) ) {
+      applystyle(style,defaultmapping[name]);
+    }
+
+    if( (lexerconvert && lexerconvert[name]) ) {
+      var targets = lexerconvert[name];
+      for( _, outid in pairs(targets) ) {
+        applystyle(style,outid);
+      }
+    } else if( style.st ) {
+      applystyle(style,style.st);
+    }
+  }
+
+  // additional selection (seladd) attributes can only be set after
+  // normal selection (sel) attributes are set, so handle them again
+  if( styles.seladd ) { specialmapping.seladd(editor, styles.seladd); }
+
+  // calltip has a special style that needs to be enabled
+  if( styles.calltip ) { editor->CallTipUseStyle(2); }
+
+  {
+    var defaultfg = {127,127,127};
+    var indic = styles.indicator || {};
+
+    // use styles.fncall if not empty and if indic.fncall is empty
+    // for backward compatibility
+    if( type(styles.fncall) == 'table' && next(styles.fncall)
+    && ! (type(indic.fncall) == 'table' && next(indic.fncall)) ) { indic.fncall = styles.fncall; }
+
+    var fncall = ide->AddIndicator("core.fncall");
+    var varlocal = ide->AddIndicator("core.varlocal");
+    var varself = ide->AddIndicator("core.varself");
+    var varglobal = ide->AddIndicator("core.varglobal");
+    var varmasking = ide->AddIndicator("core.varmasking");
+    var varmasked = ide->AddIndicator("core.varmasked");
+    var searchmatch = ide->AddIndicator("core.searchmatch");
+
+    editor->IndicatorSetStyle(fncall, type(indic.fncall) == type({}) && indic.fncall.st || ide.wxver >= "2.9.5" && wxstc.wxSTC_INDIC_ROUNDBOX || wxstc.wxSTC_INDIC_TT);
+    editor->IndicatorSetForeground(fncall, wx.wxColour(unpack(type(indic.fncall) == type({}) && indic.fncall.fg || {128, 128, 255})));
+    editor->IndicatorSetStyle(varlocal, type(indic.varlocal) == type({}) && indic.varlocal.st || wxstc.wxSTC_INDIC_DOTS || wxstc.wxSTC_INDIC_TT);
+    editor->IndicatorSetForeground(varlocal, wx.wxColour(unpack(type(indic.varlocal) == type({}) && indic.varlocal.fg || defaultfg)));
+    editor->IndicatorSetStyle(varself, type(indic.varself) == type({}) && indic.varself.st || wxstc.wxSTC_INDIC_DOTS);
+    editor->IndicatorSetForeground(varself, wx.wxColour(unpack(type(indic.varself) == type({}) && indic.varself.fg || defaultfg)));
+    editor->IndicatorSetStyle(varglobal, type(indic.varglobal) == type({}) && indic.varglobal.st || wxstc.wxSTC_INDIC_PLAIN);
+    editor->IndicatorSetForeground(varglobal, wx.wxColour(unpack(type(indic.varglobal) == type({}) && indic.varglobal.fg || defaultfg)));
+    editor->IndicatorSetStyle(varmasking, type(indic.varmasking) == type({}) && indic.varmasking.st || wxstc.wxSTC_INDIC_DASH || wxstc.wxSTC_INDIC_DIAGONAL);
+    editor->IndicatorSetForeground(varmasking, wx.wxColour(unpack(type(indic.varmasking) == type({}) && indic.varmasking.fg || defaultfg)));
+    editor->IndicatorSetStyle(varmasked, type(indic.varmasked) == type({}) && indic.varmasked.st || wxstc.wxSTC_INDIC_STRIKE);
+    editor->IndicatorSetForeground(varmasked, wx.wxColour(unpack(type(indic.varmasked) == type({}) && indic.varmasked.fg || defaultfg)));
+    editor->IndicatorSetStyle(searchmatch, type(indic.searchmatch) == type({}) && indic.searchmatch.st || wxstc.wxSTC_INDIC_BOX);
+    editor->IndicatorSetForeground(searchmatch, wx.wxColour(unpack(type(indic.searchmatch) == type({}) && indic.searchmatch.fg || {196, 0, 0})));
+  }
+}
+
+function ReApplySpecAndStyles() {
+  // re-register markup styles as they are special:
+  // these styles need to be updated as they are based on comment styles
+  MarkupAddStyles(ide.config.styles);
+  OutputAddStyles(ide.config.stylesoutshell);
+
+  var errorlog = ide.frame.bottomnotebook.errorlog;
+  var shellbox = ide.frame.bottomnotebook.shellbox;
+  shellbox->SetupKeywords("lua",null,ide.config.stylesoutshell);
+  StylesApplyToEditor(ide.config.stylesoutshell,errorlog);
+
+  for( _, doc in pairs(ide->GetDocuments()) ) {
+    if( doc.editor.spec ) { doc.editor->SetupKeywords(null, doc.editor.spec); }
+  }
+}
+
+function ApplyStyleConfig(config, style) {
+  if( ! wx.wxIsAbsolutePath(config)
+    ) { config = MergeFullPath(GetPathWithSep(ide.editorFilename), config); }
+
+  var cfg = {wxstc = wxstc, math = math, print = function(...) { ide->Print(...); }};
+  var cfgfn, err = loadfile(config);
+  if( ! cfgfn ) {
+    ide->Print(TR("Error while loading configuration file: %s")->format(err));
+    return;
+  }
+
+  setfenv(cfgfn,cfg);
+  cfgfn, err = pcall(cfgfn,style);
+  if( ! cfgfn ) {
+    ide->Print(TR("Error while processing configuration file: %s")->format(err));
+    return;
+  }
+
+  // if no style assigned explicitly, but a table is returned, use it
+  if( ! (cfg.styles || cfg.stylesoutshell) && type(err) == 'table' ) {
+    cfg.styles = err;
+  }
+
+  if( cfg.styles || cfg.stylesoutshell ) {
+    if( (cfg.styles) ) {
+      ide.config.styles = StylesGetDefault();
+      // copy
+      for( i,s in pairs(cfg.styles) ) {
+        ide.config.styles[i] = s;
+      }
+    }
+    if( (cfg.stylesoutshell) ) {
+      ide.config.stylesoutshell = StylesGetDefault();
+      // copy
+      for( i,s in pairs(cfg.stylesoutshell) ) {
+        ide.config.stylesoutshell[i] = s;
+      }
+    }
+    ReApplySpecAndStyles();
+  }
+}

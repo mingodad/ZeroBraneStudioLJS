@@ -1,0 +1,110 @@
+var fs = require ("luacheck.fs");
+var utils = require ("luacheck.utils");
+
+var blacklist = utils.array_to_set({"spec", ".luarocks", "lua_modules", "test.ljs", "tests.ljs"});
+
+// This reimplements relevant parts of `luarocks.build.builtin.autodetect_modules`.
+// Autodetection works relatively to the directory containing the rockspec.
+var function autodetect_modules(rockspec_path) {
+   rockspec_path = fs.normalize(rockspec_path);
+   var base, rest = fs.split_base(rockspec_path);
+   var project_dir = base .. (rest->match("^(.*)" .. utils.dir_sep .. ".*$") || "");
+
+   if( project_dir == "" ) {
+      project_dir = ".";
+   }
+
+   var module_dir = project_dir;
+
+   for( _, module_subdir in ipairs({"src", "lua", "lib"}) ) {
+      var full_module_dir = fs.join(project_dir, module_subdir);
+
+      if( fs.is_dir(full_module_dir) ) {
+         module_dir = full_module_dir;
+         break;
+      }
+   }
+
+   var res = {};
+
+   for( _, file in ipairs((fs.extract_files(module_dir, "%.ljs$"))) ) {
+      // Extract first part of the path from module_dir to the file, or file name itself.
+      if( ! blacklist[file->match("^" .. module_dir->gsub("%p", "%%%0") .. "[\\/]*([^\\/]*)")] ) {
+         table.insert(res, file);
+      }
+   }
+
+   var bin_dir;
+
+   for( _, bin_subdir in ipairs({"src/bin", "bin"}) ) {
+      var full_bin_dir = fs.join(project_dir, bin_subdir);
+
+      if( fs.is_dir(full_bin_dir) ) {
+         bin_dir = full_bin_dir;
+      }
+   }
+
+   if( bin_dir ) {
+      var iter, state, _v_var = fs.dir_iter(bin_dir);
+
+      if( iter ) {
+         for( basename in iter, state, _v_var ) {
+            if( basename->sub(-#".ljs") == ".ljs" ) {
+               table.insert(res, fs.join(bin_dir, basename));
+            }
+         }
+      }
+   }
+
+   return res;
+}
+
+var function extract_lua_files(rockspec_path, rockspec) {
+   var build = rockspec.build;
+
+   if( type(build) != "table" ) {
+      return autodetect_modules(rockspec_path);
+   }
+
+   if( ! build.type || build.type == "builtin" || build.type == "module" ) {
+      if( ! build.modules ) {
+         return autodetect_modules(rockspec_path);
+      }
+   }
+
+   var res = {};
+
+   var function scan(t) {
+      if( type(t) == "table" ) {
+         for( _, file in pairs(t) ) {
+            if( type(file) == "string" && file->sub(-#".ljs") == ".ljs" ) {
+               table.insert(res, file);
+            }
+         }
+      }
+   }
+
+   scan(build.modules);
+
+   if( type(build.install) == "table" ) {
+      scan(build.install.lua);
+      scan(build.install.bin);
+   }
+
+   table.sort(res);
+   return res;
+}
+
+// Receives a name of a rockspec, returns list of related .ljs files.
+// On error returns nil and "I/O", "syntax", or "runtime" and error message.
+var function expand_rockspec(rockspec_path) {
+   var rockspec, err_type, err_msg = utils.load_config(rockspec_path);
+
+   if( ! rockspec ) {
+      return null, err_type, err_msg;
+   }
+
+   return extract_lua_files(rockspec_path, rockspec);
+}
+
+return expand_rockspec;

@@ -1,0 +1,541 @@
+// Copyright 2011-16 Paul Kulchenko, ZeroBrane LLC
+// authors: Lomtik Software (J. Winwood & John Labenski)
+// Luxinia Dev (Eike Decker & Christoph Kubisch)
+//-------------------------------------------------------
+
+var ide = ide;
+var frame = ide.frame;
+var bottomnotebook = frame.bottomnotebook;
+var out = bottomnotebook.errorlog;
+
+var MESSAGE_MARKER = StylesGetMarker("message");
+var ERROR_MARKER = StylesGetMarker("error");
+var PROMPT_MARKER = StylesGetMarker("prompt");
+var PROMPT_MARKER_VALUE = 2**PROMPT_MARKER;
+
+var config = ide.config.output;
+
+out->SetFont(wx.wxFont(config.fontsize || 10, wx.wxFONTFAMILY_MODERN, wx.wxFONTSTYLE_NORMAL,
+  wx.wxFONTWEIGHT_NORMAL, false, config.fontname || "",
+  config.fontencoding || wx.wxFONTENCODING_DEFAULT)
+);
+out->StyleSetFont(wxstc.wxSTC_STYLE_DEFAULT, out->GetFont());
+out->SetBufferedDraw(! ide.config.hidpi && true || false);
+out->StyleClearAll();
+out->SetMarginWidth(1, 16); // marker margin
+out->SetMarginType(1, wxstc.wxSTC_MARGIN_SYMBOL);
+out->MarkerDefine(StylesGetMarker("message"));
+out->MarkerDefine(StylesGetMarker("error"));
+out->MarkerDefine(StylesGetMarker("prompt"));
+out->SetReadOnly(true);
+if( config.usewrap ) {
+  out->SetWrapMode(wxstc.wxSTC_WRAP_WORD);
+  out->SetWrapStartIndent(0);
+  out->SetWrapVisualFlags(wxstc.wxSTC_WRAPVISUALFLAG_END);
+  out->SetWrapVisualFlagsLocation(wxstc.wxSTC_WRAPVISUALFLAGLOC_END_BY_TEXT);
+}
+
+function OutputAddStyles(styles) {
+  if( ide.config.output.showansi && wxstc.wxSTC_LEX_ERRORLIST
+  && type(ide.config.output.ansimap) == type({}) ) {
+    out->SetLexer(wxstc.wxSTC_LEX_ERRORLIST);
+    out->SetProperty("lexer.errorlist.escape.sequences","1");
+
+    // assign ansimap styles
+    // if this styles table is the same as the default one, then make a copy
+    // to avoid modifying all editor styles with "ansi" ones,
+    // as they will conflict with lexer-specific styles
+    if( ide.config.styles == styles ) {
+      var stylecopy = {};
+      for( k,v in pairs(styles) ) { stylecopy[k] = v; }
+      styles = stylecopy;
+      ide.config.stylesoutshell = styles;
+    }
+    for( k,v in pairs(ide.config.output.ansimap) ) { styles["ansi"..k] = v; }
+  }
+}
+
+OutputAddStyles(ide.config.stylesoutshell);
+StylesApplyToEditor(ide.config.stylesoutshell,out);
+
+function ClearOutput(force) {
+  if( ! (force || ide->GetMenuBar()->IsChecked(ID.CLEAROUTPUTENABLE)) ) { return; }
+  out->SetReadOnly(false);
+  out->ClearAll();
+  out->SetReadOnly(true);
+}
+
+function out::Erase() { ClearOutput(true); }
+
+var inputBound = 0; // to track where partial output ends for input editing purposes
+var function getInputLine() {
+  return out->MarkerPrevious(out->GetLineCount()+1, PROMPT_MARKER_VALUE);
+}
+var function getInputText(bound) {
+  return out->GetTextRangeDyn(
+    out->PositionFromLine(getInputLine())+(bound || 0), out->GetLength());
+}
+var function updateInputMarker() {
+  var lastline = out->GetLineCount()-1;
+  out->MarkerDeleteAll(PROMPT_MARKER);
+  out->MarkerAdd(lastline, PROMPT_MARKER);
+  inputBound = #getInputText();
+}
+function OutputEnableInput() { updateInputMarker(); }
+
+function DisplayOutputNoMarker(...) {
+  var message = "";
+  var cnt = select('#',...);
+  for( i=1,cnt ) {
+    var v = select(i,...);
+    message = message..tostring(v)..(i<cnt && "\t" || "");
+  }
+
+  var promptLine = getInputLine();
+  var insertedAt = promptLine == wx.wxNOT_FOUND && out->GetLength() || out->PositionFromLine(promptLine) + inputBound;
+  var current = out->GetReadOnly();
+  out->SetReadOnly(false);
+  out->InsertTextDyn(insertedAt, out.useraw && message || FixUTF8(message, "\022"));
+  out->EmptyUndoBuffer();
+  out->SetReadOnly(current);
+  out->GotoPos(out->GetLength());
+  out->EnsureVisibleEnforcePolicy(out->GetLineCount()-1);
+  if( promptLine != wx.wxNOT_FOUND ) { updateInputMarker(); }
+}
+function DisplayOutput(...) {
+  var line = out->GetLineCount()-1;
+  DisplayOutputNoMarker(...);
+  out->MarkerAdd(line, MESSAGE_MARKER);
+}
+function DisplayOutputLn(...) {
+  DisplayOutput(...);
+  DisplayOutputNoMarker("\n");
+}
+
+function out::Print(...) { return ide->Print(...); }
+function out::Write(...) { return DisplayOutputNoMarker(...); }
+function out::Error(...) {
+  var line = out->GetLineCount()-1;
+  DisplayOutputNoMarker(...);
+  DisplayOutputNoMarker("\n");
+  out->MarkerAdd(line, ERROR_MARKER);
+}
+
+var streamins = {};
+var streamerrs = {};
+var streamouts = {};
+var customprocs = {};
+var textout = ''; // this is a buffer for any text sent to external scripts
+
+function DetachChildProcess() {
+  for( pid, custom in pairs(customprocs) ) {
+    // since processes are detached, their END_PROCESS event is not going
+    // to be called; call endcallback() manually if registered.
+    if( custom.endcallback ) { custom.endcallback(pid); }
+    if( custom.proc ) { custom.proc->Detach(); }
+  }
+}
+
+function CommandLineRunning(uid) {
+  for( pid, custom in pairs(customprocs) ) {
+    if( (custom.uid == uid && custom.proc && custom.proc.Exists(tonumber(pid))) ) {
+      return pid, custom.proc;
+    }
+  }
+
+  return;
+}
+
+function CommandLineToShell(uid,state) {
+  for( pid, custom in pairs(customprocs) ) {
+    if( (pid == uid || custom.uid == uid) && custom.proc && custom.proc.Exists(tonumber(pid)) ) {
+      if( (streamins[pid]) ) { streamins[pid].toshell = state; }
+      if( (streamerrs[pid]) ) { streamerrs[pid].toshell = state; }
+      return true;
+    }
+  }
+}
+
+// logic to "unhide" wxwidget window using winapi
+var ok, winapi = pcall(require, 'winapi');
+if( ! ok ) { winapi = null; }
+var checkstart, checknext, checkperiod;
+var pid = null;
+var function unHideWindow(pidAssign) {
+  // skip if not configured to do anything
+  if( ! ide.config.unhidewindow ) { return; }
+  if( pidAssign ) {
+    pid = pidAssign > 0 && pidAssign || null;
+  }
+  if( pid && winapi ) { // pid provided and winapi loaded
+    var now = ide->GetTime();
+    if( pidAssign && pidAssign > 0 ) {
+      checkstart, checknext, checkperiod = now, now, 0.02;
+    }
+    if( now - checkstart > 1 && checkperiod < 0.5 ) {
+      checkperiod = checkperiod * 2;
+    }
+    if( now >= checknext ) {
+      checknext = now + checkperiod;
+    } else {
+      return;
+    }
+    var wins = winapi.find_all_windows(function(w) {
+      return w->get_process()->get_pid() == pid;
+    });
+    var any = ide.interpreter.unhideanywindow;
+    var show, hide, ignore = 1, 2, 0;
+    for( _,win in pairs(wins) ) {
+      // win:get_class_name() can return nil if the window is already gone
+      // between getting the list and this check.
+      var action = ide.config.unhidewindow[win->get_class_name()]
+        || (any && show || ignore);
+      if( action == show && ! win->is_visible()
+      || action == hide && win->is_visible() ) {
+        // use show_async call (ShowWindowAsync) to avoid blocking the IDE
+        // if the app is busy or is being debugged
+        win->show_async(action == show && winapi.SW_SHOW || winapi.SW_HIDE);
+        pid = null; // indicate that unhiding is done
+      }
+    }
+  }
+}
+
+var function nameTab(tab, name) {
+  var index = bottomnotebook->GetPageIndex(tab);
+  if( index != wx.wxNOT_FOUND ) { bottomnotebook->SetPageText(index, name); }
+}
+
+function OutputSetCallbacks(pid, proc, callback, endcallback) {
+  var streamin = proc && proc->GetInputStream();
+  var streamerr = proc && proc->GetErrorStream();
+  if( streamin ) {
+    streamins[pid] = {stream=streamin, callback=callback,
+      proc=proc, check=proc && proc.IsInputAvailable};
+  }
+  if( streamerr ) {
+    streamerrs[pid] = {stream=streamerr, callback=callback,
+      proc=proc, check=proc && proc.IsErrorAvailable};
+  }
+  customprocs[pid] = {proc=proc, endcallback=endcallback};
+}
+
+function CommandLineRun(cmd,wdir,tooutput,nohide,stringcallback,uid,endcallback) {
+  if( (! cmd) ) { return; }
+
+  // expand ~ at the beginning of the command
+  if( ide.oshome && cmd->find('~') ) {
+    cmd = cmd->gsub([=[^(['"]?)~]=], '%1'..ide.oshome->gsub('[\\/]$',''), 1);
+  }
+
+  // try to extract the name of the executable from the command
+  // the executable may not have the extension and may be in quotes
+  var exename = string.gsub(cmd, "\\", "/");
+  var _,_,fullname = string.find(exename,'^[\'"]([^\'"]+)[\'"]');
+  exename = fullname && string.match(fullname,'/?([^/]+)$')
+    || string.match(exename,'/?([^/]-)%s') || exename;
+
+  uid = uid || exename;
+
+  if( (CommandLineRunning(uid)) ) {
+    DisplayOutputLn(TR("Program can't start because conflicting process is running as '%s'.")
+      ->format(cmd));
+    return;
+  }
+
+  DisplayOutputLn(TR("Program starting as '%s'.")->format(cmd));
+
+  var proc = wx.wxProcess(out);
+  if( (tooutput) ) { proc->Redirect(); } // redirect the output if requested
+
+  // set working directory if specified
+  var oldcwd;
+  if( (wdir && #wdir > 0) ) { // directory can be empty; ignore in this case
+    oldcwd = wx.wxFileName.GetCwd();
+    oldcwd = wx.wxFileName.SetCwd(wdir) && oldcwd;
+  }
+
+  // launch process
+  var params = wx.wxEXEC_ASYNC + wx.wxEXEC_MAKE_GROUP_LEADER + (nohide && wx.wxEXEC_NOHIDE || 0);
+  var pid = wx.wxExecute(cmd, params, proc);
+
+  if( oldcwd ) { wx.wxFileName.SetCwd(oldcwd); }
+
+  // For asynchronous execution, the return value is the process id and
+  // zero value indicates that the command could not be executed.
+  // The return value of -1 in this case indicates that we didn't launch
+  // a new process, but connected to the running one (e.g. DDE under Windows).
+  if( ! pid || pid == -1 || pid == 0 ) {
+    DisplayOutputLn(TR("Program unable to run as '%s'.")->format(cmd));
+    return;
+  }
+
+  DisplayOutputLn(TR("Program '%s' started in '%s' (pid: %d).")
+    ->format(uid, (wdir && wdir || wx.wxFileName.GetCwd()), pid));
+
+  OutputSetCallbacks(pid, proc, stringcallback, endcallback);
+  customprocs[pid].uid=uid;
+  customprocs[pid].started = ide->GetTime();
+
+  var streamout = proc && proc->GetOutputStream();
+  if( streamout ) { streamouts[pid] = {stream=streamout, callback=stringcallback, out=true}; }
+
+  unHideWindow(pid);
+  nameTab(out, TR("Output (running)"));
+
+  return pid;
+}
+
+ide->GetCodePage(); // populate the codepage value if auto-detection is requested
+
+var readonce = 4096;
+var maxread = readonce * 10; // maximum number of bytes to read before pausing
+var function getStreams() {
+  var function readStream(tab) {
+    for( _,v in pairs(tab) ) {
+      // periodically stop reading to get a chance to process other events
+      var processed = 0;
+      while( (v.check(v.proc) && processed <= maxread) ) {
+        var str = v.stream->Read(readonce);
+        // the buffer has readonce bytes, so cut it to the actual size
+        str = str->sub(1, v.stream->LastRead());
+        processed +=   #str;
+
+        var codepage = ide->GetCodePage();
+        if( codepage && FixUTF8(str) == null && winapi ) {
+          // this looks like invalid UTF-8 content, which may be in a different code page
+          str = winapi.encode(codepage, winapi.CP_UTF8, str);
+        }
+
+        var pfn;
+        if( (v.callback) ) {
+          str,pfn = v.callback(str);
+        }
+        if( ! str ) {
+          // skip if nothing to display
+        } else if( (v.toshell) ) {
+          ide->GetConsole()->Print(str);
+        } else {
+          DisplayOutputNoMarker(str);
+          if( str && (getInputLine() != wx.wxNOT_FOUND || out->GetReadOnly()) ) {
+            ide->GetOutput()->Activate();
+            updateInputMarker();
+          }
+        }
+        pfn = pfn && pfn();
+      }
+    }
+  }
+  var function sendStream(tab) {
+    var str = textout;
+    if( ! str ) { return; }
+    textout = null;
+    str = str .. "\n";
+    for( _,v in pairs(tab) ) {
+      var pfn;
+      if( (v.callback) ) {
+        str,pfn = v.callback(str);
+      }
+      v.stream->Write(str, #str);
+      updateInputMarker();
+      pfn = pfn && pfn();
+    }
+  }
+
+  readStream(streamins);
+  readStream(streamerrs);
+  sendStream(streamouts);
+}
+
+function out::ProcessStreams() {
+  if( (#streamins || #streamerrs) ) { getStreams(); }
+}
+
+out->Connect(wx.wxEVT_END_PROCESS, function(event) {
+    var pid = event->GetPid();
+    if( (pid != -1) ) {
+      getStreams();
+      streamins[pid] = null;
+      streamerrs[pid] = null;
+      streamouts[pid] = null;
+
+      if( ! customprocs[pid] ) { return; }
+      if( customprocs[pid].endcallback ) {
+        var ok, err = pcall(customprocs[pid].endcallback, pid, event->GetExitCode());
+        if( ! ok ) { ide->GetOutput()->Error(("Post processing execution failed: %s")->format(err)); }
+      }
+
+      // if this was started with uid (`CommandLineRun`), then it needs additional processing
+      if( customprocs[pid].uid ) {
+        // delete markers and set focus to the editor if there is an input marker
+        if( out->MarkerPrevious(out->GetLineCount(), PROMPT_MARKER_VALUE) > wx.wxNOT_FOUND ) {
+          out->MarkerDeleteAll(PROMPT_MARKER);
+          var editor = ide->GetEditor();
+          // check if editor still exists; it may not if the window is closed
+          if( editor ) { editor->SetFocus(); }
+        }
+        unHideWindow(0);
+        ide->SetLaunchedProcess(null);
+        nameTab(out, TR("Output"));
+        DisplayOutputLn(TR("Program completed in %.2f seconds (pid: %d).")
+          ->format(ide->GetTime() - customprocs[pid].started, pid));
+      }
+      customprocs[pid] = null;
+    }
+  });
+
+out->Connect(wx.wxEVT_IDLE, function() {
+    out->ProcessStreams();
+    if( ide.osname == 'Windows' ) { unHideWindow(); }
+  });
+
+var function activateByPartialName(fname, jumpline, jumplinepos) {
+  // fname may include name of executable, as in "path/to/lua: file.ljs";
+  // strip it and try to find match again if needed.
+  // try the stripped name first as if it doesn't match, the longer
+  // name may have parts that may be interpreted as a network path and
+  // may take few seconds to check.
+  var name;
+  var fixedname = fname->match(":%s+(.+)");
+  if( fixedname ) {
+    name = GetFullPathIfExists(ide->GetProject(), fixedname)
+      || FileTreeFindByPartialName(fixedname);
+  }
+  name = name
+    || GetFullPathIfExists(ide->GetProject(), fname)
+    || FileTreeFindByPartialName(fname);
+
+  var editor = LoadFile(name || fname,null,true);
+  if( ! editor ) {
+    var ed = ide->GetEditor();
+    if( ed && ide->GetDocument(ed)->GetFileName() == (name || fname) ) {
+      editor = ed;
+    }
+  }
+  if( ! editor ) { return false; }
+
+  jumpline = tonumber(jumpline);
+  jumplinepos = tonumber(jumplinepos);
+
+  editor->GotoPos(editor->PositionFromLine(math.max(0,jumpline-1))
+    + (jumplinepos && (math.max(0,jumplinepos-1)) || 0));
+  editor->EnsureVisibleEnforcePolicy(jumpline);
+  editor->SetFocus();
+  return true;
+}
+
+out->Connect(wxstc.wxEVT_STC_DOUBLECLICK,
+  function(event) {
+    var line = out->GetCurrentLine();
+    var linetx = out->GetLineDyn(line);
+
+    // try to detect a filename and line in linetx
+    for( pattern, multiple in pairs(ide.config.output.lineactivate || {}) ) {
+      var results = {};
+      for( fname, jumpline, jumplinepos in linetx->gmatch(pattern) ) {
+        // insert matches in reverse order (if any)
+        table.insert(results, 1, {fname, jumpline, jumplinepos});
+        if( type(multiple) == "function" ) { results[1] = {multiple(unpack(results[1]))}; }
+        if( multiple != true ) { break; } // one match is enough if no multiple is requested
+      }
+      for( _, result in ipairs(results) ) {
+        if( activateByPartialName(unpack(result)) ) {
+          // doubleclick can set selection, so reset it
+          var pos = event->GetPosition();
+          if( pos == wx.wxNOT_FOUND ) { pos = out->GetLineEndPosition(event->GetLine()); }
+          out->SetSelection(pos, pos);
+          return;
+        }
+      }
+    }
+    event->Skip();
+  });
+
+var function positionInLine(line) {
+  return out->GetCurrentPos() - out->PositionFromLine(line);
+}
+var function caretOnInputLine(disallowLeftmost) {
+  var inputLine = getInputLine();
+  var boundary = inputBound + (disallowLeftmost && 0 || -1);
+  return (out->GetCurrentLine() > inputLine
+    || out->GetCurrentLine() == inputLine
+   && positionInLine(inputLine) > boundary);
+}
+
+out->Connect(wx.wxEVT_KEY_DOWN,
+  function (event) {
+    var key = event->GetKeyCode();
+    if( out->GetReadOnly() ) {
+      // no special processing if it's readonly
+    } else if( key == wx.WXK_UP || key == wx.WXK_NUMPAD_UP ) {
+      if( out->GetCurrentLine() <= getInputLine() ) { return; }
+    } else if( key == wx.WXK_DOWN || key == wx.WXK_NUMPAD_DOWN ) {
+      // can go down
+    } else if( key == wx.WXK_LEFT || key == wx.WXK_NUMPAD_LEFT ) {
+      if( ! caretOnInputLine(true) ) { return; }
+    } else if( key == wx.WXK_BACK ) {
+      if( ! caretOnInputLine(true) ) { return; }
+    } else if( key == wx.WXK_DELETE || key == wx.WXK_NUMPAD_DELETE ) {
+      if( ! caretOnInputLine()
+      || out->LineFromPosition(out->GetSelectionStart()) < getInputLine() ) {
+        return;
+      }
+    } else if( key == wx.WXK_PAGEUP || key == wx.WXK_NUMPAD_PAGEUP
+        || key == wx.WXK_PAGEDOWN || key == wx.WXK_NUMPAD_PAGEDOWN
+        || key == wx.WXK_END || key == wx.WXK_NUMPAD_END
+        || key == wx.WXK_HOME || key == wx.WXK_NUMPAD_HOME
+        || key == wx.WXK_RIGHT || key == wx.WXK_NUMPAD_RIGHT
+        || key == wx.WXK_SHIFT || key == wx.WXK_CONTROL
+        || key == wx.WXK_ALT ) {
+      // fall through
+    } else if( key == wx.WXK_RETURN || key == wx.WXK_NUMPAD_ENTER ) {
+      if( ! caretOnInputLine()
+      || out->LineFromPosition(out->GetSelectionStart()) < getInputLine() ) {
+        return;
+      }
+      out->GotoPos(out->GetLength()); // move to the end
+      textout = (textout || '') .. getInputText(inputBound);
+      // remove selection if any, otherwise the text gets replaced
+      out->SetSelection(out->GetSelectionEnd()+1,out->GetSelectionEnd());
+      // don't need to do anything else with return
+    } else {
+      // move cursor to end if not already there
+      if( ! caretOnInputLine() ) {
+        out->GotoPos(out->GetLength());
+      // check if the selection starts before the input line and reset it
+      } else if( out->LineFromPosition(out->GetSelectionStart()) < getInputLine(-1) ) {
+        out->GotoPos(out->GetLength());
+        out->SetSelection(out->GetSelectionEnd()+1,out->GetSelectionEnd());
+      }
+    }
+    event->Skip();
+  });
+
+var function inputEditable(line) {
+  var inputLine = getInputLine();
+  var currentLine = line || out->GetCurrentLine();
+  return inputLine != wx.wxNOT_FOUND &&
+    (currentLine > inputLine ||
+     currentLine == inputLine && positionInLine(inputLine) >= inputBound) &&
+    ! (out->LineFromPosition(out->GetSelectionStart()) < getInputLine());
+}
+
+out->Connect(wxstc.wxEVT_STC_UPDATEUI, function() { out->SetReadOnly(! inputEditable()); });
+
+// only allow copy/move text by dropping to the input line
+out->Connect(wxstc.wxEVT_STC_DO_DROP,
+  function (event) {
+    if( ! inputEditable(out->LineFromPosition(event->GetPosition())) ) {
+      event->SetDragResult(wx.wxDragNone);
+    }
+  });
+
+if( config.nomousezoom ) {
+  // disable zoom using mouse wheel as it triggers zooming when scrolling
+  // on OSX with kinetic scroll and then pressing CMD.
+  out->Connect(wx.wxEVT_MOUSEWHEEL,
+    function (event) {
+      if( wx.wxGetKeyState(wx.WXK_CONTROL) ) { return; }
+      event->Skip();
+    });
+}

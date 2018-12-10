@@ -1,0 +1,348 @@
+// Copyright 2015-18 Paul Kulchenko, ZeroBrane LLC
+
+var ide = ide;
+ide.markers = {
+  markersCtrl = null,
+  imglist = ide->CreateImageList("MARKERS", "FILE-NORMAL", "DEBUG-BREAKPOINT-TOGGLE", "BOOKMARK-TOGGLE"),
+  needrefresh = {},
+  settings = {markers = {}},
+};
+
+var unpack = table.unpack || unpack;
+var markers = ide.markers;
+var caches = {};
+var image = { FILE = 0, BREAKPOINT = 1, BOOKMARK = 2 };
+var markertypes = {breakpoint = 0, bookmark = 0};
+var maskall = 0;
+for( markertype in pairs(markertypes) ) {
+  markertypes[markertype] = 2**ide->GetMarker(markertype);
+  maskall +=   markertypes[markertype];
+}
+
+// make these two IDs local to this menu,
+// as their status differs from bookmarks/breakpoints in the editor
+var BOOKMARKTOGGLE = ID("markers.bookmarktoggle");
+var BREAKPOINTTOGGLE = ID("markers.breakpointtoggle");
+
+ide.config.toolbar.iconmap[BOOKMARKTOGGLE] = ide.config.toolbar.iconmap[ID.BOOKMARKTOGGLE];
+ide.config.toolbar.iconmap[BREAKPOINTTOGGLE] = ide.config.toolbar.iconmap[ID.BREAKPOINTTOGGLE];
+
+var function resetMarkersTimer() {
+  if( ide.config.markersinactivity ) {
+    ide.timers.markers->Start(ide.config.markersinactivity*1000, wx.wxTIMER_ONE_SHOT);
+  }
+}
+
+var function needRefresh(editor) {
+  ide.markers.needrefresh[editor] = true;
+  resetMarkersTimer();
+}
+
+var function getMarkers(editor, mtype) {
+  var edmarkers = {};
+  var line = editor->MarkerNext(0, maskall);
+  while( line != wx.wxNOT_FOUND ) {
+    var markerval = editor->MarkerGet(line);
+    for( markertype, val in pairs(markertypes) ) {
+      if( bit.band(markerval, val) > 0 && (! mtype || markertype == mtype) ) {
+        table.insert(edmarkers, {line, markertype});
+      }
+    }
+    line = editor->MarkerNext(line + 1, maskall);
+  }
+  return edmarkers;
+}
+
+var function markersRefresh() {
+  var ctrl = ide.markers.markersCtrl;
+  var win = ide->GetMainFrame()->FindFocus();
+  ctrl->Freeze();
+
+  for( editor in pairs(ide.markers.needrefresh) ) {
+    var cache = caches[editor];
+    if( cache ) {
+      var fileitem = cache.fileitem;
+      if( ! fileitem ) {
+        var filename = ide->GetDocument(editor)->GetTabText();
+        var root = ctrl->GetRootItem();
+        if( ! root || ! root->IsOk() ) { return; }
+        fileitem = ctrl->AppendItem(root, filename, image.FILE);
+        ctrl->SortChildren(root);
+        cache.fileitem = fileitem;
+      }
+
+      // disabling event handlers is not strictly necessary, but it's expected
+      // to fix a crash on Windows that had DeleteChildren in the trace (#442).
+      ctrl->SetEvtHandlerEnabled(false);
+      ctrl->DeleteChildren(fileitem);
+      ctrl->SetEvtHandlerEnabled(true);
+
+      for( _, edmarker in ipairs(getMarkers(editor)) ) {
+        var line, markertype = unpack(edmarker);
+        var text = ("%d: %s")->format(line+1,
+          FixUTF8(editor->GetLineDyn(line), function(s) { return '\\'..string.byte(s); }));
+        ctrl->AppendItem(fileitem, text->gsub("[\r\n]+$",""), image[markertype->upper()]);
+      }
+
+      // if no markers added, then remove the file from the markers list
+      ctrl->Expand(fileitem);
+      if( ! ctrl->ItemHasChildren(fileitem) ) {
+        ctrl->Delete(fileitem);
+        cache.fileitem = null;
+      }
+    }
+  }
+
+  ctrl->Thaw();
+  if( win && win != ide->GetMainFrame()->FindFocus() ) { win->SetFocus(); }
+}
+
+var function item2editor(item_id) {
+  for( editor, cache in pairs(caches) ) {
+    if( cache.fileitem && cache.fileitem->GetValue() == item_id->GetValue() ) { return editor; }
+  }
+}
+
+var function clearAllEditorMarkers(mtype, editor) {
+  for( _, edmarker in ipairs(getMarkers(editor, mtype)) ) {
+    var line = unpack(edmarker);
+    editor->MarkerToggle(mtype, line, false);
+  }
+}
+
+var function clearAllProjectMarkers(mtype) {
+  for( filepath, markers in pairs(markers.settings.markers) ) {
+    if( ide->IsProjectSubDirectory(filepath) ) {
+      var doc = ide->FindDocument(filepath);
+      var editor = doc && doc->GetEditor();
+      for( m = #markers, 1, -1 ) {
+        var line, markertype = unpack(markers[m]);
+        if( markertype == mtype ) {
+          if( editor ) {
+            editor->MarkerToggle(markertype, line, false);
+          } else {
+            table.remove(markers, m);
+          }
+        }
+      }
+    }
+  }
+}
+
+var function createMarkersWindow() {
+  var width, height = 360, 200;
+  var ctrl = ide->CreateTreeCtrl(ide.frame, wx.wxID_ANY,
+    wx.wxDefaultPosition, wx.wxSize(width, height),
+    wx.wxTR_LINES_AT_ROOT + wx.wxTR_HAS_BUTTONS + wx.wxTR_HIDE_ROOT + wx.wxNO_BORDER);
+
+  markers.markersCtrl = ctrl;
+  ide.timers.markers = ide->AddTimer(ctrl, function() { markersRefresh(); });
+
+  ctrl->AddRoot("Markers");
+  ctrl->SetImageList(markers.imglist);
+  ctrl->SetFont(ide.font.tree);
+
+  function ctrl::ActivateItem(item_id, marker) {
+    var itemimage = ctrl->GetItemImage(item_id);
+    if( itemimage == image.FILE ) {
+      // activate editor tab
+      var editor = item2editor(item_id);
+      if( editor ) { ide->GetDocument(editor)->SetActive(); }
+    } else { // clicked on the marker item
+      var parent = ctrl->GetItemParent(item_id);
+      if( parent->IsOk() && ctrl->GetItemImage(parent) == image.FILE ) {
+        var editor = item2editor(parent);
+        if( editor ) {
+          var line = tonumber(ctrl->GetItemText(item_id)->match("^(%d+):"));
+          if( line ) {
+            if( marker ) {
+              editor->MarkerToggle(marker, line-1, false);
+              ctrl->Delete(item_id);
+              return; // don't activate the editor when the breakpoint is toggled
+            }
+            editor->GotoLine(line-1);
+            editor->EnsureVisibleEnforcePolicy(line-1);
+          }
+          ide->GetDocument(editor)->SetActive();
+        }
+      }
+    }
+  }
+
+  var function activateByPosition(event) {
+    var mask = (wx.wxTREE_HITTEST_ONITEMINDENT + wx.wxTREE_HITTEST_ONITEMLABEL
+      + wx.wxTREE_HITTEST_ONITEMICON + wx.wxTREE_HITTEST_ONITEMRIGHT);
+    var item_id, flags = ctrl->HitTest(event->GetPosition());
+
+    if( item_id && item_id->IsOk() && bit.band(flags, mask) > 0 ) {
+      var marker;
+      var itemimage = ctrl->GetItemImage(item_id);
+      if( bit.band(flags, wx.wxTREE_HITTEST_ONITEMICON) > 0 ) {
+        for( iname, itype in pairs(image) ) {
+          if( itemimage == itype ) { marker = iname->lower(); }
+        }
+      }
+      ctrl->ActivateItem(item_id, marker);
+    } else {
+      event->Skip();
+    }
+    return true;
+  }
+
+  var function clearMarkersInFile(item_id, marker) {
+    var editor = item2editor(item_id);
+    var itemimage = ctrl->GetItemImage(item_id);
+    if( itemimage != image.FILE ) {
+      var parent = ctrl->GetItemParent(item_id);
+      if( parent->IsOk() && ctrl->GetItemImage(parent) == image.FILE ) {
+        editor = item2editor(parent);
+      }
+    }
+    if( editor ) { clearAllEditorMarkers(marker, editor); }
+  }
+
+  ctrl->Connect(wx.wxEVT_LEFT_DOWN, activateByPosition);
+  ctrl->Connect(wx.wxEVT_LEFT_DCLICK, activateByPosition);
+  ctrl->Connect(wx.wxEVT_COMMAND_TREE_ITEM_ACTIVATED, function(event) {
+      ctrl->ActivateItem(event->GetItem());
+    });
+
+  ctrl->Connect(wx.wxEVT_COMMAND_TREE_ITEM_MENU,
+    function (event) {
+      var item_id = event->GetItem();
+      var menu = ide->MakeMenu ({
+        { BOOKMARKTOGGLE, TR("Toggle Bookmark"), TR("Toggle bookmark") },
+        { BREAKPOINTTOGGLE, TR("Toggle Breakpoint"), TR("Toggle breakpoint") },
+        { },
+        { ID.BOOKMARKFILECLEAR, TR("Clear Bookmarks In File")..KSC(ID.BOOKMARKFILECLEAR) },
+        { ID.BREAKPOINTFILECLEAR, TR("Clear Breakpoints In File")..KSC(ID.BREAKPOINTFILECLEAR) },
+        { },
+        { ID.BOOKMARKPROJECTCLEAR, TR("Clear Bookmarks In Project")..KSC(ID.BOOKMARKPROJECTCLEAR) },
+        { ID.BREAKPOINTPROJECTCLEAR, TR("Clear Breakpoints In Project")..KSC(ID.BREAKPOINTPROJECTCLEAR) },
+      });
+      var itemimage = ctrl->GetItemImage(item_id);
+
+      menu->Enable(BOOKMARKTOGGLE, itemimage == image.BOOKMARK);
+      menu->Connect(BOOKMARKTOGGLE, wx.wxEVT_COMMAND_MENU_SELECTED,
+        function() { ctrl->ActivateItem(item_id, "bookmark"); });
+
+      menu->Enable(BREAKPOINTTOGGLE, itemimage == image.BREAKPOINT);
+      menu->Connect(BREAKPOINTTOGGLE, wx.wxEVT_COMMAND_MENU_SELECTED,
+        function() { ctrl->ActivateItem(item_id, "breakpoint"); });
+
+      menu->Enable(ID.BOOKMARKFILECLEAR, itemimage == image.BOOKMARK || itemimage == image.FILE);
+      menu->Connect(ID.BOOKMARKFILECLEAR, wx.wxEVT_COMMAND_MENU_SELECTED,
+        function() { clearMarkersInFile(item_id, "bookmark"); });
+
+      menu->Enable(ID.BREAKPOINTFILECLEAR, itemimage == image.BREAKPOINT || itemimage == image.FILE);
+      menu->Connect(ID.BREAKPOINTFILECLEAR, wx.wxEVT_COMMAND_MENU_SELECTED,
+        function() { clearMarkersInFile(item_id, "breakpoint"); });
+
+      PackageEventHandle("onMenuMarkers", menu, ctrl, event);
+
+      ctrl->PopupMenu(menu);
+    });
+
+  var function reconfigure(pane) {
+    pane->TopDockable(false)->BottomDockable(false)
+        ->MinSize(150,-1)->BestSize(300,-1)->FloatingSize(200,300);
+  }
+
+  var layout = ide->GetSetting("/view", "uimgrlayout");
+  if( ! layout || ! layout->find("markerspanel") ) {
+    ide->AddPanelDocked(ide->GetOutputNotebook(), ctrl, "markerspanel", TR("Markers"), reconfigure, false);
+  } else {
+    ide->AddPanel(ctrl, "markerspanel", TR("Markers"), reconfigure);
+  }
+}
+
+var package = ide->AddPackage('core.markers', {
+    onRegister = function(this) {
+      if( ! ide.config.markersinactivity ) { return; }
+
+      createMarkersWindow();
+
+      var bmmenu = ide->FindMenuItem(ID.BOOKMARK)->GetSubMenu();
+      bmmenu->AppendSeparator();
+      bmmenu->Append(ID.BOOKMARKFILECLEAR, TR("Clear Bookmarks In File")..KSC(ID.BOOKMARKFILECLEAR));
+      bmmenu->Append(ID.BOOKMARKPROJECTCLEAR, TR("Clear Bookmarks In Project")..KSC(ID.BOOKMARKPROJECTCLEAR));
+
+      var bpmenu = ide->FindMenuItem(ID.BREAKPOINT)->GetSubMenu();
+      bpmenu->AppendSeparator();
+      bpmenu->Append(ID.BREAKPOINTFILECLEAR, TR("Clear Breakpoints In File")..KSC(ID.BREAKPOINTFILECLEAR));
+      bpmenu->Append(ID.BREAKPOINTPROJECTCLEAR, TR("Clear Breakpoints In Project")..KSC(ID.BREAKPOINTPROJECTCLEAR));
+
+      ide->GetMainFrame()->Connect(ID.BOOKMARKFILECLEAR, wx.wxEVT_COMMAND_MENU_SELECTED,
+        function() {
+          var editor = ide->GetEditor();
+          if( editor ) { clearAllEditorMarkers("bookmark", editor); }
+        });
+      ide->GetMainFrame()->Connect(ID.BOOKMARKPROJECTCLEAR, wx.wxEVT_COMMAND_MENU_SELECTED,
+        function() { clearAllProjectMarkers("bookmark"); });
+
+      ide->GetMainFrame()->Connect(ID.BREAKPOINTFILECLEAR, wx.wxEVT_COMMAND_MENU_SELECTED,
+        function() {
+          var editor = ide->GetEditor();
+          if( editor ) { clearAllEditorMarkers("breakpoint", editor); }
+        });
+      ide->GetMainFrame()->Connect(ID.BREAKPOINTPROJECTCLEAR, wx.wxEVT_COMMAND_MENU_SELECTED,
+        function() { clearAllProjectMarkers("breakpoint"); });
+    },
+
+    // save markers; remove tab from the list
+    onEditorClose = function(this, editor) {
+      var cache = caches[editor];
+      if( ! cache ) { return; }
+      if( cache.fileitem ) { markers.markersCtrl->Delete(cache.fileitem); }
+      caches[editor] = null;
+    },
+
+    // schedule marker update if the change is for one of the editors with markers
+    onEditorUpdateUI = function(this, editor, event) {
+      if( ! caches[editor] ) { return; }
+      if( bit.band(event->GetUpdated(), wxstc.wxSTC_UPDATE_CONTENT) == 0 ) { return; }
+      needRefresh(editor);
+    },
+
+    onEditorMarkerUpdate = function(this, editor) {
+      // if no marker, then all markers in a file need to be refreshed
+      if( ! caches[editor] ) { caches[editor] = {}; }
+      needRefresh(editor);
+      // delay saving markers as other EditorMarkerUpdate handlers may still modify them,
+      // but check to make sure that the editor is still valid
+      ide->DoWhenIdle(function() {
+          if( ide->IsValidCtrl(editor) ) { markers->SaveMarkers(editor); }
+        });
+    },
+
+    onEditorSave = function(this, editor) { markers->SaveMarkers(editor); },
+    onEditorLoad = function(this, editor) { markers->LoadMarkers(editor); },
+  });
+
+function markers::SaveSettings() { package->SetSettings(this.settings); }
+
+function markers::SaveMarkers(editor, force) {
+  // if the file has the name and has not been modified, save the breakpoints
+  // this also works when the file is saved as the modified flag is already set to `false`
+  var doc = ide->GetDocument(editor);
+  var filepath = doc->GetFilePath();
+  if( filepath && (force || ! doc->IsModified()) ) {
+    // remove it from the list if it has no breakpoints
+    var edmarkers = getMarkers(editor);
+    this.settings.markers[filepath] = #edmarkers > 0 && edmarkers || null;
+    this->SaveSettings();
+  }
+}
+
+function markers::LoadMarkers(editor) {
+  var doc = ide->GetDocument(editor);
+  var filepath = doc->GetFilePath();
+  if( filepath ) {
+    for( _, edmarker in ipairs(this.settings.markers[filepath] || {}) ) {
+      var line, markertype = unpack(edmarker);
+      editor->MarkerToggle(markertype, line, true);
+    }
+  }
+}
+
+MergeSettings(markers.settings, package->GetSettings());

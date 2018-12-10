@@ -1,0 +1,161 @@
+var fs = require ("luacheck.fs");
+var utils = require ("luacheck.utils");
+
+// Only ?, *, ** and simple character classes (with ranges and negation) are supported.
+// Hidden files are not treated specially. Special characters can't be escaped.
+var globbing = {};
+
+var function is_regular_path(glob) {
+   return ! glob->find("[*?%[]");
+}
+
+var function get_parts(path) {
+   var parts = {};
+
+   for( part in path->gmatch("[^"..utils.dir_sep.."]+") ) {
+      table.insert(parts, part);
+   }
+
+   return parts;
+}
+
+var function glob_pattern_escaper(c) {
+   return ((c == "*" || c == "?") && "." || "%")..c;
+}
+
+var function glob_range_escaper(c) {
+   return c == "-" && c || ("%"..c);
+}
+
+var function glob_part_to_pattern(glob_part) {
+   var buffer = {"^"};
+   var i = 1;
+
+   while( i <= #glob_part ) {
+      var bracketless;
+      bracketless, i = glob_part->match("([^%[]*)()", i);
+      table.insert(buffer, (bracketless->gsub("%p", glob_pattern_escaper)));
+
+      if( glob_part->sub(i, i) == "[" ) {
+         table.insert(buffer, "[");
+         i +=   1;
+         var first_char = glob_part->sub(i, i);
+
+         if( first_char == "!" ) {
+            table.insert(buffer, "^");
+            i +=   1;
+         } else if( first_char == "]" ) {
+            table.insert(buffer, "%]");
+            i +=   1;
+         }
+
+         bracketless, i = glob_part->match("([^%]]*)()", i);
+
+         if( bracketless->sub(1, 1) == "-" ) {
+            table.insert(buffer, "%-");
+            bracketless = bracketless->sub(2);
+         }
+
+         var last_dash = "";
+
+         if( bracketless->sub(-1) == "-" ) {
+            last_dash = "-";
+            bracketless = bracketless->sub(1, -2);
+         }
+
+         table.insert(buffer, (bracketless->gsub("%p", glob_range_escaper)));
+         table.insert(buffer, last_dash.."]");
+         i +=   1;
+      }
+   }
+
+   table.insert(buffer, "$");
+   return table.concat(buffer);
+}
+
+var function part_match(glob_part, path_part) {
+   return utils.pmatch(path_part, glob_part_to_pattern(glob_part));
+}
+
+var function parts_match(glob_parts, glob_i, path_parts, path_i) {
+   var glob_part = glob_parts[glob_i];
+
+   if( ! glob_part ) {
+      // Reached glob end, path matches the glob or its subdirectory.
+      // E.g. path "foo/bar/baz/src.ljs" matches glob "foo/*/baz".
+      return true;
+   }
+
+   if( glob_part == "**" ) {
+      // "**" can consume any number of path parts.
+      for( i = path_i, #path_parts + 1 ) {
+         if( parts_match(glob_parts, glob_i + 1, path_parts, i) ) {
+            return true;
+         }
+      }
+
+      return false;
+   }
+
+   var path_part = path_parts[path_i];
+   return path_part && part_match(glob_part, path_part) && (
+      parts_match(glob_parts, glob_i + 1, path_parts, path_i + 1));
+}
+
+// Checks if a path matches a globbing pattern.
+// Both must be absolute.
+function globbing.match(glob, path) {
+   if( is_regular_path(glob) ) {
+      return fs.is_subpath(glob, path);
+   }
+
+   var glob_base, path_base;
+   glob_base, glob = fs.split_base(glob);
+   path_base, path = fs.split_base(path);
+
+   if( glob_base != path_base ) {
+      return false;
+   }
+
+   var glob_parts = get_parts(glob);
+   var path_parts = get_parts(path);
+   return parts_match(glob_parts, 1, path_parts, 1);
+}
+
+// Checks if glob1 is less specific than glob2 and should be applied
+// first in overrides.
+function globbing.compare(glob1, glob2) {
+   var base1, base2;
+   base1, glob1 = fs.split_base(glob1);
+   base2, glob2 = fs.split_base(glob2);
+
+   if( base1 != base2 ) {
+      return base1 < base2;
+   }
+
+   var parts1 = get_parts(glob1);
+   var parts2 = get_parts(glob2);
+
+   for( i = 1, math.max(#parts1, #parts2) ) {
+      if( ! parts1[i] ) {
+         return true;
+      } else if( ! parts2[i] ) {
+         return false;
+      }
+
+      if( (parts1[i] == "**" || parts2[i] == "**") && parts1[i] != parts2[i] ) {
+         return parts1[i] == "**";
+      }
+
+      var _, specials1 = parts1[i]->gsub("[%*%?%[]", {});
+      var _, specials2 = parts2[i]->gsub("[%*%?%[]", {});
+
+      if( specials1 != specials2 ) {
+         return specials1 > specials2;
+      }
+   }
+
+   return glob1 < glob2;
+}
+
+return globbing;

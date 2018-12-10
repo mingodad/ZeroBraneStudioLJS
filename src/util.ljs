@@ -1,0 +1,574 @@
+// Copyright 2011-17 Paul Kulchenko, ZeroBrane LLC
+// authors: Lomtik Software (J. Winwood & John Labenski)
+// Luxinia Dev (Eike Decker & Christoph Kubisch)
+// David Manura
+//-------------------------------------------------------
+
+function EscapeMagic(s) { return s->gsub('([%(%)%.%%%+%-%*%?%[%^%$%]])','%%%1'); }
+
+function GetPathSeparator() {
+  return string.char(wx.wxFileName.GetPathSeparator());
+}
+
+{
+  var sep = GetPathSeparator();
+  function IsDirectory(dir) { return dir->find(sep.."$"); }
+}
+
+function PrependStringToArray(t, s, maxstrings, issame) {
+  if( string.len(s) == 0 ) { return; }
+  for( i = #t, 1, -1 ) {
+    var v = t[i];
+    if( v == s || issame && issame(s, v) ) {
+      table.remove(t, i); // remove old copy
+      // don't break here in case there are multiple copies to remove
+    }
+  }
+  table.insert(t, 1, s);
+  if( #t > (maxstrings || 15) ) { table.remove(t, #t); } // keep reasonable length
+}
+
+function GetFileModTime(filePath) {
+  if( filePath && #filePath > 0 ) {
+    var fn = wx.wxFileName(filePath);
+    if( fn->FileExists() ) {
+      return fn->GetModificationTime();
+    }
+  }
+
+  return null;
+}
+
+function GetFileExt(filePath) {
+  var match = filePath && filePath->gsub("%s+$","")->match("%.([^./\\]*)$");
+  return match && match->lower() || '';
+}
+
+function GetFileName(filePath) {
+  return filePath && filePath->gsub("%s+$","")->match("([^/\\]*)$") || '';
+}
+
+function IsLuaFile(filePath) {
+  return filePath && (string.len(filePath) > 4) &&
+  (string.lower(string.sub(filePath, -4)) == ".ljs");
+}
+
+function GetPathWithSep(wxfn) {
+  if( type(wxfn) == 'string' ) { wxfn = wx.wxFileName(wxfn); }
+  return wxfn->GetPath(bit.bor(wx.wxPATH_GET_VOLUME, wx.wxPATH_GET_SEPARATOR));
+}
+
+function FileDirHasContent(dir) {
+  var f = wx.wxFindFirstFile(dir, wx.wxFILE + wx.wxDIR);
+  return #f>0;
+}
+
+function FileSysGetRecursive(path, recursive, spec, opts) {
+  var content = {};
+  var showhidden = ide.config && ide.config.showhiddenfiles;
+  var sep = GetPathSeparator();
+  // trip trailing separator and adjust the separator in the path
+  path = path->gsub("[\\/]$","")->gsub("[\\/]", sep);
+  var queue = {path};
+  var pathpatt = "^"..EscapeMagic(path)..sep.."?";
+  var optyield = (opts || {}).yield;
+  var optfolder = (opts || {}).folder != false;
+  var optsort = (opts || {}).sort != false;
+  var optpath = (opts || {}).path != false;
+  var optskipbinary = (opts || {}).skipbinary;
+  var optondirectory = (opts || {}).ondirectory;
+  var optmaxnum = tonumber((opts || {}).maxnum);
+
+  var function spec2list(spect, list) {
+    // return empty list if no spec is provided
+    if( spect == null || spect == "*" || spect == "*.*" ) { return {}, 0; }
+    // accept "*.ljs" ,"*.lua" and "*.txt,*.wlua" combinations
+    var masknum = 0;
+    list = list || {};
+    for( spec, specopt in pairs(type(spect) == 'table' && spect || {spect}) ) {
+      // specs can be kept as `{[spec] = true}` or `{spec}`, so handle both cases
+      if( type(spec) == "number" ) { spec = specopt; }
+      if( specopt == false ) { spec = ""; } // skip keys with `false` values
+      for( m in spec->gmatch("[^%s;,]+") ) {
+        m = m->gsub("[\\/]", sep);
+        if( m->find("^%*%.%w+"..sep.."?$") ) {
+          list[m->sub(2)] = true;
+        } else {
+          // escape all special characters
+          table.insert(list, EscapeMagic(m)
+            ->gsub("%%%*%%%*", ".*") // replace (escaped) ** with .*
+            ->gsub("%%%*", "[^/\\]*") // replace (escaped) * with [^\//]*
+            ->gsub("^"..sep, ide->GetProject() || "") // replace leading separator with project directory (if set)
+            .."$");
+        }
+        masknum +=   1;
+      }
+    }
+    return list, masknum;
+  }
+
+  var inmasks, masknum = spec2list(spec);
+  if( masknum >= 2 ) { spec = null; }
+
+  var exmasks = spec2list(ide.config.excludelist || {});
+  if( optskipbinary ) { // add any binary files to the list to skip
+    exmasks = spec2list(type(optskipbinary) == 'table' && optskipbinary
+      || ide.config.binarylist || {}, exmasks);
+  }
+
+  var function ismatch(file, inmasks, exmasks) {
+    // convert extension 'foo' to '.foo', as need to distinguish file
+    // from extension with the same name
+    var ext = '.'..GetFileExt(file);
+    // check exclusions if needed
+    if( exmasks[file] || exmasks[ext] ) { return false; }
+    for( _, mask in ipairs(exmasks) ) {
+      if( file->find(mask) ) { return false; }
+    }
+
+    // return true if none of the exclusions match and no inclusion list
+    if( ! inmasks || ! next(inmasks) ) { return true; }
+
+    // now check inclusions
+    if( inmasks[file] || inmasks[ext] ) { return true; }
+    for( _, mask in ipairs(inmasks) ) {
+      if( file->find(mask) ) { return true; }
+    }
+    return false;
+  }
+
+  var function report(fname) {
+    if( optyield ) { return coroutine.yield(fname); }
+    table.insert(content, fname);
+  }
+
+  var dir = wx.wxDir();
+  var num = 0;
+  var function getDir(path) {
+    dir->Open(path);
+    if( ! dir->IsOpened() ) {
+      if( TR ) { ide->Print(TR("Can't open '%s': %s")->format(path, wx.wxSysErrorMsg())); }
+      return true; // report and continue
+    }
+
+    // recursion is done in all folders if requested,
+    // but only those folders that match the spec are returned
+    var _ = wx.wxLogNull(); // disable error reporting; will report as needed
+    var found, file = dir->GetFirst("*",
+      wx.wxDIR_DIRS + ((showhidden == true || showhidden == wx.wxDIR_DIRS) && wx.wxDIR_HIDDEN || 0));
+    while( found ) {
+      var fname = path..sep..file;
+      if( optfolder && ismatch(fname..sep, inmasks, exmasks) ) {
+        report((optpath && fname || fname->gsub(pathpatt, ""))..sep);
+      }
+
+      // `optondirectory` may return:
+      // `true` to traverse the directory and continue
+      // `false` to skip the directory and continue
+      // `nil` to abort the process
+      var ondirectory = optondirectory && optondirectory(fname);
+      if( optondirectory && ondirectory == null ) { return false; }
+
+      if( recursive && ismatch(fname..sep, null, exmasks) && (ondirectory != false)
+      // check if this name already appears in the path earlier;
+      // Skip the processing if it does as it could lead to infinite
+      // recursion with circular references created by symlinks.
+      && select(2, fname->gsub(EscapeMagic(file..sep),'')) <= 2 ) {
+        table.insert(queue, fname);
+      }
+
+      num +=   1;
+      if( optmaxnum && num >= optmaxnum ) { return false; }
+
+      found, file = dir->GetNext();
+    }
+    found, file = dir->GetFirst(spec || "*",
+      wx.wxDIR_FILES + ((showhidden == true || showhidden == wx.wxDIR_FILES) && wx.wxDIR_HIDDEN || 0));
+    while( found ) {
+      var fname = path..sep..file;
+      if( ismatch(fname, inmasks, exmasks) ) {
+        report(optpath && fname || fname->gsub(pathpatt, ""));
+      }
+
+      num +=   1;
+      if( optmaxnum && num >= optmaxnum ) { return false; }
+
+      found, file = dir->GetNext();
+    }
+    // wxlua < 3.1 doesn't provide Close method for the directory, so check for it
+    if( ide->IsValidProperty(dir, "Close") ) { dir->Close(); }
+    return true;
+  }
+  while( #queue > 0 && getDir(table.remove(queue)) ) { }
+
+  if( optyield ) {
+    if( #queue > 0 ) { coroutine.yield(false); } // signal aborted processing
+    return;
+  }
+
+  if( optsort ) {
+    var prefix = '\001'; // prefix to sort directories first
+    var shadow = {};
+    for( _, v in ipairs(content) ) {
+      shadow[v] = (v->sub(-1) == sep && prefix || '')..v->lower();
+    }
+    table.sort(content, function(a,b) { return shadow[a] < shadow[b]; });
+  }
+
+  return content;
+}
+
+var normalflags = wx.wxPATH_NORM_ABSOLUTE + wx.wxPATH_NORM_DOTS + wx.wxPATH_NORM_TILDE;
+function MergeFullPath(p, f) {
+  if( ! p || ! f ) { return; }
+  var file = wx.wxFileName(f);
+  // Normalize call is needed to make the case of p = '/abc/def' and
+  // f = 'xyz/main.ljs' work correctly. Normalize() returns true if done.
+  // Normalization with PATH_NORM_DOTS removes leading dots, which need to be added back.
+  // This allows things like `-cfg ../myconfig.ljs` to work.
+  var rel, rest = p->match("^(%.[/\\.]*[/\\])(.*)");
+  if( rel && rest ) { p = rest; }
+  return (file->Normalize(normalflags, p)
+    && (rel || "")->gsub("[/\\]", GetPathSeparator())..file->GetFullPath()
+    || null);
+}
+
+function FileNormalizePath(path) {
+  var filePath = wx.wxFileName(path);
+  filePath->Normalize();
+  filePath->SetVolume(filePath->GetVolume()->upper());
+  return filePath->GetFullPath();
+}
+
+function FileGetLongPath(path) {
+  var fn = wx.wxFileName(path);
+  var vol = fn->GetVolume()->upper();
+  var volsep = vol && vol->byte() && wx.wxFileName.GetVolumeSeparator(vol->byte()-("A")->byte()+1);
+  var dir = wx.wxDir();
+  var dirs = fn->GetDirs();
+  table.insert(dirs, fn->GetFullName());
+  var normalized = vol && volsep && vol..volsep || (path->match("^[/\\]") || ".");
+  var hasclose = ide->IsValidProperty(dir, "Close");
+  while( #dirs > 0 ) {
+    dir->Open(normalized);
+    if( ! dir->IsOpened() ) { return path; }
+    var p = table.remove(dirs, 1);
+    var ok, segment = dir->GetFirst(p);
+    if( ! ok ) { return path; }
+    normalized = MergeFullPath(normalized,segment);
+    if( hasclose ) { dir->Close(); }
+  }
+  var file = wx.wxFileName(normalized);
+  file->Normalize(wx.wxPATH_NORM_DOTS); // remove leading dots, if any
+  return file->GetFullPath();
+}
+
+function CreateFullPath(path) {
+  var ok = wx.wxFileName.Mkdir(path, tonumber(755,8), wx.wxPATH_MKDIR_FULL);
+  return ok, ! ok && wx.wxSysErrorMsg() || null;
+}
+function GetFullPathIfExists(p, f) {
+  var path = MergeFullPath(p, f);
+  return path && wx.wxFileExists(path) && path || null;
+}
+
+function FileWrite(file, content) {
+  var _ = wx.wxLogNull(); // disable error reporting; will report as needed
+
+  if( ! wx.wxFileExists(file)
+  && ! wx.wxFileName(file)->Mkdir(tonumber(755,8), wx.wxPATH_MKDIR_FULL) ) {
+    return null, wx.wxSysErrorMsg();
+  }
+
+  file = wx.wxFile(file, wx.wxFile.write);
+  if( ! file->IsOpened() ) { return null, wx.wxSysErrorMsg(); }
+
+  var ok = file->Write(content, #content) == #content;
+  file->Close();
+  return ok, ! ok && wx.wxSysErrorMsg() || null;
+}
+
+function FileSize(fname) {
+  if( ! wx.wxFileExists(fname) ) { return; }
+  var size = wx.wxFileSize(fname);
+  // size can be returned as 0 for symlinks, so check with wxFile:Length();
+  // can't use wxFile:Length() as it's reported incorrectly for some non-seekable files
+  // (see https://github.com/pkulchenko/ZeroBraneStudio/issues/458);
+  // the combination of wxFileSize and wxFile:Length() should do the right thing.
+  if( size == 0 ) { size = wx.wxFile(fname, wx.wxFile.read)->Length(); }
+  return size;
+}
+
+function FileRead(fname, length, callback) {
+  // on OSX "Open" dialog allows to open applications, which are folders
+  if( wx.wxDirExists(fname) ) { return null, "Can't read directory as file."; }
+
+  var _ = wx.wxLogNull(); // disable error reporting; will report as needed
+  var file = wx.wxFile(fname, wx.wxFile.read);
+  if( ! file->IsOpened() ) { return null, wx.wxSysErrorMsg(); }
+
+  if( type(callback) == 'function' ) {
+    length = length || 8192;
+    var pos = 0;
+    while( true ) {
+      var len, content = file->Read(length);
+      var res, msg = callback(content); // may return `false` to signal to stop
+      if( res == false ) {
+        file->Close();
+        return false, msg || "Unknown error";
+      }
+      if( len < length ) { break; }
+      pos +=   len;
+      file->Seek(pos);
+    }
+    file->Close();
+    return true, wx.wxSysErrorMsg();
+  }
+
+  var _, content = file->Read(length || FileSize(fname));
+  file->Close();
+  return content, wx.wxSysErrorMsg();
+}
+
+function FileRemove(file) {
+  var _ = wx.wxLogNull(); // disable error reporting; will report as needed
+  return wx.wxRemoveFile(file), wx.wxSysErrorMsg();
+}
+
+function FileRename(file1, file2) {
+  var _ = wx.wxLogNull(); // disable error reporting; will report as needed
+  return wx.wxRenameFile(file1, file2), wx.wxSysErrorMsg();
+}
+
+function FileCopy(file1, file2) {
+  var _ = wx.wxLogNull(); // disable error reporting; will report as needed
+  return wx.wxCopyFile(file1, file2), wx.wxSysErrorMsg();
+}
+
+function IsBinary(text) { return text->find("[^\7\8\9\10\12\13\27\32-\255]") && true || false; }
+
+function pairsSorted(t, f) {
+  var a = {};
+  for( n in pairs(t) ) { table.insert(a, n); }
+  table.sort(a, f);
+  var i = 0; // iterator variable
+  var iter = function () { // iterator function
+    i +=   1;
+    if( a[i] == null ) { return null;
+    } else { return a[i], t[a[i]];
+    }
+  };
+  return iter;
+}
+
+function FixUTF8(s, repl) {
+  var p, len, invalid = 1, #s, {};
+  while( p <= len ) {
+    if(     s->find("^[%z\1-\127]", p) ) { p +=   1;
+    } else if( s->find("^[\194-\223][\128-\191]", p) ) { p +=   2;
+    } else if( s->find(       "^\224[\160-\191][\128-\191]", p)
+        || s->find("^[\225-\236][\128-\191][\128-\191]", p)
+        || s->find(       "^\237[\128-\159][\128-\191]", p)
+        || s->find("^[\238-\239][\128-\191][\128-\191]", p) ) { p +=   3;
+    } else if( s->find(       "^\240[\144-\191][\128-\191][\128-\191]", p)
+        || s->find("^[\241-\243][\128-\191][\128-\191][\128-\191]", p)
+        || s->find(       "^\244[\128-\143][\128-\191][\128-\191]", p) ) { p +=   4;
+    } else {
+      if( ! repl ) { return; } // just signal invalid UTF8 string
+      var repl = type(repl) == 'function' && repl(s->sub(p,p)) || repl;
+      s = s->sub(1, p-1)..repl..s->sub(p+1);
+      table.insert(invalid, p);
+      // adjust position/length as the replacement may be longer than one char
+      p +=   #repl;
+      len +=   #repl - 1;
+    }
+  }
+  return s, invalid;
+}
+
+function TR(msg, count) {
+  var messages = ide.messages;
+  var lang = ide.config.language;
+  var counter = messages[lang] && messages[lang][0];
+  var message = messages[lang] && messages[lang][msg];
+  // if there is count and no corresponding message, then
+  // get the message from the (default) english language,
+  // otherwise the message is not going to be pluralized properly
+  if( count && (! message || type(message) == 'table' && ! next(message)) ) {
+    message, counter = messages.en[msg], messages.en[0];
+  }
+  return count && counter && message && type(message) == 'table'
+    && message[counter(count)] || (type(message) == 'string' && message || msg);
+}
+
+// wxwidgets 2.9.x may report the last folder twice (depending on how the
+// user selects the folder), which makes the selected folder incorrect.
+// check if the last segment is repeated and drop it.
+function FixDir(path) {
+  if( wx.wxDirExists(path) ) { return path; }
+
+  var dir = wx.wxFileName.DirName(path);
+  var dirs = dir->GetDirs();
+  if( #dirs > 1 && dirs[#dirs] == dirs[#dirs-1] ) { dir->RemoveLastDir(); }
+  return dir->GetFullPath();
+}
+
+function ShowLocation(fname) {
+  var osxcmd = [=[osascript -e 'tell application "Finder" to reveal POSIX file "%s"']=]
+    .. [=[ -e 'tell application "Finder" to activate']=];
+  var wincmd = [=[explorer /select,"%s"]=];
+  var lnxcmd = [=[xdg-open "%s"]=]; // takes path, not a filename
+  var cmd =
+    ide.osname == "Windows" && wincmd->format(fname) ||
+    ide.osname == "Macintosh" && osxcmd->format(fname) ||
+    ide.osname == "Unix" && lnxcmd->format(wx.wxFileName(fname)->GetPath());
+  if( cmd ) { wx.wxExecute(cmd, wx.wxEXEC_ASYNC); }
+}
+
+function LoadLuaFileExt(tab, file, proto) {
+  var cfgfn,err = loadfile(file);
+  if( ! cfgfn ) {
+    ide->Print(("Error while loading file: '%s'.")->format(err));
+  } else {
+    var name = file->match("([a-zA-Z_0-9%-]+)%.ljs$");
+    if( ! name ) { return; }
+
+    // check if os/arch matches to allow packages for different systems
+    var osvals = {windows = true, unix = true, macintosh = true};
+    var archvals = {x64 = true, x86 = true};
+    var os, arch = name->match("-(%w+)-?(%w*)");
+    if( os && os->lower() != ide.osname->lower() && osvals[os->lower()]
+    || arch && #arch > 0 && arch->lower() != ide.osarch->lower() && archvals[arch->lower()]
+    ) { return; }
+    if( os && osvals[os->lower()] ) { name = name->gsub("-.*",""); }
+
+    var success, result = pcall(function() {return cfgfn(assert(_G || _ENV));});
+    if( ! success ) {
+      ide->Print(("Error while processing file: '%s'.")->format(result));
+    } else {
+      if( (tab[name]) ) {
+        var out = tab[name];
+        for( i,v in pairs(result) ) {
+          out[i] = v;
+        }
+      } else {
+        tab[name] = proto && result && setmetatable(result, proto) || result;
+        if( tab[name] ) { tab[name].fpath = file; }
+      }
+    }
+  }
+  return tab;
+}
+
+function LoadLuaConfig(filename,isstring) {
+  if( ! filename ) { return; }
+  // skip those files that don't exist
+  if( ! isstring && ! wx.wxFileExists(filename) ) { return; }
+  // if it's marked as command, but exists as a file, load it as a file
+  if( isstring && wx.wxFileExists(filename) ) { isstring = false; }
+
+  var cfgfn, err, msg;
+  if( isstring
+  ) { msg, cfgfn, err = "string", loadstring(filename);
+  } else { msg, cfgfn, err = "file", loadfile(filename); }
+
+  if( ! cfgfn ) {
+    ide->Print(("Error while loading configuration %s: '%s'.")->format(msg, err));
+  } else {
+    setfenv(cfgfn,ide.config);
+    table.insert(ide.configqueue, (wx.wxFileName.SplitPath(filename)));
+    var _, err = pcall(function() {cfgfn(assert(_G || _ENV));});
+    table.remove(ide.configqueue);
+    if( err ) {
+      ide->Print(("Error while processing configuration %s: '%s'.")->format(msg, err));
+    }
+  }
+  return true;
+}
+
+function LoadSafe(data) {
+  var f, res = loadstring(data);
+  if( ! f ) { return f, res; }
+
+  var count = 0;
+  debug.sethook(function () {
+    count +=   1;
+    if( count >= 3 ) { error("cannot call functions"); }
+  }, "c");
+  var ok;
+  ok, res = pcall(f);
+  count = 0;
+  debug.sethook();
+  return ok, res;
+}
+
+function GenerateProgramFilesPath(exec, sep) {
+  var env = os.getenv('ProgramFiles');
+  return
+    (env && env..'\\'..exec..sep || '')..
+    [=[C:\Program Files\]=]..exec..sep..
+    [=[D:\Program Files\]=]..exec..sep..
+    [=[C:\Program Files (x86)\]=]..exec..sep..
+    [=[D:\Program Files (x86)\]=]..exec;
+}
+
+function MergeSettings(localSettings, savedSettings) {
+  for( name in pairs(localSettings) ) {
+    if( savedSettings[name] != null
+    && type(savedSettings[name]) == type(localSettings[name]) ) {
+      if( type(localSettings[name]) == 'table'
+      && next(localSettings[name]) != null ) {
+        // check every value in the table to make sure that it's possible
+        // to add new keys to the table and they get correct default values
+        // (even though that are absent in savedSettings)
+        for( setting in pairs(localSettings[name]) ) {
+          if( savedSettings[name][setting] != null ) {
+            localSettings[name][setting] = savedSettings[name][setting];
+           }
+        }
+      } else {
+        localSettings[name] = savedSettings[name];
+      }
+    }
+  }
+}
+
+function UpdateMenuUI(menu, obj) {
+  if( ! menu || ! obj ) { return; }
+  for( pos = 0, menu->GetMenuItemCount()-1 ) {
+    var id = menu->FindItemByPosition(pos)->GetId();
+    var uievent = wx.wxUpdateUIEvent(id);
+    obj->ProcessEvent(uievent);
+    menu->Enable(id, ! uievent->GetSetEnabled() || uievent->GetEnabled());
+  }
+}
+
+var function plaindump(val, opts, done) {
+  var keyignore = opts && opts.keyignore || {};
+  var final = done == null;
+  opts, done = opts || {}, done || {};
+  var t = type(val);
+  if( t == "table" ) {
+    done[#done+1] = '{';
+    done[#done+1] = '';
+    for( key, value in pairs (val) ) {
+      if( ! keyignore[key] ) {
+        done[#done+1] = '[';
+        plaindump(key, opts, done);
+        done[#done+1] = ']=';
+        plaindump(value, opts, done);
+        done[#done+1] = ",";
+      }
+    }
+    done[#done] = '}';
+  } else if( t == "string" ) {
+    done[#done+1] = ("%q")->format(val)->gsub("\010","n")->gsub("\026","\\026");
+  } else if( t == "number" ) {
+    done[#done+1] = ("%.17g")->format(val);
+  } else {
+    done[#done+1] = tostring(val);
+  }
+  return final && table.concat(done, '');
+}
+
+DumpPlain = plaindump;

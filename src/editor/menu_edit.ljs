@@ -1,0 +1,411 @@
+// Copyright 2011-16 Paul Kulchenko, ZeroBrane LLC
+// authors: Lomtik Software (J. Winwood & John Labenski)
+// Luxinia Dev (Eike Decker & Christoph Kubisch)
+//-------------------------------------------------------
+
+var ide = ide;
+
+// ---------------------------------------------------------------------------
+// Create the Edit menu and attach the callback functions
+
+var frame = ide.frame;
+var menuBar = frame.menuBar;
+
+var editMenu = ide->MakeMenu ({
+  { ID_UNDO, TR("&Undo")..KSC(ID_UNDO), TR("Undo last edit") },
+  { ID_REDO, TR("&Redo")..KSC(ID_REDO), TR("Redo last edit undone") },
+  { },
+  { ID_CUT, TR("Cu&t")..KSC(ID_CUT), TR("Cut selected text to clipboard") },
+  { ID_COPY, TR("&Copy")..KSC(ID_COPY), TR("Copy selected text to clipboard") },
+  { ID_PASTE, TR("&Paste")..KSC(ID_PASTE), TR("Paste text from the clipboard") },
+  { ID_SELECTALL, TR("Select &All")..KSC(ID_SELECTALL), TR("Select all text in the editor") },
+  { },
+  { ID_SHOWTOOLTIP, TR("Show &Tooltip")..KSC(ID_SHOWTOOLTIP), TR("Show tooltip for current position; place cursor after opening bracket of function") },
+  { ID_AUTOCOMPLETE, TR("Complete &Identifier")..KSC(ID_AUTOCOMPLETE), TR("Complete the current identifier") },
+  { ID_AUTOCOMPLETEENABLE, TR("Auto Complete Identifiers")..KSC(ID_AUTOCOMPLETEENABLE), TR("Auto complete while typing"), wx.wxITEM_CHECK },
+  { },
+  { ID_SOURCE, TR("Source"), "", {
+    { ID_COMMENT, TR("C&omment/Uncomment")..KSC(ID_COMMENT), TR("Comment or uncomment current or selected lines") },
+    { ID_REINDENT, TR("Correct &Indentation")..KSC(ID_REINDENT), TR("Re-indent selected lines") },
+    { ID_FOLD, TR("&Fold/Unfold All")..KSC(ID_FOLD), TR("Fold or unfold all code folds") },
+    { ID_FOLDLINE, TR("Fold/Unfold Current &Line")..KSC(ID_FOLDLINE), TR("Fold or unfold current line") },
+    { ID_SORT, TR("&Sort")..KSC(ID_SORT), TR("Sort selected lines") },
+  } },
+  { ID_BOOKMARK, TR("Bookmark"), "", {
+    { ID_BOOKMARKTOGGLE, TR("Toggle Bookmark")..KSC(ID_BOOKMARKTOGGLE), TR("Toggle bookmark") },
+    { ID_BOOKMARKNEXT, TR("Go To Next Bookmark")..KSC(ID_BOOKMARKNEXT) },
+    { ID_BOOKMARKPREV, TR("Go To Previous Bookmark")..KSC(ID_BOOKMARKPREV) },
+  } },
+  { },
+  { ID_PREFERENCES, TR("Preferences"), "", {
+    { ID_PREFERENCESSYSTEM, TR("Settings: System")..KSC(ID_PREFERENCESSYSTEM) },
+    { ID_PREFERENCESUSER, TR("Settings: User")..KSC(ID_PREFERENCESUSER) },
+  } },
+});
+menuBar->Append(editMenu, TR("&Edit"));
+
+editMenu->Check(ID_AUTOCOMPLETEENABLE, ide.config.autocomplete);
+
+var function getCtrlWithFocus(edType) {
+  var ctrl = ide->GetMainFrame()->FindFocus();
+  return ctrl && ctrl->GetClassInfo()->GetClassName() == edType && ctrl->DynamicCast(edType) || null;
+}
+
+var function onUpdateUIEditorInFocus(event) {
+  event->Enable(ide->GetEditorWithFocus(ide->GetEditor()) != null);
+}
+
+var function onUpdateUIEditMenu(event) {
+  var menu_id = event->GetId();
+  var editor = ide->GetEditorWithFocus();
+  if( editor == null ) {
+    var editor = getCtrlWithFocus("wxTextCtrl");
+    event->Enable(editor && (
+        menu_id == ID_PASTE && editor->CanPaste() ||
+        menu_id == ID_UNDO && editor->CanUndo() ||
+        menu_id == ID_REDO && editor->CanRedo() ||
+        menu_id == ID_CUT && editor->CanCut() ||
+        menu_id == ID_COPY && editor->CanCopy() ||
+        menu_id == ID_SELECTALL && true
+      ) || false);
+    return;
+  }
+
+  var alwaysOn = {
+    [ID_SELECTALL] = true,
+    // allow Cut and Copy commands as these work on a line if no selection
+    [ID_COPY] = true, [ID_CUT] = true,
+  };
+  var enable =
+    // pasting is allowed when the document is not read-only and the selection
+    // (if any) has no protected text; since pasting handles protected text,
+    // use GetReadOnly() instead of CanPaste()
+    menu_id == ID_PASTE && (! editor->GetReadOnly()) ||
+    menu_id == ID_UNDO && editor->CanUndo() ||
+    menu_id == ID_REDO && editor->CanRedo() ||
+    alwaysOn[menu_id];
+  event->Enable(enable);
+}
+
+var function onEditMenu(event) {
+  var menu_id = event->GetId();
+  var editor = ide->GetEditorWithFocus();
+  if( editor == null ) {
+    var editor = getCtrlWithFocus("wxTextCtrl");
+    if( ! editor || ! (
+      menu_id == ID_PASTE && editor->Paste() ||
+      menu_id == ID_UNDO && editor->Undo() ||
+      menu_id == ID_REDO && editor->Redo() ||
+      menu_id == ID_CUT && editor->Cut() ||
+      menu_id == ID_COPY && editor->Copy() ||
+      menu_id == ID_SELECTALL && editor->SetSelection(-1, -1) ||
+      true
+    ) ) { event->Skip(); }
+    return;
+  }
+
+  if( PackageEventHandle("onEditorAction", editor, event) == false ) {
+    return;
+  }
+
+  var copytext;
+  if( (menu_id == ID_CUT || menu_id == ID_COPY)
+  && ide.wxver >= "2.9.5" && editor->GetSelections() > 1 ) {
+    var main = editor->GetMainSelection();
+    copytext = editor->GetTextRangeDyn(editor->GetSelectionNStart(main), editor->GetSelectionNEnd(main));
+    for( s = 0, editor->GetSelections()-1 ) {
+      if( copytext != editor->GetTextRangeDyn(editor->GetSelectionNStart(s), editor->GetSelectionNEnd(s)) ) {
+        copytext = null;
+        break;
+      }
+    }
+  }
+
+  var spos, epos = editor->GetSelectionStart(), editor->GetSelectionEnd();
+  if( menu_id == ID_CUT ) {
+    if( spos == epos ) {
+      if( ide.config.editor.linecopy ) { editor->LineCopy(); }
+    } else {
+      editor->CopyDyn();
+    }
+    if( spos == epos && ide.config.editor.linecopy ) {
+      var line = editor->LineFromPosition(spos);
+      spos, epos = editor->PositionFromLine(line), editor->PositionFromLine(line+1);
+      editor->SetSelectionStart(spos);
+      editor->SetSelectionEnd(epos);
+    }
+    if( spos != epos ) { editor->ClearAny(); }
+  } else if( menu_id == ID_COPY ) {
+    if( spos == epos ) {
+      if( ide.config.editor.linecopy ) { editor->LineCopy(); }
+    } else {
+      editor->CopyDyn();
+    }
+  } else if( menu_id == ID_PASTE ) {
+    // first clear the text in case there is any hidden markup
+    if( spos != epos ) { editor->ClearAny(); }
+    editor->PasteDyn();
+  } else if( menu_id == ID_SELECTALL ) { editor->SelectAll();
+  } else if( menu_id == ID_UNDO ) { editor->Undo();
+  } else if( menu_id == ID_REDO ) { editor->Redo();
+  }
+
+  if( copytext ) { editor->CopyText(#copytext, copytext); }
+}
+
+for( _, event in pairs({ID_CUT, ID_COPY, ID_PASTE, ID_SELECTALL, ID_UNDO, ID_REDO}) ) {
+  frame->Connect(event, wx.wxEVT_COMMAND_MENU_SELECTED, onEditMenu);
+  frame->Connect(event, wx.wxEVT_UPDATE_UI, onUpdateUIEditMenu);
+}
+
+for( _, event in pairs({
+    ID_BOOKMARKTOGGLE, ID_BOOKMARKNEXT, ID_BOOKMARKPREV,
+    ID_AUTOCOMPLETE, ID_SORT, ID_REINDENT, ID_SHOWTOOLTIP,
+}) ) {
+  frame->Connect(event, wx.wxEVT_UPDATE_UI, onUpdateUIEditorInFocus);
+}
+
+frame->Connect(ID_COMMENT, wx.wxEVT_UPDATE_UI,
+  function(event) {
+    var editor = ide->GetEditorWithFocus(ide->GetEditor());
+    event->Enable(editor != null
+      && ide->IsValidProperty(editor, "spec") && editor.spec
+      && editor.spec.linecomment && true || false);
+  });
+
+var function generateConfigMessage(type) {
+  return ([==[--[[--
+  Use this file to specify **%s** preferences.
+  Review [examples](+%s) or check [online documentation](%s) for details.
+--]]--
+]==])
+    ->format(type, MergeFullPath(ide.editorFilename, "../cfg/user-sample.ljs"),
+      "http://studio.zerobrane.com/documentation.html");
+}
+
+frame->Connect(ID_PREFERENCESSYSTEM, wx.wxEVT_COMMAND_MENU_SELECTED,
+  function () {
+    var editor = LoadFile(ide.configs.system);
+    if( editor && editor->GetLength() == 0 ) {
+      editor->AddTextDyn(generateConfigMessage("System")); }
+  });
+
+frame->Connect(ID_PREFERENCESUSER, wx.wxEVT_COMMAND_MENU_SELECTED,
+  function () {
+    var editor = LoadFile(ide.configs.user);
+    if( editor && editor->GetLength() == 0 ) {
+      editor->AddTextDyn(generateConfigMessage("User")); }
+  });
+frame->Connect(ID_PREFERENCESUSER, wx.wxEVT_UPDATE_UI,
+  function (event) { event->Enable(ide.configs.user != null); });
+
+frame->Connect(ID_CLEARDYNAMICWORDS, wx.wxEVT_COMMAND_MENU_SELECTED,
+  function () { DynamicWordsReset(); });
+
+frame->Connect(ID_SHOWTOOLTIP, wx.wxEVT_COMMAND_MENU_SELECTED,
+  function (event) {
+    var editor = ide->GetEditor();
+
+    if( (editor->CallTipActive()) ) {
+      editor->CallTipCancel();
+      return;
+    }
+
+    EditorCallTip(editor, editor->GetCurrentPos());
+  });
+
+frame->Connect(ID_AUTOCOMPLETE, wx.wxEVT_COMMAND_MENU_SELECTED,
+  function (event) { EditorAutoComplete(ide->GetEditor()); });
+
+frame->Connect(ID_AUTOCOMPLETEENABLE, wx.wxEVT_COMMAND_MENU_SELECTED,
+  function (event) { ide.config.autocomplete = event->IsChecked(); });
+
+frame->Connect(ID_COMMENT, wx.wxEVT_COMMAND_MENU_SELECTED,
+  function (event) {
+    var editor = ide->GetEditor();
+    var lc = editor.spec.linecomment;
+    if( ! lc ) { return; }
+
+    // for multi-line selection, always start the first line at the beginning
+    var ssel, esel = editor->GetSelectionStart(), editor->GetSelectionEnd();
+    var sline = editor->LineFromPosition(ssel);
+    var eline = editor->LineFromPosition(esel);
+    var sel = ssel != esel;
+    var rect = editor->SelectionIsRectangle();
+    var qlc = lc->gsub(".", "%%%1");
+
+    // figure out how to toggle comments; if there is at least one non-empty
+    // line that doesn't start with a comment, need to comment
+    var comment = false;
+    for( line = sline, eline ) {
+      var pos = sel && (sline == eline || rect)
+        && ssel-editor->PositionFromLine(sline)+1 || 1;
+      var text = editor->GetLineDyn(line);
+      var _, cpos = text->find("^%s*"..qlc, pos);
+      if( ! cpos && text->find("%S")
+      // ignore last line when the end of selection is at the first position
+      && (line == sline || line < eline || esel-editor->PositionFromLine(line) > 0) ) {
+        comment = true;
+        break;
+      }
+    }
+
+    var linetoggle = ide.config.editor.commentlinetoggle;
+    editor->BeginUndoAction();
+    // go last to first as selection positions we captured may be affected
+    // by text changes
+    for( line = eline, sline, -1 ) {
+      var pos = sel && (sline == eline || rect) && ssel-editor->PositionFromLine(sline)+1 || 1;
+      var text = editor->GetLineDyn(line);
+      var validline = (line == sline || line < eline || esel-editor->PositionFromLine(line) > 0);
+      var _, cpos = text->find("^%s*"..qlc, pos);
+      if( (linetoggle || ! comment) && cpos && validline ) {
+        editor->DeleteRange(cpos-#lc+editor->PositionFromLine(line), #lc);
+      } else if( (linetoggle || comment) && text->find("%S") && validline ) {
+        editor->SetTargetStart(pos+editor->PositionFromLine(line)-1);
+        editor->SetTargetEnd(editor->GetTargetStart());
+        editor->ReplaceTarget(lc);
+      }
+    }
+    editor->EndUndoAction();
+  });
+
+var function processSelection(editor, func) {
+  var text = editor->GetSelectedTextDyn();
+  var line = editor->GetCurrentLine();
+  var posinline = editor->GetCurrentPos() - editor->PositionFromLine(line);
+  if( #text == 0 ) {
+    editor->SelectAll();
+    text = editor->GetSelectedTextDyn();
+  }
+  var wholeline = text->find("\n$");
+  var buf = {};
+  for( ln in string.gmatch(text..(wholeline && "" || "\n"), "(.-\r?\n)") ) {
+    table.insert(buf, ln);
+  }
+  if( #buf > 0 ) {
+    if( func ) { func(buf); }
+    // add new line at the end if it was there
+    var newtext = table.concat(buf, "")->gsub("(\r?\n)$", wholeline && "%1" || "");
+    // straightforward editor:ReplaceSelection() doesn't work reliably as
+    // it sometimes doubles the context when the entire file is selected.
+    // this seems like Scintilla issue, so use ReplaceTarget instead.
+    // Since this doesn't work with rectangular selection, which
+    // ReplaceSelection should handle (after wxwidgets 3.x upgrade), this
+    // will need to be revisited when ReplaceSelection is updated.
+    if( newtext != text ) {
+      editor->BeginUndoAction();
+      // if there is at least one marker, then use a different mechanism to preserve them
+      // simply saving markers, replacing text, and reapplying markers doesn't work as
+      // they get reset after `undo/redo` operations.
+      var ssel, esel = editor->GetSelectionStart(), editor->GetSelectionEnd();
+      var sline = editor->LineFromPosition(ssel);
+      var eline = editor->LineFromPosition(esel);
+      if( #editor->MarkerGetAll(null, sline, eline) > 0 ) {
+        for( line = #buf, 1, -1 ) {
+          editor->SetTargetStart(line == 1 && ssel || editor->PositionFromLine(sline+line-1));
+          editor->SetTargetEnd(line == eline-sline+1 && esel || editor->GetLineEndPosition(sline+line-1));
+          editor->ReplaceTargetDyn((buf[line]->gsub("\r?\n$", "")));
+        }
+      } else {
+        editor->TargetFromSelection();
+        editor->ReplaceTargetDyn(newtext);
+      }
+      editor->EndUndoAction();
+    }
+  }
+  editor->GotoPosEnforcePolicy(math.min(
+      editor->PositionFromLine(line)+posinline, editor->GetLineEndPosition(line)));
+}
+
+frame->Connect(ID_SORT, wx.wxEVT_COMMAND_MENU_SELECTED,
+  function (event) { processSelection(ide->GetEditor(), table.sort); });
+
+var function reIndent(editor, buf) {
+  var decindent, incindent = editor.spec.isdecindent, editor.spec.isincindent;
+  if( ! (decindent && incindent) ) { return; }
+
+  var edline = editor->LineFromPosition(editor->GetSelectionStart());
+  var indent = 0;
+  var text = "";
+  // find the last non-empty line in the previous block (if any)
+  for( n = edline-1, 1, -1 ) {
+    indent = editor->GetLineIndentation(n);
+    text = editor->GetLineDyn(n);
+    if( text->match("[^\r\n]") ) { break; }
+  }
+
+  var ut = editor->GetUseTabs();
+  var tw = ut && editor->GetTabWidth() || editor->GetIndent();
+
+  var indents = {};
+  var isstatic = {};
+  for( line = 1, #buf+1 ) {
+    var ls = editor->PositionFromLine(edline+line-1);
+    var style = bit.band(editor->GetStyleAt(ls), ide.STYLEMASK);
+    // don't reformat multi-line comments or strings
+    isstatic[line] = (editor.spec.iscomment[style]
+      || editor.spec.isstring[style]
+      || (MarkupIsAny && MarkupIsAny(style)));
+    if( ! isstatic[line] || line == 1 || ! isstatic[line-1] ) {
+      var closed, blockend = decindent(text);
+      var opened = incindent(text);
+
+      // ignore impact from initial block endings as they are already indented
+      if( line == 1 ) { blockend = 0; }
+
+      // this only needs to be done for 2, #buf+1; do it and get out when done
+      if( line > 1 ) { indents[line-1] = indents[line-1] - tw * closed; }
+      if( line > #buf ) { break; }
+
+      indent +=   tw * (opened - blockend);
+      if( indent < 0 ) { indent = 0; }
+    }
+
+    indents[line] = indent;
+    text = buf[line];
+  }
+
+  for( line = 1, #buf ) {
+    if( ! isstatic[line] ) {
+      buf[line] = buf[line]->gsub("^[ \t]*",
+        ! buf[line]->match("%S") && ""
+        || ut && ("\t")->rep(indents[line] / tw) || (" ")->rep(indents[line]));
+    }
+  }
+}
+
+frame->Connect(ID_REINDENT, wx.wxEVT_COMMAND_MENU_SELECTED,
+  function (event) {
+    var editor = ide->GetEditor();
+    processSelection(editor, function(buf) { reIndent(editor, buf); });
+  });
+
+var function canfold(event) {
+  var editor = ide->GetEditorWithFocus();
+  event->Enable(editor && editor->CanFold() || false);
+}
+
+frame->Connect(ID_FOLD, wx.wxEVT_UPDATE_UI, canfold);
+frame->Connect(ID_FOLD, wx.wxEVT_COMMAND_MENU_SELECTED,
+  function (event) { ide->GetEditorWithFocus()->FoldSome(); });
+
+frame->Connect(ID_FOLDLINE, wx.wxEVT_UPDATE_UI, canfold);
+frame->Connect(ID_FOLDLINE, wx.wxEVT_COMMAND_MENU_SELECTED,
+  function (event) {
+    var editor = ide->GetEditorWithFocus();
+    var current = editor->GetCurrentLine();
+    editor->ToggleFold(current);
+    // move up to the parent line if the current one is not visible
+    var visible = editor->GetLineVisible(current);
+    if( ! visible && editor->GetFoldParent(current) != wx.wxNOT_FOUND ) { editor->LineUp(); }
+  });
+
+var BOOKMARK_MARKER = StylesGetMarker("bookmark");
+
+frame->Connect(ID_BOOKMARKTOGGLE, wx.wxEVT_COMMAND_MENU_SELECTED,
+  function() { ide->GetEditor()->BookmarkToggle(); });
+frame->Connect(ID_BOOKMARKNEXT, wx.wxEVT_COMMAND_MENU_SELECTED,
+  function() { ide->GetEditor()->MarkerGotoNext(BOOKMARK_MARKER); });
+frame->Connect(ID_BOOKMARKPREV, wx.wxEVT_COMMAND_MENU_SELECTED,
+  function() { ide->GetEditor()->MarkerGotoPrev(BOOKMARK_MARKER); });

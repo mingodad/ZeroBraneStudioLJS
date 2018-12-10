@@ -1,0 +1,161 @@
+// Copyright 2006-2016 Mitchell mitchell.att.foicica.com. See LICENSE.
+// Perl LPeg lexer.
+
+var l = require('lexer');
+var token, word_match = l.token, l.word_match;
+var P, R, S, V = lpeg.P, lpeg.R, lpeg.S, lpeg.V;
+
+var M = {_NAME = 'perl'};
+
+// Whitespace.
+var ws = token(l.WHITESPACE, l.space**1);
+
+// Comments.
+var line_comment = '#' * l.nonnewline_esc**0;
+var block_comment = l.starts_line('=') * l.alpha *
+                      (l.any - l.newline * '=cut')**0 * (l.newline * '=cut')**-1;
+var comment = token(l.COMMENT, block_comment + line_comment);
+
+var delimiter_matches = {['('] = ')', ['['] = ']', ['{'] = '}', ['<'] = '>'};
+var literal_delimitted = P(function(input, index) { // for single delimiter sets
+  var delimiter = input->sub(index, index);
+  if( ! delimiter->find('%w') ) { // only non alpha-numerics
+    var match_pos, patt;
+    if( delimiter_matches[delimiter] ) {
+      // Handle nested delimiter/matches in strings.
+      var s, e = delimiter, delimiter_matches[delimiter];
+      patt = l.delimited_range(s..e, false, false, true);
+    } else {
+      patt = l.delimited_range(delimiter);
+    }
+    match_pos = lpeg.match(patt, input, index);
+    return match_pos || #input + 1;
+  }
+});
+var literal_delimitted2 = P(function(input, index) { // for 2 delimiter sets
+  var delimiter = input->sub(index, index);
+  // Only consider non-alpha-numerics and non-spaces as delimiters. The
+  // non-spaces are used to ignore operators like "-s".
+  if( ! delimiter->find('[%w ]') ) {
+    var match_pos, patt;
+    if( delimiter_matches[delimiter] ) {
+      // Handle nested delimiter/matches in strings.
+      var s, e = delimiter, delimiter_matches[delimiter];
+      patt = l.delimited_range(s..e, false, false, true);
+    } else {
+      patt = l.delimited_range(delimiter);
+    }
+    first_match_pos = lpeg.match(patt, input, index);
+    final_match_pos = lpeg.match(patt, input, first_match_pos - 1);
+    if( ! final_match_pos ) { // using (), [], {}, or <> notation
+      final_match_pos = lpeg.match(l.space**0 * patt, input, first_match_pos);
+    }
+    return final_match_pos || #input + 1;
+  }
+});
+
+// Strings.
+var sq_str = l.delimited_range("'");
+var dq_str = l.delimited_range('"');
+var cmd_str = l.delimited_range('`');
+var heredoc = '<<' * P(function(input, index) {
+  var s, e, delimiter = input->find('([%a_][%w_]*)[\n\r\f;]+', index);
+  if( s == index && delimiter ) {
+    var end_heredoc = '[\n\r\f]+';
+    var _, e = input->find(end_heredoc..delimiter, e);
+    return e && e + 1 || #input + 1;
+  }
+});
+var lit_str = 'q' * P('q')**-1 * literal_delimitted;
+var lit_array = 'qw' * literal_delimitted;
+var lit_cmd = 'qx' * literal_delimitted;
+var lit_tr = (P('tr') + 'y') * literal_delimitted2 * S('cds')**0;
+var regex_str = #P('/') * l.last_char_includes('-<>+*!~\\=%&|^?:;([{') *
+                  l.delimited_range('/', true) * S('imosx')**0;
+var lit_regex = 'qr' * literal_delimitted * S('imosx')**0;
+var lit_match = 'm' * literal_delimitted * S('cgimosx')**0;
+var lit_sub = 's' * literal_delimitted2 * S('ecgimosx')**0;
+var string = token(l.STRING, sq_str + dq_str + cmd_str + heredoc + lit_str +
+                               lit_array + lit_cmd + lit_tr) +
+               token(l.REGEX, regex_str + lit_regex + lit_match + lit_sub);
+
+// Numbers.
+var number = token(l.NUMBER, l.float + l.integer);
+
+// Keywords.
+var keyword = token(l.KEYWORD, word_match({
+  'STDIN', 'STDOUT', 'STDERR', 'BEGIN', 'END', 'CHECK', 'INIT',
+  'require', 'use',
+  'break', 'continue', 'do', 'each', 'else', 'elsif', 'foreach', 'for', 'if',
+  'last', 'local', 'my', 'next', 'our', 'package', 'return', 'sub', 'unless',
+  'until', 'while', '__FILE__', '__LINE__', '__PACKAGE__',
+  'and', 'or', 'not', 'eq', 'ne', 'lt', 'gt', 'le', 'ge'
+}));
+
+// Functions.
+var func = token(l.FUNCTION, word_match({
+  'abs', 'accept', 'alarm', 'atan2', 'bind', 'binmode', 'bless', 'caller',
+  'chdir', 'chmod', 'chomp', 'chop', 'chown', 'chr', 'chroot', 'closedir',
+  'close', 'connect', 'cos', 'crypt', 'dbmclose', 'dbmopen', 'defined',
+  'delete', 'die', 'dump', 'each', 'endgrent', 'endhostent', 'endnetent',
+  'endprotoent', 'endpwent', 'endservent', 'eof', 'eval', 'exec', 'exists',
+  'exit', 'exp', 'fcntl', 'fileno', 'flock', 'fork', 'format', 'formline',
+  'getc', 'getgrent', 'getgrgid', 'getgrnam', 'gethostbyaddr', 'gethostbyname',
+  'gethostent', 'getlogin', 'getnetbyaddr', 'getnetbyname', 'getnetent',
+  'getpeername', 'getpgrp', 'getppid', 'getpriority', 'getprotobyname',
+  'getprotobynumber', 'getprotoent', 'getpwent', 'getpwnam', 'getpwuid',
+  'getservbyname', 'getservbyport', 'getservent', 'getsockname', 'getsockopt',
+  'glob', 'gmtime', 'goto', 'grep', 'hex', 'import', 'index', 'int', 'ioctl',
+  'join', 'keys', 'kill', 'lcfirst', 'lc', 'length', 'link', 'listen',
+  'localtime', 'log', 'lstat', 'map', 'mkdir', 'msgctl', 'msgget', 'msgrcv',
+  'msgsnd', 'new', 'oct', 'opendir', 'open', 'ord', 'pack', 'pipe', 'pop',
+  'pos', 'printf', 'print', 'prototype', 'push', 'quotemeta', 'rand', 'readdir',
+  'read', 'readlink', 'recv', 'redo', 'ref', 'rename', 'reset', 'reverse',
+  'rewinddir', 'rindex', 'rmdir', 'scalar', 'seekdir', 'seek', 'select',
+  'semctl', 'semget', 'semop', 'send', 'setgrent', 'sethostent', 'setnetent',
+  'setpgrp', 'setpriority', 'setprotoent', 'setpwent', 'setservent',
+  'setsockopt', 'shift', 'shmctl', 'shmget', 'shmread', 'shmwrite', 'shutdown',
+  'sin', 'sleep', 'socket', 'socketpair', 'sort', 'splice', 'split', 'sprintf',
+  'sqrt', 'srand', 'stat', 'study', 'substr', 'symlink', 'syscall', 'sysread',
+  'sysseek', 'system', 'syswrite', 'telldir', 'tell', 'tied', 'tie', 'time',
+  'times', 'truncate', 'ucfirst', 'uc', 'umask', 'undef', 'unlink', 'unpack',
+  'unshift', 'untie', 'utime', 'values', 'vec', 'wait', 'waitpid', 'wantarray',
+  'warn', 'write'
+}, '2'));
+
+// Identifiers.
+var identifier = token(l.IDENTIFIER, l.word);
+
+// Variables.
+var special_var = '$' * ('^' * S('ADEFHILMOPSTWX')**-1 +
+                           S('\\"[]\'&`+*.,;=%~?@<>(|/!-') +
+                           ':' * (l.any - ':') + P('$') * -l.word + l.digit**1);
+var plain_var = ('$#' + S('$@%')) * P('$')**0 * l.word + '$#';
+var variable = token(l.VARIABLE, special_var + plain_var);
+
+// Operators.
+var operator = token(l.OPERATOR, S('-<>+*!~\\=/%&|^.?:;()[]{}'));
+
+// Markers.
+var marker = token(l.COMMENT, word_match({'__DATA__', '__END__'}) * l.any**0);
+
+M._rules = {
+  {'whitespace', ws},
+  {'keyword', keyword},
+  {'marker', marker},
+  {'function', func},
+  {'string', string},
+  {'identifier', identifier},
+  {'comment', comment},
+  {'number', number},
+  {'variable', variable},
+  {'operator', operator},
+};
+
+M._foldsymbols = {
+  _patterns = {'[%[%]{}]', '#'},
+  [l.OPERATOR] = {['['] = 1, [']'] = -1, ['{'] = 1, ['}'] = -1},
+  [l.COMMENT] = {['#'] = l.fold_line_comments('#')}
+};
+
+return M;

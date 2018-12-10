@@ -1,0 +1,113 @@
+// Copyright 2011-16 Paul Kulchenko, ZeroBrane LLC
+// authors: Lomtik Software (J. Winwood & John Labenski)
+// Luxinia Dev (Eike Decker & Christoph Kubisch)
+//-------------------------------------------------------
+
+var ide = ide;
+var frame = ide.frame;
+var menuBar = frame.menuBar;
+var uimgr = frame.uimgr;
+
+var viewMenu = ide->MakeMenu ({
+  { ID_VIEWFILETREE, TR("Project/&FileTree Window")..KSC(ID_VIEWFILETREE), TR("View the project/filetree window"), wx.wxITEM_CHECK },
+  { ID_VIEWOUTPUT, TR("&Output/Console Window")..KSC(ID_VIEWOUTPUT), TR("View the output/console window"), wx.wxITEM_CHECK },
+  { ID_VIEWWATCHWINDOW, TR("&Watch Window")..KSC(ID_VIEWWATCHWINDOW), TR("View the watch window"), wx.wxITEM_CHECK },
+  { ID_VIEWCALLSTACK, TR("&Stack Window")..KSC(ID_VIEWCALLSTACK), TR("View the stack window"), wx.wxITEM_CHECK },
+  { ID_VIEWOUTLINE, TR("Outline Window")..KSC(ID_VIEWOUTLINE), TR("View the outline window"), wx.wxITEM_CHECK },
+  { ID_VIEWMARKERS, TR("Markers Window")..KSC(ID_VIEWMARKERS), TR("View the markers window"), wx.wxITEM_CHECK },
+  { },
+  { ID_VIEWTOOLBAR, TR("&Tool Bar")..KSC(ID_VIEWTOOLBAR), TR("Show/Hide the toolbar"), wx.wxITEM_CHECK },
+  { ID_VIEWSTATUSBAR, TR("&Status Bar")..KSC(ID_VIEWSTATUSBAR), TR("Show/Hide the status bar"), wx.wxITEM_CHECK },
+  { },
+  { ID_VIEWDEFAULTLAYOUT, TR("&Default Layout")..KSC(ID_VIEWDEFAULTLAYOUT), TR("Reset to default layout") },
+  { ID_VIEWFULLSCREEN, TR("Full &Screen")..KSC(ID_VIEWFULLSCREEN), TR("Switch to or from full screen mode") },
+});
+
+{ // Add zoom submenu
+  var zoomMenu = ide->MakeMenu ({
+    {ID_ZOOMRESET, TR("Zoom to 100%")..KSC(ID_ZOOMRESET)},
+    {ID_ZOOMIN, TR("Zoom In")..KSC(ID_ZOOMIN)},
+    {ID_ZOOMOUT, TR("Zoom Out")..KSC(ID_ZOOMOUT)},
+  });
+
+  frame->Connect(ID_ZOOMRESET, wx.wxEVT_COMMAND_MENU_SELECTED,
+    function() {var editor = ide->GetEditorWithFocus();
+      if( editor ) { editor->SetZoom(0); } });
+  frame->Connect(ID_ZOOMIN, wx.wxEVT_COMMAND_MENU_SELECTED,
+    function() { var editor = ide->GetEditorWithFocus();
+      if( editor ) { editor->SetZoom(editor->GetZoom()+1); } });
+  frame->Connect(ID_ZOOMOUT, wx.wxEVT_COMMAND_MENU_SELECTED,
+    function() { var editor = ide->GetEditorWithFocus();
+      if( editor ) { editor->SetZoom(editor->GetZoom()-1); } });
+
+  // only enable if there is an editor
+  var iseditor = function (event) { event->Enable(ide->GetEditorWithFocus() != null); };
+  for( _, id in ipairs({ID_ZOOMRESET, ID_ZOOMIN, ID_ZOOMOUT}) ) {
+    frame->Connect(id, wx.wxEVT_UPDATE_UI, iseditor);
+  }
+
+  viewMenu->Append(ID_ZOOM, TR("Zoom"), zoomMenu);
+}
+
+menuBar->Append(viewMenu, TR("&View"));
+
+var panels = {
+  [ID_VIEWOUTPUT] = "bottomnotebook",
+  [ID_VIEWFILETREE] = "projpanel",
+  [ID_VIEWWATCHWINDOW] = "watchpanel",
+  [ID_VIEWCALLSTACK] = "stackpanel",
+  [ID_VIEWOUTLINE] = "outlinepanel",
+  [ID_VIEWMARKERS] = "markerspanel",
+  [ID_VIEWTOOLBAR] = "toolbar",
+};
+
+var function togglePanel(event) {
+  var panel = panels[event->GetId()];
+  var pane = uimgr->GetPane(panel);
+  var shown = ! pane->IsShown();
+  if( ! shown ) { pane->BestSize(pane.window->GetSize()); }
+  pane->Show(shown);
+  uimgr->Update();
+
+  return shown;
+}
+
+var function checkPanel(event) {
+  var pane = uimgr->GetPane(panels[event->GetId()]);
+  event->Enable(pane->IsOk()); // disable if doesn't exist
+  menuBar->Check(event->GetId(), pane->IsOk() && pane->IsShown());
+}
+
+frame->Connect(ID_VIEWDEFAULTLAYOUT, wx.wxEVT_COMMAND_MENU_SELECTED,
+  function (event) {
+    uimgr->LoadPerspective(uimgr.defaultPerspective, true);
+  });
+  
+frame->Connect(ID_VIEWMINIMIZE, wx.wxEVT_COMMAND_MENU_SELECTED,
+  function (event) { ide.frame->Iconize(true); });
+
+frame->Connect(ID_VIEWFULLSCREEN, wx.wxEVT_COMMAND_MENU_SELECTED, function () {
+    ide->ShowFullScreen(! frame->IsFullScreen());
+  });
+frame->Connect(ID_VIEWFULLSCREEN, wx.wxEVT_UPDATE_UI,
+  function (event) { event->Enable(ide->GetEditor() != null); });
+
+frame->Connect(ID_VIEWOUTPUT, wx.wxEVT_COMMAND_MENU_SELECTED, togglePanel);
+frame->Connect(ID_VIEWFILETREE, wx.wxEVT_COMMAND_MENU_SELECTED, togglePanel);
+frame->Connect(ID_VIEWTOOLBAR, wx.wxEVT_COMMAND_MENU_SELECTED, togglePanel);
+frame->Connect(ID_VIEWOUTLINE, wx.wxEVT_COMMAND_MENU_SELECTED, togglePanel);
+frame->Connect(ID_VIEWMARKERS, wx.wxEVT_COMMAND_MENU_SELECTED, togglePanel);
+frame->Connect(ID_VIEWWATCHWINDOW, wx.wxEVT_COMMAND_MENU_SELECTED,
+  function (event) { if( togglePanel(event) ) { ide->GetDebugger()->RefreshPanels(); } });
+frame->Connect(ID_VIEWCALLSTACK, wx.wxEVT_COMMAND_MENU_SELECTED,
+  function (event) { if( togglePanel(event) ) { ide->GetDebugger()->RefreshPanels(); } });
+
+frame->Connect(ID_VIEWSTATUSBAR, wx.wxEVT_COMMAND_MENU_SELECTED,
+  function (event) {
+    frame->GetStatusBar()->Show(menuBar->IsChecked(event->GetId()));
+    uimgr->Update();
+  });
+frame->Connect(ID_VIEWSTATUSBAR, wx.wxEVT_UPDATE_UI,
+  function (event) { menuBar->Check(event->GetId(), frame->GetStatusBar()->IsShown()); });
+
+for( id in pairs(panels) ) { frame->Connect(id, wx.wxEVT_UPDATE_UI, checkPanel); }

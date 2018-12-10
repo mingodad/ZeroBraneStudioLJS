@@ -1,0 +1,127 @@
+//---------------------------------------------------------------------------
+// Unified SMTP/FTP subsystem
+// LuaSocket toolkit.
+// Author: Diego Nehab
+//---------------------------------------------------------------------------
+
+//---------------------------------------------------------------------------
+// Declare module and import dependencies
+//---------------------------------------------------------------------------
+var base = _G;
+var string = require("string");
+var socket = require("socket");
+var ltn12 = require("ltn12");
+
+socket.tp = {};
+var _M = socket.tp;
+
+//---------------------------------------------------------------------------
+// Program constants
+//---------------------------------------------------------------------------
+_M.TIMEOUT = 60;
+
+//---------------------------------------------------------------------------
+// Implementation
+//---------------------------------------------------------------------------
+// gets server reply (works for SMTP and FTP)
+var function get_reply(c) {
+    var code, current, sep;
+    var line, err = c->receive();
+    var reply = line;
+    if( err ) { return null, err; }
+    code, sep = socket.skip(2, string.find(line, "^(%d%d%d)(.?)"));
+    if( ! code ) { return null, "invalid server reply"; }
+    if( sep == "-" ) { // reply is multiline
+        do {
+            line, err = c->receive();
+            if( err ) { return null, err; }
+            current, sep = socket.skip(2, string.find(line, "^(%d%d%d)(.?)"));
+            reply = reply .. "\n" .. line;
+        // reply ends with same code
+        } while(!( code == current && sep == " ") );
+    }
+    return code, reply;
+}
+
+// metatable for sock object
+var metat = { __index = {} };
+
+function metat.__index::check(ok) {
+    var code, reply = get_reply(this.c);
+    if( ! code ) { return null, reply; }
+    if( base.type(ok) != "function" ) {
+        if( base.type(ok) == "table" ) {
+            for( i, v in base.ipairs(ok) ) {
+                if( string.find(code, v) ) {
+                    return base.tonumber(code), reply;
+                }
+            }
+            return null, reply;
+        } else {
+            if( string.find(code, ok) ) { return base.tonumber(code), reply;
+            } else { return null, reply; }
+        }
+    } else { return ok(base.tonumber(code), reply); }
+}
+
+function metat.__index::command(cmd, arg) {
+    cmd = string.upper(cmd);
+    if( arg ) {
+        return this.c->send(cmd .. " " .. arg.. "\r\n");
+    } else {
+        return this.c->send(cmd .. "\r\n");
+    }
+}
+
+function metat.__index::sink(snk, pat) {
+    var chunk, err = c->receive(pat);
+    return snk(chunk, err);
+}
+
+function metat.__index::send(data) {
+    return this.c->send(data);
+}
+
+function metat.__index::receive(pat) {
+    return this.c->receive(pat);
+}
+
+function metat.__index::getfd() {
+    return this.c->getfd();
+}
+
+function metat.__index::dirty() {
+    return this.c->dirty();
+}
+
+function metat.__index::getcontrol() {
+    return this.c;
+}
+
+function metat.__index::source(source, step) {
+    var sink = socket.sink("keep-open", this.c);
+    var ret, err = ltn12.pump.all(source, sink, step || ltn12.pump.step);
+    return ret, err;
+}
+
+// closes the underlying c
+function metat.__index::close() {
+    this.c->close();
+    return 1;
+}
+
+// connect with server and return c object
+function _M.connect(host, port, timeout, create) {
+    var c, e = (create || socket.tcp)();
+    if( ! c ) { return null, e; }
+    c->settimeout(timeout || _M.TIMEOUT);
+    var r;
+    r, e = c->connect(host, port);
+    if( ! r ) {
+        c->close();
+        return null, e;
+    }
+    return base.setmetatable({c = c}, metat);
+}
+
+return _M;

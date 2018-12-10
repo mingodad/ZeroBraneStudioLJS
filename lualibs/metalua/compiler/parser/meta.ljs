@@ -1,0 +1,138 @@
+//-----------------------------------------------------------------------------
+// Copyright (c) 2006-2014 Fabien Fleutot and others.
+//
+// All rights reserved.
+//
+// This program and the accompanying materials are made available
+// under the terms of the Eclipse Public License v1.0 which
+// accompanies this distribution, and is available at
+// http://www.eclipse.org/legal/epl-v10.html
+//
+// This program and the accompanying materials are also made available
+// under the terms of the MIT public license which accompanies this
+// distribution, and is available at http://www.lua.org/license.html
+//
+// Contributors:
+//     Fabien Fleutot - API and implementation
+//
+//-----------------------------------------------------------------------------
+
+// Compile-time metaprogramming features: splicing ASTs generated during compilation,
+// AST quasi-quoting helpers.
+
+var gg       = require ('metalua.grammar.generator');
+
+return function(M) {
+    var _M = gg.future(M);
+    M.meta={ };
+    var _MM = gg.future(M.meta);
+
+    //------------------------------------------------------------------------------
+    // External splicing: compile an AST into a chunk, load and evaluate
+    // that chunk, and replace the chunk by its result (which must also be
+    // an AST).
+    //------------------------------------------------------------------------------
+
+    // TODO: that's not part of the parser
+    function M.meta.eval (ast) {
+        // TODO: should there be one mlc per splice, or per parser instance?
+        var mlc = require ('metalua.compiler').new();
+        var f = mlc ->ast_to_function (ast, '=splice');
+        var result=f(M); // splices act on the current parser
+        return result;
+    }
+
+    //--------------------------------------------------------------------------
+    // Going from an AST to an AST representing that AST
+    // the only hash-part key being lifted is `"tag"`.
+    // Doesn't lift subtrees protected inside a `Splice{ ... }.
+    // e.g. change `Foo{ 123 } into
+    // `Table{ `Pair{ `String "tag", `String "foo" }, `Number 123 }
+    //--------------------------------------------------------------------------
+    var function lift (t) {
+        //print("QUOTING:", table.tostring(t, 60,'nohash'))
+        var cases = { };
+        function cases.table (t) {
+            var mt = { tag = "Table" };
+            //table.insert (mt, { tag = "Pair", quote "quote", { tag = "True" } })
+            if( t.tag == "Splice" ) {
+                assert (#t==1, "Invalid splice");
+                var sp = t[1];
+                return sp;
+            } else if( t.tag ) {
+                table.insert (mt, { tag="Pair", lift ("tag"), lift(t.tag) });
+            }
+            for( _, v in ipairs (t) ) {
+                table.insert (mt, lift(v));
+            }
+            return mt;
+        }
+        function cases.number  (t) { return { tag = "Number", t, quote = true }; }
+        function cases.string  (t) { return { tag = "String", t, quote = true }; }
+        function cases.boolean (t) { return { tag = t && "True" || "False", t, quote = true }; }
+        var f = cases [type(t)];
+        if( f ) { return f(t); } else { error ("Cannot quote an AST containing "..tostring(t)); }
+    }
+    M.meta.lift = lift;
+
+    //------------------------------------------------------------------------------
+    // when this variable is false, code inside [-{...}] is compiled and
+    // avaluated immediately. When it's true (supposedly when we're
+    // parsing data inside a quasiquote), [-{foo}] is replaced by
+    // [`Splice{foo}], which will be unpacked by [quote()].
+    //------------------------------------------------------------------------------
+    var in_a_quote = false;
+
+    //------------------------------------------------------------------------------
+    // Parse the inside of a "-{ ... }"
+    //------------------------------------------------------------------------------
+    function M.meta.splice_content (lx) {
+        var parser_name = "expr";
+        if( lx->is_keyword (lx->peek(2), ":") ) {
+            var a = lx->next();
+            lx->next(); // skip ":"
+            assert (a.tag=="Id", "Invalid splice parser name");
+            parser_name = a[1];
+        }
+        // TODO FIXME running a new parser with the old lexer?!
+        var parser = require ('metalua.compiler.parser').new();
+        var ast = parser [parser_name](lx);
+        if( in_a_quote ) { // only prevent quotation in this subtree
+            //printf("SPLICE_IN_QUOTE:\n%s", _G.table.tostring(ast, "nohash", 60))
+            return { tag="Splice", ast };
+        } else { // convert in a block, eval, replace with result
+            if( parser_name == "expr" ) { ast = { { tag="Return", ast } };
+            } else if( parser_name == "stat"  ) { ast = { ast };
+            } else if( parser_name != "block" ) {
+                error ("splice content must be an expr, stat or block"); }
+            //printf("EXEC THIS SPLICE:\n%s", _G.table.tostring(ast, "nohash", 60))
+            return M.meta.eval (ast);
+        }
+    }
+
+    M.meta.splice = gg.sequence({ "-{", _MM.splice_content, "}", builder=unpack });
+
+    //------------------------------------------------------------------------------
+    // Parse the inside of a "+{ ... }"
+    //------------------------------------------------------------------------------
+    function M.meta.quote_content (lx) {
+        var parser;
+        if( lx->is_keyword (lx->peek(2), ":") ) { // +{parser: content }
+            var parser_name = M.id(lx)[1];
+            parser = M[parser_name];
+            lx->next(); // skip ":"
+        } else { // +{ content }
+            parser = M.expr;
+        }
+
+        var prev_iq = in_a_quote;
+        in_a_quote = true;
+        //print("IN_A_QUOTE")
+        var content = parser (lx);
+        var q_content = M.meta.lift (content);
+        in_a_quote = prev_iq;
+        return q_content;
+    }
+
+    return M;
+};

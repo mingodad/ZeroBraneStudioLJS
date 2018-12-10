@@ -1,0 +1,52 @@
+var stage = {};
+
+// Mutates an array of nodes and non-tables, unwrapping Paren nodes.
+// If list_start is given, tail Paren is not unwrapped if it's unpacking and past list_start index.
+var function handle_nodes(nodes, list_start) {
+   var num_nodes = #nodes;
+
+   for( index = 1, num_nodes ) {
+      var node = nodes[index];
+
+      if( type(node) == "table" ) {
+         var tag = node.tag;
+
+         if( tag == "Table" || tag == "Return" ) {
+            handle_nodes(node, 1);
+         } else if( tag == "Call" ) {
+            handle_nodes(node, 2);
+         } else if( tag == "Invoke" ) {
+            handle_nodes(node, 3);
+         } else if( tag == "Forin" ) {
+            handle_nodes(node[2], 1);
+            handle_nodes(node[3]);
+         } else if( tag == "Local" ) {
+            if( node[2] ) {
+               handle_nodes(node[2]);
+            }
+         } else if( tag == "Set" ) {
+            handle_nodes(node[1]);
+            handle_nodes(node[2], 1);
+         } else {
+            handle_nodes(node);
+
+            if( tag == "Paren" && (! list_start || index < list_start || index != num_nodes) ) {
+               var inner_node = node[1];
+
+               if( inner_node.tag != "Call" && inner_node.tag != "Invoke" && inner_node.tag != "Dots" ) {
+                  nodes[index] = inner_node;
+               }
+            }
+         }
+      }
+   }
+}
+
+// Mutates AST, unwrapping Paren nodes.
+// Paren nodes are preserved only when they matter:
+// at the ends of expression lists with potentially multi-value inner expressions.
+function stage.run(chstate) {
+   handle_nodes(chstate.ast);
+}
+
+return stage;

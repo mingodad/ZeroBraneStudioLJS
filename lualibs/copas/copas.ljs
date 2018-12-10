@@ -1,0 +1,636 @@
+//-----------------------------------------------------------------------------
+// Copas - Coroutine Oriented Portable Asynchronous Services
+//
+// A dispatcher based on coroutines that can be used by TCP/IP servers.
+// Uses LuaSocket as the interface with the TCP/IP stack.
+//
+// Authors: Andre Carregal, Javier Guerra, and Fabio Mascarenhas
+// Contributors: Diego Nehab, Mike Pall, David Burgess, Leonardo Godinho,
+//               Thomas Harning Jr., and Gary NG
+//
+// Copyright 2005 - Kepler Project (www.keplerproject.org)
+//
+// $Id: copas.lua,v 1.37 2009/04/07 22:09:52 carregal Exp $
+//-----------------------------------------------------------------------------
+
+if( package.loaded["socket.http"] ) {
+  error("you must require copas before require'ing socket.http");
+}
+
+var socket = require ("socket");
+var gettime = socket.gettime;
+var coxpcall = require ("coxpcall");
+
+var WATCH_DOG_TIMEOUT = 120;
+var UDP_DATAGRAM_MAX = 8192;
+
+// Redefines LuaSocket functions with coroutine safe versions
+// (this allows the use of socket.http from within copas)
+var function statusHandler(status, ...) {
+  if( status ) { return ...; }
+  var err = (...);
+  if( type(err) == "table" ) {
+    return null, err[1];
+  } else {
+    error(err);
+  }
+}
+
+function socket.protect(func) {
+  return function (...) {
+           return statusHandler(coxpcall.pcall(func, ...));
+         };
+}
+
+function socket.newtry(finalizer) {
+  return function (...) {
+           var status = (...);
+           if( ! status ) {
+             coxpcall.pcall(finalizer, select(2, ...));
+             error({ (select(2, ...)) }, 0);
+           }
+           return ...;
+         };
+}
+
+// end of LuaSocket redefinitions
+
+var copas = {};
+
+// Meta information is public even if beginning with an "_"
+copas._COPYRIGHT   = "Copyright (C) 2005-2010 Kepler Project";
+copas._DESCRIPTION = "Coroutine Oriented Portable Asynchronous Services";
+copas._VERSION     = "Copas 1.2.1";
+
+// Close the socket associated with the current connection after the handler finishes
+copas.autoclose = true;
+
+//-----------------------------------------------------------------------------
+// Simple set implementation based on LuaSocket's tinyirc.ljs example
+// adds a FIFO queue for each value in the set
+//-----------------------------------------------------------------------------
+var function newset() {
+  var reverse = {};
+  var set = {};
+  var q = {};
+  setmetatable(set, { __index = {
+                        insert = function(set, value) {
+                                   if( ! reverse[value] ) {
+                                     set[#set + 1] = value;
+                                     reverse[value] = #set;
+                                   }
+                                 },
+
+                        remove = function(set, value) {
+                                   var index = reverse[value];
+                                   if( index ) {
+                                     reverse[value] = null;
+                                     var top = set[#set];
+                                     set[#set] = null;
+                                     if( top != value ) {
+                                       reverse[top] = index;
+                                       set[index] = top;
+                                     }
+                                   }
+                                 },
+
+                        push = function (set, key, itm) {
+                                 var qKey = q[key];
+                                 if( qKey == null ) {
+                                   q[key] = {itm};
+                                 } else {
+                                   qKey[#qKey + 1] = itm;
+                                 }
+                               },
+
+                        pop = function (set, key) {
+                                var t = q[key];
+                                if( t != null ) {
+                                  var ret = table.remove (t, 1);
+                                  if( t[1] == null ) {
+                                    q[key] = null;
+                                  }
+                                  return ret;
+                                }
+                              }
+                    }});
+  return set;
+}
+
+var fnil = function() {};
+var _sleeping = {
+    times = {},  // list with wake-up times
+    cos = {},    // list with coroutines, index matches the 'times' list
+    lethargy = {}, // list of coroutines sleeping without a wakeup time
+
+    insert = fnil,
+    remove = fnil,
+    push = function(this, sleeptime, co) {
+        if( ! co ) { return; }
+        if( sleeptime<0 ) {
+            //sleep until explicit wakeup through copas.wakeup
+            this.lethargy[co] = true;
+            return;
+        } else {
+            sleeptime = gettime() + sleeptime;
+        }
+        var t, c = this.times, this.cos;
+        var i, cou = 1, #t;
+        //TODO: do a binary search
+        while( i<=cou && t[i]<=sleeptime ) { i+=1; }
+        table.insert(t, i, sleeptime);
+        table.insert(c, i, co);
+    },
+    getnext = function(this) {  // returns delay until next sleep expires, or nil if there is none
+        var t = this.times;
+        var delay = t[1] && t[1] - gettime() || null;
+
+        return delay && math.max(delay, 0) || null;
+    },
+    // find the thread that should wake up to the time
+    pop = function(this, time) {
+        var t, c = this.times, this.cos;
+        if( #t==0 || time<t[1] ) { return; }
+        var co = c[1];
+        table.remove(t, 1);
+        table.remove(c, 1);
+        return co;
+    },
+    wakeup = function(this, co) {
+        var vlet = this.lethargy;
+        if( vlet[co] ) {
+            this->push(0, co);
+            vlet[co] = null;
+        } else {
+            vlet = this.cos;
+            for( i=1,#vlet ) {
+                if( vlet[i]==co ) {
+                    table.remove(vlet, i);
+                    var tm = this.times[i];
+                    table.remove(this.times, i);
+                    this->push(0, co);
+                    return;
+                }
+            }
+        }
+    }
+}; //_sleeping
+
+var _servers = newset(); // servers being handled
+var _reading_log = {};
+var _writing_log = {};
+
+var _reading = newset(); // sockets currently being read
+var _writing = newset(); // sockets currently being written
+
+//-----------------------------------------------------------------------------
+// Coroutine based socket I/O functions.
+//-----------------------------------------------------------------------------
+// reads a pattern from a client and yields to the reading set on timeouts
+// UDP: a UDP socket expects a second argument to be a number, so it MUST
+// be provided as the 'pattern' below defaults to a string. Will throw a
+// 'bad argument' error if omitted.
+function copas.receive(client, pattern, part) {
+  var s, err;
+  pattern = pattern || "*l";
+  do {
+    s, err, part = client->receive(pattern, part);
+    if( s || err != "timeout" ) {
+      _reading_log[client] = null;
+      return s, err, part;
+    }
+    _reading_log[client] = gettime();
+    coroutine.yield(client, _reading);
+  } while(!( false) );
+}
+
+// receives data from a client over UDP. Not available for TCP.
+// (this is a copy of receive() method, adapted for receivefrom() use)
+function copas.receivefrom(client, size) {
+  var s, err, port;
+  size = size || UDP_DATAGRAM_MAX;
+  do {
+    s, err, port = client->receivefrom(size); // upon success err holds ip address
+    if( s || err != "timeout" ) {
+      _reading_log[client] = null;
+      return s, err, port;
+    }
+    _reading_log[client] = gettime();
+    coroutine.yield(client, _reading);
+  } while(!( false) );
+}
+
+// same as above but with special treatment when reading chunks,
+// unblocks on any data received.
+function copas.receivePartial(client, pattern, part) {
+  var s, err;
+  pattern = pattern || "*l";
+  do {
+    s, err, part = client->receive(pattern, part);
+    if( s || ( (type(pattern)=="number") && part!="" && part !=null ) ||
+      err != "timeout" ) {
+      _reading_log[client] = null;
+      return s, err, part;
+    }
+    _reading_log[client] = gettime();
+    coroutine.yield(client, _reading);
+  } while(!( false) );
+}
+
+// sends data to a client. The operation is buffered and
+// yields to the writing set on timeouts
+// Note: from and to parameters will be ignored by/for UDP sockets
+function copas.send(client, data, from, to) {
+  var s, err,sent;
+  from = from || 1;
+  var lastIndex = from - 1;
+
+  do {
+    s, err, lastIndex = client->send(data, lastIndex + 1, to);
+    // adds extra corrotine swap
+    // garantees that high throuput dont take other threads to starvation
+    if( (math.random(100) > 90) ) {
+      _writing_log[client] = gettime();
+      coroutine.yield(client, _writing);
+    }
+    if( s || err != "timeout" ) {
+      _writing_log[client] = null;
+      return s, err,lastIndex;
+    }
+    _writing_log[client] = gettime();
+    coroutine.yield(client, _writing);
+  } while(!( false) );
+}
+
+// sends data to a client over UDP. Not available for TCP.
+// (this is a copy of send() method, adapted for sendto() use)
+function copas.sendto(client, data, ip, port) {
+  var s, err,sent;
+
+  do {
+    s, err = client->sendto(data, ip, port);
+    // adds extra corrotine swap
+    // garantees that high throuput dont take other threads to starvation
+    if( (math.random(100) > 90) ) {
+      _writing_log[client] = gettime();
+      coroutine.yield(client, _writing);
+    }
+    if( s || err != "timeout" ) {
+      _writing_log[client] = null;
+      return s, err;
+    }
+    _writing_log[client] = gettime();
+    coroutine.yield(client, _writing);
+  } while(!( false) );
+}
+
+// waits until connection is completed
+function copas.connect(skt, host, port) {
+  skt->settimeout(0);
+  var ret, err;
+  do {
+    ret, err = skt->connect (host, port);
+    if( ret || err != "timeout" ) {
+      _writing_log[skt] = null;
+      return ret, err;
+    }
+    _writing_log[skt] = gettime();
+    coroutine.yield(skt, _writing);
+  } while(!( false) );
+  return ret, err;
+}
+
+// flushes a client write buffer (deprecated)
+function copas.flush(client) {
+}
+
+// wraps a TCP socket to use Copas methods (send, receive, flush and settimeout)
+var _skt_mt = {__index = {
+                   send = function (this, data, from, to) {
+                            return copas.send (this.socket, data, from, to);
+                          },
+
+                   receive = function (this, pattern, prefix) {
+                               if( (this.timeout==0) ) {
+                                 return copas.receivePartial(this.socket, pattern, prefix);
+                               }
+                               return copas.receive(this.socket, pattern, prefix);
+                             },
+
+                   flush = function (this) {
+                             return copas.flush(this.socket);
+                           },
+
+                   settimeout = function (this,time) {
+                                  this.timeout=time;
+                                  return true;
+                                },
+
+                   skip = function(this, ...) { return this.socket->skip(...); },
+
+                   close = function(this, ...) { return this.socket->close(...); },
+               }};
+
+// wraps a UDP socket, copy of TCP one adapted for UDP.
+// Mainly adds sendto() and receivefrom()
+var _skt_mt_udp = {__index = {
+                   send = function (this, data) {
+                            return copas.send (this.socket, data);
+                          },
+
+                   sendto = function (this, data, ip, port) {
+                            return copas.sendto (this.socket, data, ip, port);
+                          },
+
+                   receive = function (this, size) {
+                               return copas.receive (this.socket, (size || UDP_DATAGRAM_MAX));
+                             },
+
+                   receivefrom = function (this, size) {
+                               return copas.receivefrom (this.socket, (size || UDP_DATAGRAM_MAX));
+                             },
+
+                   flush = function (this) {
+                             return copas.flush (this.socket);
+                           },
+
+                   settimeout = function (this,time) {
+                                  this.timeout=time;
+                                  return true;
+                                },
+               }};
+
+function copas.wrap (skt) {
+  if( string.sub(tostring(skt),1,3) == "udp" ) {
+    return  setmetatable ({socket = skt}, _skt_mt_udp);
+  } else {
+    return  setmetatable ({socket = skt}, _skt_mt);
+  }
+}
+
+//------------------------------------------------
+// Error handling
+//------------------------------------------------
+
+var _errhandlers = {};   // error handler per coroutine
+
+function copas.setErrorHandler (err) {
+  var co = coroutine.running();
+  if( co ) {
+    _errhandlers [co] = err;
+  }
+}
+
+var function _deferror (msg, co, skt) {
+  print (msg, co, skt);
+}
+
+//-----------------------------------------------------------------------------
+// Thread handling
+//-----------------------------------------------------------------------------
+
+var function _doTick (co, skt, ...) {
+  if( ! co ) { return; }
+
+  var ok, res, new_q = coroutine.resume(co, skt, ...);
+
+  if( ok && res && new_q ) {
+    new_q->insert (res);
+    new_q->push (res, co);
+  } else {
+    if( ! ok ) { coxpcall.pcall (_errhandlers [co] || _deferror, res, co, skt); }
+    if( skt && copas.autoclose ) { skt->close(); }
+    _errhandlers [co] = null;
+  }
+}
+
+// accepts a connection on socket input
+var function _accept(input, handler) {
+  var client = input->accept();
+  if( client ) {
+    client->settimeout(0);
+    var co = coroutine.create(handler);
+    _doTick (co, client);
+    //_reading:insert(client)
+  }
+  return client;
+}
+
+// handle threads on a queue
+var function _tickRead (skt) {
+  _doTick (_reading->pop (skt), skt);
+}
+
+var function _tickWrite (skt) {
+  _doTick (_writing->pop (skt), skt);
+}
+
+//-----------------------------------------------------------------------------
+// Adds a server/handler pair to Copas dispatcher
+//-----------------------------------------------------------------------------
+var function addTCPserver(server, handler, timeout) {
+  server->settimeout(timeout || 0.1);
+  _servers[server] = handler;
+  _reading->insert(server);
+}
+
+var function addUDPserver(server, handler, timeout) {
+    server->settimeout(timeout || 0);
+    var co = coroutine.create(handler);
+    _reading->insert(server);
+    _doTick (co, server);
+}
+
+function copas.addserver(server, handler, timeout) {
+    if( string.sub(tostring(server),1,3) == "udp" ) {
+        addUDPserver(server, handler, timeout);
+    } else {
+        addTCPserver(server, handler, timeout);
+    }
+}
+
+function copas.removeserver(server) {
+  _servers[server] = null;
+  _reading->remove(server);
+  return server->close();
+}
+
+//-----------------------------------------------------------------------------
+// Adds an new courotine thread to Copas dispatcher
+//-----------------------------------------------------------------------------
+function copas.addthread(thread, ...) {
+  if( type(thread) != "thread" ) {
+    thread = coroutine.create(thread);
+  }
+  _doTick (thread, null, ...);
+  return thread;
+}
+
+//-----------------------------------------------------------------------------
+// tasks registering
+//-----------------------------------------------------------------------------
+
+var _tasks = {};
+
+var function addtaskRead (tsk) {
+  // lets tasks call the default _tick()
+  tsk.def_tick = _tickRead;
+
+  _tasks [tsk] = true;
+}
+
+var function addtaskWrite (tsk) {
+  // lets tasks call the default _tick()
+  tsk.def_tick = _tickWrite;
+
+  _tasks [tsk] = true;
+}
+
+var function tasks () {
+  return next, _tasks;
+}
+
+//-----------------------------------------------------------------------------
+// main tasks: manage readable and writable socket sets
+//-----------------------------------------------------------------------------
+// a task to check ready to read events
+var _readable_t = {
+  events = function(this) {
+             var i = 0;
+             return function () {
+                      i +=   1;
+                      return this._evs [i];
+                    };
+           },
+
+  tick = function (this, input) {
+           var handler = _servers[input];
+           if( handler ) {
+             input = _accept(input, handler);
+           } else {
+             _reading->remove (input);
+             this.def_tick (input);
+           }
+         }
+};
+
+addtaskRead (_readable_t);
+
+
+// a task to check ready to write events
+var _writable_t = {
+  events = function (this) {
+             var i = 0;
+             return function () {
+                      i +=   1;
+                      return this._evs [i];
+                    };
+           },
+
+  tick = function (this, output) {
+           _writing->remove (output);
+           this.def_tick (output);
+         }
+};
+
+addtaskWrite (_writable_t);
+//
+//sleeping threads task
+var _sleeping_t = {
+    tick = function (this, time, ...) {
+       _doTick(_sleeping->pop(time), ...);
+    }
+};
+
+// yields the current coroutine and wakes it after 'sleeptime' seconds.
+// If sleeptime<0 then it sleeps until explicitly woken up using 'wakeup'
+function copas.sleep(sleeptime) {
+    coroutine.yield((sleeptime || 0), _sleeping);
+}
+
+// Wakes up a sleeping coroutine 'co'.
+function copas.wakeup(co) {
+    _sleeping->wakeup(co);
+}
+
+var last_cleansing = 0;
+
+//-----------------------------------------------------------------------------
+// Checks for reads and writes on sockets
+//-----------------------------------------------------------------------------
+var function _select (timeout) {
+  var err;
+  var now = gettime();
+  var duration = function(t2, t1) { return t2-t1; };
+
+  _readable_t._evs, _writable_t._evs, err = socket.select(_reading, _writing, timeout);
+  var r_evs, w_evs = _readable_t._evs, _writable_t._evs;
+
+  if( duration(now, last_cleansing) > WATCH_DOG_TIMEOUT ) {
+    last_cleansing = now;
+    for( k,v in pairs(_reading_log) ) {
+      if( ! r_evs[k] && duration(now, v) > WATCH_DOG_TIMEOUT ) {
+        _reading_log[k] = null;
+        r_evs[#r_evs + 1] = k;
+        r_evs[k] = #r_evs;
+      }
+    }
+
+    for( k,v in pairs(_writing_log) ) {
+      if( ! w_evs[k] && duration(now, v) > WATCH_DOG_TIMEOUT ) {
+        _writing_log[k] = null;
+        w_evs[#w_evs + 1] = k;
+        w_evs[k] = #w_evs;
+      }
+    }
+  }
+
+  if( err == "timeout" && #r_evs + #w_evs > 0 ) {
+    return null;
+  } else {
+    return err;
+  }
+}
+
+
+//-----------------------------------------------------------------------------
+// Dispatcher loop step.
+// Listen to client requests and handles them
+// Returns false if no data was handled (timeout), or true if there was data
+// handled (or nil + error message)
+//-----------------------------------------------------------------------------
+function copas.step(timeout) {
+  _sleeping_t->tick(gettime());
+
+  // Need to wake up the select call it time for the next sleeping event
+  var nextwait = _sleeping->getnext();
+  if( nextwait ) {
+    timeout = timeout && math.min(nextwait, timeout) || nextwait;
+  }
+
+  var err = _select (timeout);
+  if( err == "timeout" ) { return false; }
+
+  if( err ) {
+    error(err);
+  }
+
+  for( tsk in tasks() ) {
+    for( ev in tsk->events() ) {
+      tsk->tick (ev);
+    }
+  }
+  return true;
+}
+
+//-----------------------------------------------------------------------------
+// Dispatcher endless loop.
+// Listen to client requests and handles them forever
+//-----------------------------------------------------------------------------
+function copas.loop(timeout) {
+  while( true ) {
+    copas.step(timeout);
+  }
+}
+
+return copas;

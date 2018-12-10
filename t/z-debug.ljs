@@ -1,0 +1,51 @@
+var pkg = ...;
+var unpack = table.unpack || unpack;
+var debugger = ide->GetDebugger();
+// start debugger server
+debugger->Listen();
+// save a test file and then load it
+var debugfile = MergeFullPath(wx.wxStandardPaths.Get()->GetTempDir(), "debug.ljs");
+FileWrite(debugfile, "var a = 1+2\na = 2+3\na = 3+4\na = 4+5\na = 5+6");
+ok(wx.wxFileExists(debugfile), "File created before starting debugging.");
+var editor = ide->ActivateFile(debugfile);
+editor->BreakpointToggle(4);
+
+ide->GetMenuBar()->Check(ID.CLEAROUTPUTENABLE, false);
+ProjectDebug();
+
+var commands = {
+  {debugfile, 1, "Step"},
+  {debugfile, 2, "RunTo", {editor, 4}},
+  {debugfile, 4, "Run"},
+  {debugfile, 5, "Stop"},
+};
+var command = 1;
+
+// wait for the connection to be initiated
+pkg.onDebuggerActivate = function(this, debugger, file, line) {
+  if( ! commands[command] ) {
+    debugger->Step();
+    return;
+  }
+  var afile, aline, cmd, args = unpack(commands[command]);
+  ok(wx.wxFileName(file)->SameAs(wx.wxFileName(afile)), "Filename is reported as expected after debugger activation ("..command.."/"..#commands..").");
+  is(line, aline, "Line number is reported as expected after debugger activation ("..command.."/"..#commands..").");
+  if( debugger->IsRunning() ) { debugger->Wait(); }
+  if( command == 1 ) {
+    debugger->EvalAsync("1+2", function(val) {
+        is(val, "3", "Asynchronous expression evaluation in debugger returns expected result.");
+      });
+    debugger->Wait();
+  }
+  command +=   1;
+  debugger[cmd](debugger, unpack(args || {}));
+};
+pkg.onDebuggerClose = function() {
+  var doc = ide->IsValidCtrl(editor) && ide->GetDocument(editor);
+  if( doc ) { doc->Close(); }
+
+  pkg.onDebuggerActivate = null;
+  pkg.onDebuggerClose = null;
+  pkg->report();
+};
+pkg.onAppClose = function() { FileRemove(debugfile); };

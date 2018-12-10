@@ -1,0 +1,82 @@
+// Copyright 2015-2016 Mitchell mitchell.att.foicica.com. See LICENSE.
+// PowerShell LPeg lexer.
+// Contributed by Jeff Stone.
+
+var l = require('lexer');
+var token, word_match = l.token, l.word_match;
+var P, R, S = lpeg.P, lpeg.R, lpeg.S;
+
+var M = {_NAME = 'powershell'};
+
+// Whitespace.
+var ws = token(l.WHITESPACE, l.space**1);
+
+// Comments.
+var comment = token(l.COMMENT, '#' * l.nonnewline**0);
+
+// Keywords.
+var keyword = token(l.KEYWORD, word_match({
+  'Begin', 'Break', 'Continue', 'Do', 'Else', 'End', 'Exit', 'For', 'ForEach',
+  'ForEach-Object', 'Get-Date', 'Get-Random', 'If', 'Param', 'Pause',
+  'Powershell', 'Process', 'Read-Host', 'Return', 'Switch', 'While',
+  'Write-Host'
+}, '-', true));
+
+// Comparison Operators.
+var comparison = token(l.KEYWORD, '-' * word_match({
+  'and', 'as', 'band', 'bor', 'contains', 'eq', 'ge', 'gt', 'is', 'isnot', 'le',
+  'like', 'lt', 'match', 'ne', 'nomatch', 'not', 'notcontains', 'notlike', 'or',
+  'replace'
+}, null, true));
+
+// Parameters.
+var parameter = token(l.KEYWORD, '-' * word_match({
+  'Confirm', 'Debug', 'ErrorAction', 'ErrorVariable', 'OutBuffer',
+  'OutVariable', 'Verbose', 'WhatIf'
+}, null, true));
+
+// Properties.
+var property = token(l.KEYWORD, '.' * word_match({
+  'day', 'dayofweek', 'dayofyear', 'hour', 'millisecond', 'minute', 'month',
+  'second', 'timeofday', 'year'
+}, null, true));
+
+// Types.
+var type = token(l.KEYWORD, '[' * word_match({
+  'array', 'boolean', 'byte', 'char', 'datetime', 'decimal', 'double',
+  'hashtable', 'int', 'long', 'single', 'string', 'xml'
+}, null, true) * ']');
+
+// Variables.
+var variable = token(l.VARIABLE, '$' * (l.digit**1 + l.word +
+                                          l.delimited_range('{}', true, true)));
+
+// Strings.
+var string = token(l.STRING, l.delimited_range('"', true));
+
+// Numbers.
+var number = token(l.NUMBER, l.float + l.integer);
+
+// Operators.
+var operator = token(l.OPERATOR, S('=!<>+-/*^&|~.,:;?()[]{}%`'));
+
+M._rules = {
+  {'whitespace', ws},
+  {'comment', comment},
+  {'keyword', keyword},
+  {'comparison', comparison},
+  {'parameter', parameter},
+  {'property', property},
+  {'type', type},
+  {'variable', variable},
+  {'string', string},
+  {'number', number},
+  {'operator', operator},
+};
+
+M._foldsymbols = {
+  _patterns = {'[{}]'},
+  [l.OPERATOR] = {['{'] = 1, ['}'] = -1}
+};
+
+return M;

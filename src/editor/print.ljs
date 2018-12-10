@@ -1,0 +1,195 @@
+// Copyright 2015 Paul Kulchenko, ZeroBrane LLC
+//-------------------------------------------------------
+
+var frame = ide->GetMainFrame();
+var margin = {top = 10, left = 10, bottom = 10, right = 10};
+var function printScaling(dc, printOut) {
+  var pageSizeMM_x, pageSizeMM_y = printOut->GetPageSizeMM();
+
+  var ppiScr_x, ppiScr_y = printOut->GetPPIScreen();
+  var ppiPrn_x, ppiPrn_y = printOut->GetPPIPrinter();
+
+  var ppi_scale_x = ppiPrn_x/ppiScr_x;
+  var ppi_scale_y = ppiPrn_y/ppiScr_y;
+
+  // get the size of DC in pixels and the number of pixels in the page
+  var dcSize_x, dcSize_y = dc->GetSize();
+  var pagePixSize_x, pagePixSize_y = printOut->GetPageSizePixels();
+
+  var dc_pagepix_scale_x = dcSize_x/pagePixSize_x;
+  var dc_pagepix_scale_y = dcSize_y/pagePixSize_y;
+
+  var dc_scale_x = ppi_scale_x * dc_pagepix_scale_x;
+  var dc_scale_y = ppi_scale_y * dc_pagepix_scale_y;
+
+  // calculate the pixels / mm (25.4 mm = 1 inch)
+  var ppmm_x = ppiScr_x / 25.4;
+  var ppmm_y = ppiScr_y / 25.4;
+
+  // adjust the page size for the pixels / mm scaling factor
+  var page_x    = math.floor(pageSizeMM_x * ppmm_x);
+  var page_y    = math.floor(pageSizeMM_y * ppmm_y);
+  var pageRect  = wx.wxRect(0, 0, page_x, page_y);
+
+  // get margins informations and convert to printer pixels
+  var top    = math.floor(margin.top    * ppmm_y);
+  var bottom = math.floor(margin.bottom * ppmm_y);
+  var left   = math.floor(margin.left   * ppmm_x);
+  var right  = math.floor(margin.right  * ppmm_x);
+
+  dc->SetUserScale(dc_scale_x, dc_scale_y);
+
+  var printRect = wx.wxRect(left, top, page_x-(left+right), page_y-(top+bottom));
+  return printRect, pageRect;
+}
+
+var function connectPrintEvents(printer, printOut) {
+  var editor = ide->GetEditorWithFocus();
+  var cfg = ide.config.print;
+  var pages;
+
+  function printOut::OnPrintPage(pageNum) {
+    var dc = this->GetDC();
+    var printRect, pageRect = printScaling(dc, printOut);
+
+    // print to an area smaller by the height of the header/footer
+    dc->SetFont(editor->GetFont());
+    var _, headerHeight = dc->GetTextExtent("qH");
+    var textRect = wx.wxRect(printRect);
+    if( cfg.header ) {
+      textRect->SetY(textRect->GetY() + headerHeight*1.5);
+      textRect->SetHeight(textRect->GetHeight() - headerHeight*1.5);
+    }
+    if( cfg.footer ) {
+      textRect->SetHeight(textRect->GetHeight() - headerHeight*1.5);
+    }
+
+    var selection = printer->GetPrintDialogData()->GetSelection();
+    var spos = selection && editor->GetSelectionStart() || 1;
+    var epos = selection && editor->GetSelectionEnd() || editor->GetLength();
+    if( pageNum == null ) {
+      pages = {};
+      ide->PushStatus("");
+      printOut.startTime = wx.wxNow();
+      var pos = spos;
+      while( pos < epos ) {
+        table.insert(pages, pos);
+        pos = editor->FormatRange(false, pos, epos, dc, dc, textRect, pageRect);
+        ide->PopStatus();
+        ide->PushStatus(TR("%s%% formatted...")->format(math.floor((pos-spos)*100.0/(epos-spos))));
+      }
+      if( #pages == 0 ) { pages = {0}; }
+      ide->PopStatus();
+    } else {
+      ide->SetStatusFor(TR("Formatting page %d...")->format(pageNum));
+      editor->FormatRange(true, pages[pageNum], epos, dc, dc, textRect, pageRect);
+
+      var c = wx.wxColour(127, 127, 127);
+      dc->SetPen(wx.wxPen(c, 1, wx.wxSOLID));
+      dc->SetTextForeground(c);
+
+      var doc = ide->GetDocument(editor);
+      var format = "([^\t]*)\t?([^\t]*)\t?([^\t]*)";
+      var placeholders = {
+        D = printOut.startTime,
+        p = pageNum,
+        P = #pages,
+        S = doc && doc->GetFileName() || "",
+      };
+      dc->SetFont(editor->GetFont());
+      if( cfg.header ) {
+        var left, center, right = ide->ExpandPlaceholders(cfg.header, placeholders)->match(format);
+        dc->DrawText(left, printRect.X, printRect.Y);
+        dc->DrawText(center, printRect.Left + (printRect.Left + printRect.Width - dc->GetTextExtentSize(center).Width)/2, printRect.Y);
+        dc->DrawText(right, printRect.Left + printRect.Width - dc->GetTextExtentSize(right).Width,  printRect.Y);
+        dc->DrawLine(printRect.X, printRect.Y + headerHeight, printRect.Left + printRect.Width, printRect.Y + headerHeight);
+      }
+      if( cfg.footer ) {
+        var footerY = printRect.Y + printRect.Height - headerHeight;
+        var left, center, right = ide->ExpandPlaceholders(cfg.footer, placeholders)->match(format);
+        dc->DrawText(left, printRect.X, footerY);
+        dc->DrawText(center, printRect.Left + (printRect.Left + printRect.Width - dc->GetTextExtentSize(center).Width)/2, footerY);
+        dc->DrawText(right, printRect.Left + printRect.Width - dc->GetTextExtentSize(right).Width,  footerY);
+        dc->DrawLine(printRect.X, footerY, printRect.Left + printRect.Width, footerY);
+      }
+    }
+    return true;
+  }
+  function printOut::HasPage(pageNum) { return pages[pageNum] != null; }
+  function printOut::GetPageInfo() {
+    // on Linux `GetPageInfo` is called before the canvas is initialized, which prevents
+    // proper calculation of the number of pages (wx2.9.5).
+    // Return defaults here as it's going to be called once more in the right place.
+    if( ide.osname == "Unix" && ! pages ) { return 1, 9999, 1, 9999; }
+    var printDD = printer->GetPrintDialogData();
+    // due to wxwidgets bug (http://trac.wxwidgets.org/ticket/17200), if `to` page is not set explicitly,
+    // only one page is being printed when `selection` option is selected in the print dialog.
+    if( printDD->GetSelection() ) { printDD->SetToPage(#pages); } // set the page as a workaround
+    var tofrom = ! printDD->GetSelection() && ! printDD->GetAllPages();
+    return 1, #pages, tofrom && printDD->GetFromPage() || 1, tofrom && printDD->GetToPage() || #pages;
+  }
+  function printOut::OnPreparePrinting() { this->OnPrintPage(); }
+}
+
+frame->Connect(ID.PAGESETUP, wx.wxEVT_COMMAND_MENU_SELECTED,
+  function (event) {
+    var pageSetupDD = wx.wxPageSetupDialogData();
+    pageSetupDD.MarginTopLeft     = wx.wxPoint(margin.left, margin.top);
+    pageSetupDD.MarginBottomRight = wx.wxPoint(margin.right, margin.bottom);
+    pageSetupDD->EnableOrientation(false);
+    pageSetupDD->EnablePaper(false);
+
+    var pageSetupDialog = wx.wxPageSetupDialog(frame, pageSetupDD);
+    pageSetupDialog->ShowModal();
+    pageSetupDD = pageSetupDialog->GetPageSetupDialogData();
+    margin.top, margin.left = pageSetupDD.MarginTopLeft.y, pageSetupDD.MarginTopLeft.x;
+    margin.bottom, margin.right = pageSetupDD.MarginBottomRight.y, pageSetupDD.MarginBottomRight.x;
+  });
+
+frame->Connect(ID.PRINT, wx.wxEVT_COMMAND_MENU_SELECTED,
+  function (event) {
+    var cfg = ide.config.print;
+    var editor = ide->GetEditorWithFocus();
+    editor->SetPrintMagnification(cfg.magnification);
+    editor->SetPrintColourMode(cfg.colourmode);
+    editor->SetPrintWrapMode(cfg.wrapmode);
+
+    // only enable selection if there is something selected in the editor (ignore multiple selections)
+    var printDD = wx.wxPrintDialogData();
+    printDD->EnableSelection(editor->GetSelectionStart() != editor->GetSelectionEnd());
+
+    var printer  = wx.wxPrinter(printDD);
+    var luaPrintout = wx.wxLuaPrintout();
+    connectPrintEvents(printer, luaPrintout);
+
+    // save and hide indicators
+    var indics = {};
+    for( _, num in pairs(ide->GetIndicators()) ) {
+      indics[num] = editor->IndicatorGetStyle(num);
+      editor->IndicatorSetStyle(num, wxstc.wxSTC_INDIC_HIDDEN);
+    }
+    // bold keywords
+    var keywords = {};
+    for( _, num in ipairs(ide->IsValidProperty(editor, 'spec') && editor.spec.lexerstyleconvert && editor.spec.lexerstyleconvert.keywords0 || {}) ) {
+      keywords[num] = editor->StyleGetBold(num);
+      editor->StyleSetBold(num, true);
+    }
+    var ok = printer->Print(frame, luaPrintout, true);
+    // restore indicators
+    for( n, style in pairs(indics) ) { editor->IndicatorSetStyle(n, style); }
+    for( n, style in pairs(keywords) ) { editor->StyleSetBold(n, style); }
+    if( ! ok && printer->GetLastError() == wx.wxPRINTER_ERROR ) {
+      ide->ReportError("There was a problem while printing.\nCheck if your selected printer is connected and configured correctly.");
+    }
+  });
+
+frame->Connect(ID.PRINT, wx.wxEVT_UPDATE_UI, function(event) { event->Enable(ide->GetEditorWithFocus() != null); });
+
+var _, menu, epos = ide->FindMenuItem(ID.EXIT);
+// disable printing on Unix/Linux as it generates incorrect layout (wx2.9.5, wx3.1)
+if( ide.osname != "Unix" && menu && epos ) {
+  // insert Print-repated menu items (going in the opposite order)
+  menu->Insert(epos-1, ID.PAGESETUP, TR("Page Setup..."), "");
+  menu->Insert(epos-1, ID.PRINT, TR("&Print..."), TR("Print the current document"));
+  menu->InsertSeparator(epos-1);
+}

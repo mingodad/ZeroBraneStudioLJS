@@ -1,0 +1,54 @@
+var stage = {};
+
+stage.warnings = {
+   ["321"] = {message_format = "accessing uninitialized variable {name!}", fields = {"name"}},
+   ["341"] = {message_format = "mutating uninitialized variable {name!}", fields = {"name"}}
+};
+
+var function detect_uninit_access_in_line(chstate, line) {
+   for( _, item in ipairs(line.items) ) {
+      for( _, action_key in ipairs({"accesses", "mutations"}) ) {
+         var code = action_key == "accesses" && "321" || "341";
+         var item_var_map = item[action_key];
+
+         if( item_var_map ) {
+            for( _v_var, accessing_nodes in pairs(item_var_map) ) {
+               // If there are no values at all reaching this access, not even the empty one,
+               // this item (or a closure containing it) is not reachable from variable definition.
+               // It will be reported as unreachable code, no need to report uninitalized accesses in it.
+               if( item.used_values[_v_var] ) {
+                  // If this variable is has only one, empty value then it's already reported as never set,
+                  // no need to report each access.
+                  if( ! (#_v_var.values == 1 && _v_var.values[1].empty) ) {
+                     var all_possible_values_empty = true;
+
+                     for( _, possible_value in ipairs(item.used_values[_v_var]) ) {
+                        if( ! possible_value.empty ) {
+                           all_possible_values_empty = false;
+                           break;
+                        }
+                     }
+
+                     if( all_possible_values_empty ) {
+                        for( _, accessing_node in ipairs(accessing_nodes) ) {
+                           chstate->warn_range(code, accessing_node, {
+                              name = accessing_node[1]
+                           });
+                        }
+                     }
+                  }
+               }
+            }
+         }
+      }
+   }
+}
+
+// Warns about accesses and mutations that don't resolve to any values except initial empty one.
+function stage.run(chstate) {
+   for( _, line in ipairs(chstate.lines) ) {
+      detect_uninit_access_in_line(chstate, line);
+   }
+}
+
+return stage;

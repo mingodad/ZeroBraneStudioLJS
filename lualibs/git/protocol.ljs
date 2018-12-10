@@ -1,0 +1,188 @@
+var socket = require ('socket');
+var urllib = require ('socket.url');
+var lfs = require ('lfs');
+
+var Repo = git.repo.Repo;
+var Pack = git.pack.Pack;
+var join_path = git.util.join_path;
+var parent_dir = git.util.parent_dir;
+var make_dir = git.util.make_dir;
+var correct_separators = git.util.correct_separators;
+
+var assert, error, getmetatable, io, os, pairs, print, require, string, tonumber =
+	assert, error, getmetatable, io, os, pairs, print, require, string, tonumber;
+
+var _VERSION, newproxy = _VERSION, newproxy;
+
+module(...);
+
+var GIT_PORT = 9418;
+
+var function git_connect(host) {
+	var sock = assert(socket.connect(host, GIT_PORT));
+	var gitsocket = {};
+
+	function gitsocket::send(data) {
+		if( ! data ) { // flush packet
+			sock->send('0000');
+		} else {
+			var len = #data + 4;
+			len = string.format("%04x", len);
+			assert(sock->send(len .. data));
+		}
+	}
+
+	function gitsocket::receive() {
+		var len = assert(sock->receive(4));
+		len = tonumber(len, 16);
+		if( len == 0 ) { return; } // flush packet
+		var data = assert(sock->receive(len - 4));
+		return data;
+	}
+
+	function gitsocket::close() {
+		sock->close();
+	}
+
+	return gitsocket;
+}
+
+var function addFinalizer(object, finalizer) {
+	if( _VERSION <= "Lua 5.1" ) {
+		var gc = newproxy(true);
+		getmetatable(gc).__gc = finalizer;
+		object.__gc = gc;
+	} else {
+		var mt = getmetatable(object);
+		if( mt ) { mt.__gc = finalizer;
+		} else { setmetatable(object, {__gc = finalizer});
+		}
+	}
+}
+
+var function git_fetch(host, path, repo, head, supress_progress) {
+	var s = git_connect(host);
+	s->send('git-upload-pack '..path..'\0host='..host..'\0');
+
+	var refs, refsbyname = {}, {};
+	do {
+		var ref = s->receive();
+		if( ref ) {
+			var sha, name = ref->sub(1,40), ref->sub(42, -2);
+			refs[sha] = name;
+			refsbyname[name] = sha;
+		}
+	} while(!( ! ref) );
+
+	var wantedSha;
+	var headsha = head && refsbyname[head];
+
+	for( sha, ref in pairs(refs) ) {
+		// we implicitly want this ref
+		var wantObject = true; 
+		// unless we ask for a specific head
+		if( headsha ) {         
+			if( sha != headsha ) {
+				wantObject = false;
+			} else {
+				wantedSha = sha;
+			}
+		}
+		// or we already have it
+		if( repo && repo->has_object(sha) ) {
+			wantObject = false;
+		}
+		if( wantObject ) {
+			s->send('want '..sha..' multi_ack_detailed side-band-64k ofs-delta\n');
+		}
+	}
+
+	if( head && ! wantedSha ) {
+		error("Server does not have "..head);
+	}
+
+	s->send('deepen 1');
+	s->send();
+	while( s->receive() ) { }
+	s->send('done\n');
+	
+	assert(s->receive() == "NAK\n");
+	
+	var packname = os.tmpname() .. '.pack';
+	var packfile = assert(io.open(packname, 'wb'));
+	do {
+		var got = s->receive();
+		if( got ) {
+			// get sideband channel, 1=pack data, 2=progress, 3=error
+			var cmd = string.byte(got->sub(1,1));
+			var data = got->sub(2);
+			if( cmd == 1 ) {
+				packfile->write(data);
+			} else if( cmd == 2 ) {
+				if( ! supress_progress ) { io.write(data); }
+			} else {
+				error(data);
+			}
+		}
+	} while(!( ! got) );
+
+	packfile->close();
+	s->close();
+
+	var pack = Pack.open(packname);
+	if( repo ) {
+		pack->unpack(repo);
+		repo.isShallow = true;
+		if( wantedSha ) {
+			var headfile = correct_separators(join_path(repo.dir, head));
+			assert(make_dir(parent_dir(headfile)));
+			var f = assert(io.open(headfile, 'wb'));
+			f->write(wantedSha);
+			f->close();
+		}
+	}
+
+	addFinalizer(pack, function() {
+		os.remove(packname);
+	});
+
+	return pack, wantedSha;
+}
+
+function fetch(url, repo, head, supress_progress) {
+	if( repo ) { assert(getmetatable(repo) == Repo, "arg #2 is not a repository"); }
+	url = urllib.parse(url);
+	if( url.scheme == 'git' ) {
+		var pack, sha = git_fetch(url.host, url.path, repo, head, supress_progress);
+		return pack, sha;
+	} else {
+		error('unsupported scheme: '..url.scheme);
+	}
+}
+
+function remotes(url) {
+	// TODO: refactor common code
+	url = assert(urllib.parse(url));
+
+	if( url.scheme != 'git' ) {
+		error('unsupported scheme: '..url.scheme);
+	}
+
+	var host, path = url.host, url.path;
+
+	var s = git_connect(host);
+	s->send('git-upload-pack '..path..'\0host='..host..'\0');
+
+	var remote = {};
+	do {
+		var ref = s->receive();
+		if( ref ) {
+			var sha, name = ref->sub(1,40), ref->sub(42, -2);
+			remote[name] = sha;
+		}
+	} while(!( ! ref) );
+
+	s->close();
+
+	return remote;
+}

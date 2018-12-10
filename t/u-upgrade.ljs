@@ -1,0 +1,46 @@
+if( ide.wxver >= "3.1" ) {
+  ok(wx.wxFileName().ShouldFollowLink != null, "wxlua/wxwidgets includes wxFileName().ShouldFollowLink.");
+}
+
+var function waitToComplete(bid) {
+  while( wx.wxProcess.Exists(bid) ) {
+    wx.wxSafeYield();
+    wx.wxWakeUpIdle();
+    wx.wxMilliSleep(100);
+  }
+  wx.wxWakeUpIdle(); // wake up one more time to process messages (if any)
+}
+
+var modules = {
+  ["require([=[lfs]=])._VERSION"] = "LuaFileSystem 1.6.3",
+  ["require([=[lpeg]=]).version()"] = "1.0.0",
+  ["require([=[ssl]=])._VERSION"] = "0.6",
+};
+var envall = {'LUA_CPATH', 'LUA_CPATH_5_2', 'LUA_CPATH_5_3'};
+var envs = {};
+// save and unset all LUA_CPATH* environmental variables, as we'll only be setting LUA_CPATH
+// for simplicity, so LUA_CPATH_5_2 and _5_3 need to be cleared as they take precedence
+for( _, env in ipairs(envall) ) { envs[env] = os.getenv(env); wx.wxUnsetEnv(env); }
+for( _, luaver in ipairs({"", "5.2", "5.3"}) ) {
+  var clibs = ide.osclibs->gsub("clibs", "clibs"..luaver->gsub("%.",""));
+  wx.wxSetEnv('LUA_CPATH', clibs);
+
+  for( mod, modver in pairs(modules) ) {
+    var res = "";
+    var cmd = ('"%s" -e "print(%s)"')->format(ide.interpreters.luadeb->fexepath(luaver), mod);
+    var pid, err = ide->ExecuteCommand(cmd, "", function(s) { res = res..s; });
+    if( pid ) { waitToComplete(pid); }
+    // when there is an error, show the error instead of the expected value
+    is((pid && res || err)->gsub("%s+$",""), modver,
+      ("Checking module version (%s) with Lua%s.")->format(mod->match("%[=%[(%w+)%]=%]"), luaver));
+  }
+}
+for( env, val in pairs(envs) ) {
+  if( val ) { wx.wxSetEnv(env, val); } else { wx.wxUnsetEnv(env); }
+}
+
+is(jit && jit.version, "LuaJIT 2.0.4", "Using LuaJIT with the expected version.");
+
+require ("lpeg");
+var lexpath = package.searchpath("lexlpeg", ide.osclibs);
+ok(package.loadlib(lexpath, "GetLexerCount") != null, "LexLPeg lexer is loaded.");

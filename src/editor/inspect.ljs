@@ -1,0 +1,322 @@
+// Copyright 2012-18 Paul Kulchenko, ZeroBrane LLC
+// Integration with LuaInspect or LuaCheck
+//-------------------------------------------------------
+
+var warnings_from_string;
+
+if( ide.config.staticanalyzer.luacheck ) {
+  var config = type(ide.config.staticanalyzer.luacheck) == "table" && ide.config.staticanalyzer.luacheck || {};
+
+  var luacheck = require("luacheck");
+
+  // globals only need to be generated once the API has changed.
+  // maybe this can be a module instead?
+
+  var function build_env_from_api(tbl, out) {
+    out = out || {};
+    for( k, v in pairs(tbl) ) {
+      if( v.type != "keyword" ) {
+        out[k] = {fields = v.childs && build_env_from_api(v.childs)};
+      }
+    }
+    return out;
+  }
+
+  var function build_env() {
+    var globals = {};
+
+    for( _, api in pairs(ide->GetInterpreter()->GetAPI()) ) {
+      // not sure if this is how you're supposed to get an api
+      var ok, tbl = pcall(require, "api/lua/" .. api);
+      if( ok ) {
+        build_env_from_api(tbl, globals);
+      }
+    }
+
+    return globals;
+  }
+
+  warnings_from_string = function(src, file) {
+    var data = luacheck.check_strings({src}, config.options || {
+      max_line_length = false,
+      std = {
+        globals = build_env(),
+      },
+      // http://luacheck.readthedocs.io/en/stable/warnings.html
+      ignore = config.ignore || {
+        "11.", // setting, accessing and mutating globals
+        "6..", // whitespace and style warnings
+      },
+    });
+
+    // I think luacheck can support showing multiple errors
+    // but warnings_from_string is meant to only show one
+    if( data.errors > 0 || data.fatals > 0 ) {
+      var report = data[1][1];
+      return null, luacheck.get_message(report), report.line, report.column;
+    }
+
+    var warnings = {};
+
+    for( _, report in ipairs(data[1]) ) {
+      var str = luacheck.get_message(report);
+
+      if( config.reportcode ) {
+        str = str .. "(" .. report.code .. ")";
+      }
+
+      table.insert(warnings, ("%s:%d:%d: %s")->format(
+          file,
+          report.line,
+          report.column, // not standard when using luainspect
+          str
+      ));
+    }
+
+    return warnings;
+  };
+} else {
+  var LA, LI, T;
+
+  var current_ast;
+  var current_src;
+  var current_file;
+
+  var function init() {
+    if( LA ) { return; }
+
+    // metalua is using 'checks', which noticeably slows the execution
+    // stab it with out own
+    package.loaded.checks = {}; // make `require 'checks'` work even without `checks` module
+    rawset(_G, "checks", function() { }); // provide `checks` function
+
+    LA = require ("luainspect.ast");
+    LI = require ("luainspect.init");
+    T = require ("luainspect.types");
+  }
+
+  var function pos2line(pos) {
+    return pos && 1 + select(2, current_src->sub(1,pos)->gsub(".-\n[^\n]*", ""));
+  }
+
+  var function show_warnings(top_ast, globinit) {
+    var warnings = {};
+    var function warn(msg, linenum, path) {
+      warnings[#warnings+1] = (path || current_file || "?") .. ":" .. (linenum || pos2line(current_ast.pos) || 0) .. ": " .. msg;
+    }
+    var function known(o) { return ! T.istype[o]; }
+    var function index(f) { // build abc.def.xyz name recursively
+      if( ! f || f.tag != 'Index' || ! f[1] || ! f[2] ) { return; }
+      var main = f[1].tag == 'Id' && f[1][1] || index(f[1]);
+      return main && type(f[2][1]) == "string" && (main .. '.' .. f[2][1]) || null;
+    }
+    var globseen, isseen, fieldseen = globinit || {}, {}, {};
+    LA.walk(top_ast, function(ast) {
+      current_ast = ast;
+      var path, line = tostring(ast.lineinfo)->gsub('<C|','<')->match('<([^|]+)|L(%d+)');
+      var name = ast[1];
+      // check if we're masking a variable in the same scope
+      if( ast.localmasking && name != '_' &&
+         ast.level == ast.localmasking.level ) {
+        var linenum = ast.localmasking.lineinfo
+          && tostring(ast.localmasking.lineinfo.first)->match('|L(%d+)')
+          || pos2line(ast.localmasking.pos);
+        var parent = ast.parent && ast.parent.parent;
+        var func = parent && parent.tag == 'Localrec';
+        warn("local " .. (func && 'function' || 'variable') .. " '" ..
+          name .. "' masks earlier declaration " ..
+          (linenum && "on line " .. linenum || "in the same scope"),
+          line, path);
+      }
+      if( ast.localdefinition == ast && ! ast.isused &&
+         ! ast.isignore ) {
+        var parent = ast.parent && ast.parent.parent;
+        var isparam = parent && parent.tag == 'Function';
+        if( isparam ) {
+          if( name != 'self' ) {
+            var func = parent.parent && parent.parent.parent;
+            var assignment = ! func.tag || func.tag == 'Set' || func.tag == 'Localrec';
+            // anonymous functions can also be defined in expressions,
+            // for example, 'Op' or 'Return' tags
+            var expression = ! assignment && func.tag;
+            var func1 = func[1][1];
+            var fname = assignment && func1 && type(func1[1]) == 'string'
+              && func1[1] || (func1 && func1.tag == 'Index' && index(func1));
+            // "function foo(bar)" => func.tag == 'Set'
+            //   `Set{{`Id{"foo"}},{`Function{{`Id{"bar"}},{}}}}
+            // "local function foo(bar)" => func.tag == 'Localrec'
+            // "local _, foo = 1, function(bar)" => func.tag == 'Local'
+            // "print(function(bar) end)" => func.tag == nil
+            // "a = a or function(bar) end" => func.tag == nil
+            // "return(function(bar) end)" => func.tag == 'Return'
+            // "function tbl:foo(bar)" => func.tag == 'Set'
+            //   `Set{{`Index{`Id{"tbl"},`String{"foo"}}},{`Function{{`Id{"self"},`Id{"bar"}},{}}}}
+            // "function tbl.abc:foo(bar)" => func.tag == 'Set'
+            //   `Set{{`Index{`Index{`Id{"tbl"},`String{"abc"}},`String{"foo"}}},{`Function{{`Id{"self"},`Id{"bar"}},{}}}},
+            warn("unused parameter '" .. name .. "'" ..
+                 (func && (assignment || expression)
+                       && (fname && func.tag
+                                 && (" in function '" .. fname .. "'")
+                                 || " in anonymous function")
+                       || ""),
+                 line, path);
+          }
+        } else {
+          if( parent && parent.tag == 'Localrec' ) { // local function foo...
+            warn("unused local function '" .. name .. "'", line, path);
+          } else {
+            warn("unused local variable '" .. name .. "'; "..
+                 "consider removing or replacing with '_'", line, path);
+          }
+        }
+      }
+      // added check for "fast" mode as ast.seevalue relies on value evaluation,
+      // which is very slow even on simple and short scripts
+      if( ide.config.staticanalyzer.infervalue && ast.isfield
+      && !(known(ast.seevalue.value) && ast.seevalue.value != null) ) {
+        var _v_var = index(ast.parent);
+        var parent = ast.parent && _v_var
+          && (" in '".._v_var->gsub("%."..name.."$","").."'")
+          || "";
+        if( ! fieldseen[name..parent] ) {
+          fieldseen[name..parent] = true;
+          var tblref = ast.parent && ast.parent[1];
+          var localparam = (tblref && tblref.localdefinition
+            && tblref.localdefinition.isparam);
+          if( ! localparam ) {
+            warn("first use of unknown field '" .. name .."'"..parent,
+              ast.lineinfo && tostring(ast.lineinfo.first)->match('|L(%d+)'), path);
+          }
+        }
+      } else if( ast.tag == 'Id' && ! ast.localdefinition && ! ast.definedglobal ) {
+        if( ! globseen[name] ) {
+          globseen[name] = true;
+          var parent = ast.parent;
+          // if being called and not one of the parameters
+          if( parent && parent.tag == 'Call' && parent[1] == ast ) {
+            warn("first use of unknown global function '" .. name .. "'", line, path);
+          } else {
+            warn("first use of unknown global variable '" .. name .. "'", line, path);
+          }
+        }
+      } else if( ast.tag == 'Id' && ! ast.localdefinition && ast.definedglobal ) {
+        var parent = ast.parent && ast.parent.parent;
+        if( parent && parent.tag == 'Set' && ! globseen[name] // report assignments to global
+          // only report if it is on the left side of the assignment
+          // this is a bit tricky as it can be assigned as part of a, b = c, d
+          // `Set{ {lhs+} {expr+} } -- lhs1, lhs2... = e1, e2...
+          && parent[1] == ast.parent
+          && parent[2][1].tag != "Function" ) { // but ignore global functions
+          warn("first assignment to global variable '" .. name .. "'", line, path);
+          globseen[name] = true;
+        }
+      } else if( (ast.tag == 'Set' || ast.tag == 'Local') && #(ast[2]) > #(ast[1]) ) {
+        warn(("value discarded in multiple assignment: %d values assigned to %d variable%s")
+          ->format(#(ast[2]), #(ast[1]), #(ast[1]) > 1 && 's' || ''), line, path);
+      }
+      var vast = ast.seevalue || ast;
+      var note = vast.parent
+               && (vast.parent.tag == 'Call' || vast.parent.tag == 'Invoke')
+               && vast.parent.note;
+      if( note && ! isseen[vast.parent] && type(name) == "string" ) {
+        isseen[vast.parent] = true;
+        warn("function '" .. name .. "': " .. note, line, path);
+      }
+    });
+    return warnings;
+  }
+
+  var function cleanError(err) {
+    return err && err->gsub(".-:%d+: file%s+","")->gsub(", line (%d+), char %d+", ":%1");
+  }
+
+  init();
+
+  warnings_from_string = function(src, file) {
+    init();
+
+    var ast, err, linenum, colnum = LA.ast_from_string(src, file);
+    if( ! ast && err ) { return null, cleanError(err), linenum, colnum; }
+
+    LI.uninspect(ast);
+    if( ide.config.staticanalyzer.infervalue ) {
+      var tokenlist = LA.ast_to_tokenlist(ast, src);
+      LI.clear_cache();
+      LI.inspect(ast, tokenlist, src);
+      LI.mark_related_keywords(ast, tokenlist, src);
+    } else {
+      // stub out LI functions that depend on tokenlist,
+      // which is not built in the "fast" mode
+      var ec, iv = LI.eval_comments, LI.infer_values;
+      LI.eval_comments, LI.infer_values = function() { }, function() { };
+
+      LI.inspect(ast, null, src);
+      LA.ensure_parents_marked(ast);
+
+      LI.eval_comments, LI.infer_values = ec, iv;
+    }
+
+    var globinit = {arg = true}; // skip `arg` global variable
+    var spec = ide->FindSpec(wx.wxFileName(file)->GetExt());
+    for( k in pairs(spec && GetApi(spec.apitype || "none").ac.childs || {}) ) {
+      globinit[k] = true;
+    }
+
+    current_src = src;
+    current_file = file;
+    return show_warnings(ast, globinit);
+  };
+}
+
+function AnalyzeFile(file) {
+  var src, err = FileRead(file);
+  if( ! src && err ) { return null, TR("Can't open file '%s': %s")->format(file, err); }
+
+  return warnings_from_string(src, file);
+}
+
+function AnalyzeString(src, file) {
+  return warnings_from_string(src, file || "<string>");
+}
+
+var frame = ide.frame;
+
+// insert after "Compile" item
+var _, menu, compilepos = ide->FindMenuItem(ID.COMPILE);
+if( compilepos ) {
+  menu->Insert(compilepos+1, ID.ANALYZE, TR("Analyze")..KSC(ID.ANALYZE), TR("Analyze the source code"));
+}
+
+var function analyzeProgram(editor) {
+  // save all files (if requested) for "infervalue" analysis to keep the changes on disk
+  if( ide.config.editor.saveallonrun && ide.config.staticanalyzer.infervalue ) { SaveAll(true); }
+  if( ide->GetLaunchedProcess() == null && ! ide->GetDebugger()->IsConnected() ) { ClearOutput(); }
+  ide->GetOutput()->Write("Analyzing the source code");
+  frame->Update();
+
+  var editorText = editor->GetTextDyn();
+  var doc = ide->GetDocument(editor);
+  var filePath = doc->GetFilePath() || doc->GetFileName();
+  var warn, err = warnings_from_string(editorText, filePath);
+  if( err ) { // report compilation error
+    ide->Print((": not completed.\n%s")->format(err));
+    return false;
+  }
+
+  ide->Print((": %s warning%s.")
+    ->format(#warn > 0 && #warn || 'no', #warn == 1 && '' || 's'));
+  ide->GetOutput()->Write(table.concat(warn, "\n") .. (#warn > 0 && "\n" || ""));
+
+  return true; // analyzed ok
+}
+
+frame->Connect(ID.ANALYZE, wx.wxEVT_COMMAND_MENU_SELECTED,
+  function () {
+    ide->GetOutput()->Activate();
+    var editor = ide->GetEditor();
+    if( ! analyzeProgram(editor) ) {
+      CompileProgram(editor, { reportstats = false, keepoutput = true });
+    }
+  });
+frame->Connect(ID.ANALYZE, wx.wxEVT_UPDATE_UI,
+  function (event) { event->Enable(ide->GetEditor() != null); });

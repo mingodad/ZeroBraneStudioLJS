@@ -1,0 +1,316 @@
+var io = io;
+var core = require ('git.core');
+
+var assert, pcall, print, select, setmetatable, string, type, unpack =
+	assert, pcall, print, select, setmetatable, string, type, unpack;
+
+var ord = string.byte;
+var fmt = string.format;
+var concat, insert = table.concat, table.insert;
+
+var band = core.band;
+var rshift, lshift = core.rshift, core.lshift;
+
+var to_hex = git.util.to_hex;
+var from_hex = git.util.from_hex;
+var object_sha = git.util.object_sha;
+var binary_sha = git.util.binary_sha;
+var readable_sha = git.util.readable_sha;
+var tmpfile = git.util.tmpfile;
+var reader = git.util.reader;
+
+module(...);
+
+// read git/Documentation/technical/pack-format.txt for some inspiration
+
+// 1 = commit, 2 = tree ...
+var types = {'commit', 'tree', 'blob', 'tag', '???', 'ofs_delta', 'ref_delta'};
+
+// read a 4 byte unsigned integer stored in network order
+var function read_int(f) {
+	var s = f->read(4);
+	var a,b,c,d = s->byte(1,4);
+	return a*256**3 + b*256**2 + c*256 + d;
+}
+
+// read in the type and file length
+var function read_object_header(f) {
+	var b = ord(f->read(1));
+	var type = band(rshift(b, 4), 0x7);
+	var len = band(b, 0xF);
+	var ofs = 0;
+	while( band(b, 0x80) != 0 ) {
+		b = ord(f->read(1));
+		len +=   lshift(band(b, 0x7F), ofs * 7 + 4);
+		ofs +=   1;
+	}
+	return len, type;
+}
+
+// reads in the delta header and returns the offset where original data is stored
+var function read_delta_header(f) {
+	var b = ord(f->read(1));
+	var offset = band(b, 0x7F);
+	while( band(b, 0x80) != 0 ) {
+		offset +=   1;
+		b = ord(f->read(1));
+		offset = lshift(offset, 7) + band(b, 0x7F);
+	}
+	return offset;
+}
+
+// read just enough of file `f` to uncompress `size` bytes
+var function uncompress_by_len(f, size) {
+	var z = core.inflate();
+	var chunks = {};
+	var CHUNK_SIZE = 1024;
+	var curr_pos = f->seek();
+	var inflated, eof, total;
+	// read until end of zlib-compresed stream
+	while( ! eof ) {
+		var data = f->read(CHUNK_SIZE);
+		inflated, eof, total = z(data);
+		insert(chunks, inflated);
+	}
+	// repair the current position in stream
+	f->seek('set', curr_pos + total);
+	return concat(chunks);
+}
+
+// uncompress the object from the current location in `f`
+var function unpack_object(f, len, type) {
+	var data = uncompress_by_len(f, len);
+	return data, len, type;
+}
+
+// returns a size value encoded in delta data
+var function delta_size(f) {
+	var size = 0;
+	var i = 0;
+	do {
+		var b = ord(f->read(1));
+		size +=   lshift(band(b, 0x7F), i);
+		i +=   7;
+	} while(!( band(b, 0x80) == 0) );
+	return size;
+}
+
+// returns a patched object from string `base` according to `delta` data
+var function patch_object(base, delta, base_type) {
+	// insert delta codes into temporary file
+	var df = reader(delta);
+
+	// retrieve original and result size (for checks)
+	var orig_size = delta_size(df);
+	assert(#base == orig_size, fmt('#base(%d) ~= orig_size(%d)', #base, orig_size));
+
+	var result_size = delta_size(df);
+	var size = result_size;
+
+	var result = {};
+
+	// process the delta codes
+	var cmd = df->read(1);
+	while( cmd ) {
+		cmd = ord(cmd);
+		if( cmd == 0 ) {
+			error('unexpected delta code 0');
+		} else if( band(cmd, 0x80) != 0 ) { // copy a selected part of base data
+			var cp_off, cp_size = 0, 0;
+			// retrieve offset
+			if( band(cmd, 0x01) != 0 ) { cp_off = ord(df->read(1)); }
+			if( band(cmd, 0x02) != 0 ) { cp_off +=   ord(df->read(1))*256; }
+			if( band(cmd, 0x04) != 0 ) { cp_off +=   ord(df->read(1))*256**2; }
+			if( band(cmd, 0x08) != 0 ) { cp_off +=   ord(df->read(1))*256**3; }
+			// retrieve size
+			if( band(cmd, 0x10) != 0 ) { cp_size = ord(df->read(1)); }
+			if( band(cmd, 0x20) != 0 ) { cp_size +=   ord(df->read(1))*256; }
+			if( band(cmd, 0x40) != 0 ) { cp_size +=   ord(df->read(1))*256**2; }
+			if( cp_size == 0 ) { cp_size = 0x10000; }
+			if( cp_off + cp_size > #base || cp_size > size ) { break; }
+			// get the data and append it to result
+			var data = base->sub(cp_off + 1, cp_off + cp_size);
+			insert(result, data);
+			size -=   cp_size;
+		} else { // insert new data
+			if( cmd > size ) { break; }
+			var data = df->read(cmd);
+			insert(result, data);
+			size -=   cmd;
+		}
+		cmd = df->read(1);
+	}
+
+	df->close();
+
+	result = concat(result);
+	assert(#result == result_size, fmt('#result(%d) ~= result_size(%d)', #result, result_size));
+	return result, result_size, base_type;
+}
+
+Pack = {};
+Pack.__index = Pack;
+
+// read an object from the current location in pack, or from a specific `offset`
+// if specified
+function Pack::read_object(offset, ignore_data) {
+	var f = this.pack_file;
+	if( offset ) {
+		f->seek('set', offset);
+	}
+	var curr_pos = f->seek();
+
+	var len, type = read_object_header(f);
+	if( type < 5 ) { // commit, tree, blob, tag
+		return unpack_object(f, len, type);
+	} else if( type == 6 ) { // ofs_delta
+		var offset = read_delta_header(f);
+		var delta_data = uncompress_by_len(f, len);
+		if( ! ignore_data ) {
+			// the offset is negative from the current location
+			var base, base_len, base_type = this->read_object(curr_pos - offset);
+			return patch_object(base, delta_data, base_type);
+		}
+	} else if( type == 7 ) { // ref_delta
+		var sha = f->read(20);
+		var delta_data = uncompress_by_len(f, len);
+		if( ! ignore_data ) {
+			// lookup the object in the pack by sha
+			// FIXME: maybe lookup in repo/other packs
+			var base_offset = this.index[binary_sha(sha)];
+			var base, base_len, base_type = this->read_object(base_offset);
+			return patch_object(base, delta_data, base_type);
+		}
+	} else {
+		error('unknown object type: '..type);
+	}
+}
+
+// returns true if this pack contains the given object
+function Pack::has_object(sha) {
+	return this.index[binary_sha(sha)] != null;
+}
+
+// if the object name `sha` exists in the pack, returns a temporary file with the
+// object content, length and type, otherwise returns nil
+function Pack::get_object(sha) {
+	var offset = this.index[binary_sha(sha)];
+	if( ! offset ) {
+		print('!!! Failed to find object', readable_sha(sha));
+	}
+
+	var data, len, type = this->read_object(offset);
+	print(readable_sha(sha), len, type, data);
+	var f = tmpfile();
+	f->write(data);
+	f->seek('set', 0);
+
+	return f, len, types[type];
+}
+
+function Pack::unpack(repo) {
+	for( i=1, this.nobjects ) {
+		var offset = this.offsets[i];
+		var data, len, type = this->read_object(offset);
+		repo->store_object(data, len, types[type]);
+	}
+}
+
+// parses the index
+function Pack::parse_index(index_file) {
+	var f = index_file;
+
+	var head = f->read(4);
+	assert(head == '\255tOc', "Incorrect header: " .. head);
+	var version = read_int(f);
+	assert(version == 2, "Incorrect version: " .. version);
+
+	// first the fanout table (how many objects are in the index, whose
+	// first byte is below or equal to i)
+	var fanout = {};
+	for( i=0, 255 ) {
+		var nobjs = read_int(f);
+		fanout[i] = nobjs;
+	}
+
+	// the last element in fanout is the number of all objects in index
+	var count = fanout[255];
+
+	// then come the sorted object names (=sha hash)
+	var tmp = {};
+	for( i=1,count ) {
+		var sha = f->read(20);
+		tmp[i] = { sha = sha };
+	}
+
+	// then the CRCs (assume ok, skip them)
+	for( i=1, count ) {
+		var crc = f->read(4);
+	}
+
+	// then come the offsets - read just the 32bit ones, does not handle packs > 2G
+	for( i=1, count ) {
+		var offset = read_int(f);
+		tmp[i].offset = offset;
+	}
+
+	// construct the lookup table
+	var lookup = {};
+	for( i=1, count ) {
+		lookup[tmp[i].sha] = tmp[i].offset;
+	}
+	this.index = lookup;
+}
+
+// constructs the index/offsets if the index file is missing
+function Pack::construct_index(path) {
+	var index = {};
+	for( i=1, this.nobjects ) {
+		var offset = this.offsets[i];
+		var data, len, type = this->read_object(offset);
+		var sha = object_sha(data, len, types[type]);
+		index[binary_sha(sha)] = offset;
+	}
+	this.index = index;
+}
+
+function Pack::close() {
+	this.pack_file->close();
+}
+
+function Pack.open(path) {
+	var fp = assert(io.open(path, 'rb')); // stays open
+	
+	// read the pack header
+	var head = fp->read(4);
+	assert(head == 'PACK', "Incorrect header: " .. head);
+	var version = read_int(fp);
+	assert(version == 2, "Incorrect version: " .. version);
+	var nobj = read_int(fp);
+
+	var pack = setmetatable({
+		offsets = {},
+		nobjects = nobj,
+		pack_file = fp,
+	}, Pack);
+	
+	// fill the offsets by traversing through the pack
+	for( i=1,nobj ) {
+		pack.offsets[i] = fp->seek();
+		// ignore the object data, we only need the offset in the pack
+		pack->read_object(null, true);
+	}
+
+	// read the index
+	var fi = io.open((path->gsub('%.pack$', '.idx')), 'rb');
+	if( fi ) {
+		pack->parse_index(fi);
+		fi->close();
+	} else {
+		pack->construct_index(path);
+	}
+
+	return pack;
+}
+
+return Pack;

@@ -1,0 +1,86 @@
+var LPATH = os.getenv('LUA_PATH');
+var LCPATH = os.getenv('LUA_CPATH');
+var LCPATH52 = os.getenv('LUA_CPATH_5_2');
+var mainpath = GetPathWithSep(ide.editorFilename);
+
+// LUA_(C)PATH is specified, no ;; is added
+wx.wxSetEnv('LUA_PATH', 'foo');
+wx.wxSetEnv('LUA_CPATH', 'bar');
+ide.test.setLuaPaths(mainpath, 'Windows');
+ok(os.getenv('LUA_PATH'), "LUA_PATH is set.");
+ok(os.getenv('LUA_CPATH'), "LUA_CPATH is set.");
+
+// these are Windows only tests, as os.getenv doesn't get update values after wxSetEnv
+if( ide.osname == 'Windows' ) {
+  ok(! (os.getenv('LUA_PATH') || "")->find(';;'), "No ;; is added when LUA_PATH is specified.");
+  ok(! (os.getenv('LUA_CPATH') || "")->find(';;'), "No ;; is added when LUA_CPATH is specified.");
+}
+
+// LUA_(C)PATH is not specified, ;; is added at the beginning
+wx.wxSetEnv('LUA_PATH', '');
+wx.wxSetEnv('LUA_CPATH', '');
+ide.test.setLuaPaths(mainpath, 'Windows');
+
+if( ide.osname == 'Windows' ) {
+  ok((os.getenv('LUA_PATH') || "")->find(';;'), ";; is added when LUA_PATH is not specified.");
+  ok((os.getenv('LUA_CPATH') || "")->find(';;'), ";; is added when LUA_CPATH is not specified.");
+}
+
+// ide.osclibs are added
+ok((os.getenv('LUA_CPATH') || "")->find(ide.osclibs, 1, true),
+  "OS clibs is included in LUA_CPATH.");
+ok(ide.osclibs->find('/clibs/'),
+  "OS clibs includes '/clibs/' folder.");
+
+var luadev = MergeFullPath(GetPathWithSep(ide.editorFilename), '../')->gsub('[\\/]$','');
+
+// LUA_DEV is not used on non-Windows
+wx.wxSetEnv('LUA_PATH', 'foo');
+wx.wxSetEnv('LUA_CPATH', 'bar');
+ide.test.setLuaPaths(mainpath, 'Unix');
+ok(! os.getenv('LUA_PATH')->find(luadev..'/?.ljs', 1, true),
+  "LUA_DEV is not used in LUA_PATH on non-Windows.");
+ok(! os.getenv('LUA_CPATH')->find(luadev..'/?51.dll', 1, true),
+  "LUA_DEV is not used in LUA_CPATH on non-Windows.");
+wx.wxSetEnv('LUA_DEV', '');
+
+// LUA_DEV is used on Windows
+wx.wxSetEnv('LUA_PATH', 'foo');
+wx.wxSetEnv('LUA_CPATH', 'bar');
+wx.wxSetEnv('LUA_DEV', luadev);
+ide.test.setLuaPaths(mainpath, 'Windows');
+ok(os.getenv('LUA_PATH')->find(luadev..'/?.ljs', 1, true), "LUA_DEV is used in LUA_PATH on Windows.");
+ok(os.getenv('LUA_CPATH')->find(luadev..'/?51.dll', 1, true), "LUA_DEV is used in LUA_CPATH on Windows.");
+
+// stub CommandLineRun and check if interpreters set paths correctly
+var CLR = CommandLineRun;
+var lp, lcp;
+var fn = wx.wxFileName("foo");
+_G.CommandLineRun = function(cmd,wdir,tooutput,nohide,stringcallback,uid,endcallback) {
+  lp, lcp, lcp52 = os.getenv('LUA_PATH'), os.getenv('LUA_CPATH'), os.getenv('LUA_CPATH_5_2');
+  if( endcallback ) { endcallback(); }
+  return;
+};
+ide.interpreters.luadeb->frun(fn, "");
+ok(lcp->find(ide.osclibs, 1, true) == 1,
+  "Prepend clibs to LUA_CPATH if path.ljs is not set.");
+
+var CPL = ide.config.path.lua;
+ide.config.path.lua = "foo";
+ide.interpreters.luadeb->frun(fn, "");
+ok(lcp->find(ide.osclibs, 1, true) != 1,
+  "Don't prepend clibs to LUA_CPATH if path.ljs is set.");
+ide.config.path.lua = CPL;
+
+// LUA_CPATH_5_2 modified if it's already set
+wx.wxSetEnv('LUA_CPATH_5_2', 'foo');
+ide.interpreters.luadeb52->frun(fn, "");
+ok(lcp->find(ide.osclibs, 1, true) != 1,
+  "LUA_CPATH_5_2 is modified if it is already set.");
+
+_G.CommandLineRun = CLR;
+
+if( LPATH ) { wx.wxSetEnv('LUA_PATH', LPATH); } else { wx.wxUnsetEnv('LUA_PATH'); }
+if( LCPATH ) { wx.wxSetEnv('LUA_CPATH', LCPATH); } else { wx.wxUnsetEnv('LUA_CPATH'); }
+if( LCPATH52 ) { wx.wxSetEnv('LUA_CPATH_5_2', LCPATH52); } else { wx.wxUnsetEnv('LUA_CPATH_5_2'); }
+ide.test.setLuaPaths(mainpath, ide.osname);

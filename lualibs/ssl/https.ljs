@@ -1,0 +1,142 @@
+//--------------------------------------------------------------------------
+// LuaSec 0.6
+// Copyright (C) 2009-2016 PUC-Rio
+//
+// Author: Pablo Musa
+// Author: Tomas Guisasola
+//-------------------------------------------------------------------------
+
+var socket = require("socket");
+var ssl    = require("ssl");
+var ltn12  = require("ltn12");
+var http   = require("socket.http");
+var url    = require("socket.url");
+
+var try    = socket.try;
+
+//
+// Module
+//
+var _M = {
+  _VERSION   = "0.6",
+  _COPYRIGHT = "LuaSec 0.6 - Copyright (C) 2009-2016 PUC-Rio",
+  PORT       = 443,
+};
+
+// TLS configuration
+var cfg = {
+  protocol = "any",
+  options  = {"all", "no_sslv2", "no_sslv3"},
+  verify   = "none",
+};
+
+//------------------------------------------------------------------
+// Auxiliar Functions
+//------------------------------------------------------------------
+
+// Insert default HTTPS port.
+var function default_https_port(u) {
+   return url.build(url.parse(u, {port = _M.PORT}));
+}
+
+// Convert an URL to a table according to Luasocket needs.
+var function urlstring_totable(url, body, result_table) {
+   url = {
+      url = default_https_port(url),
+      method = body && "POST" || "GET",
+      sink = ltn12.sink.table(result_table)
+   };
+   if( body ) {
+      url.source = ltn12.source.string(body);
+      url.headers = {
+         ["content-length"] = #body,
+         ["content-type"] = "application/x-www-form-urlencoded",
+      };
+   }
+   return url;
+}
+
+// Forward calls to the real connection object.
+var function reg(conn) {
+   var mt = getmetatable(conn.sock).__index;
+   for( name, method in pairs(mt) ) {
+      if( type(method) == "function" ) {
+         conn[name] = function (this, ...) {
+                         return method(this.sock, ...);
+                      };
+      }
+   }
+}
+
+// Return a function which performs the SSL/TLS connection.
+var function tcp(params) {
+   params = params || {};
+   // Default settings
+   for( k, v in pairs(cfg) ) { 
+      params[k] = params[k] || v;
+   }
+   // Force client mode
+   params.mode = "client";
+   // 'create' function for LuaSocket
+   return function () {
+      var conn = {};
+      conn.sock = try(socket.tcp());
+      var st = getmetatable(conn.sock).__index.settimeout;
+      function conn::settimeout(...) {
+         return st(this.sock, ...);
+      }
+      // Replace TCP's connection function
+      function conn::connect(host, port) {
+         try(this.sock->connect(host, port));
+         this.sock = try(ssl.wrap(this.sock, params));
+         try(this.sock->dohandshake());
+         reg(this, getmetatable(this.sock));
+         return 1;
+      }
+      return conn;
+  };
+}
+
+//------------------------------------------------------------------
+// Main Function
+//------------------------------------------------------------------
+
+// Make a HTTP request over secure connection.  This function receives
+//  the same parameters of LuaSocket's HTTP module (except 'proxy' and
+//  'redirect') plus LuaSec parameters.
+//
+// @param url mandatory (string or table)
+// @param body optional (string)
+// @return (string if url == string or 1), code, headers, status
+//
+var function request(url, body) {
+  var result_table = {};
+  var stringrequest = type(url) == "string";
+  if( stringrequest ) {
+    url = urlstring_totable(url, body, result_table);
+  } else {
+    url.url = default_https_port(url.url);
+  }
+  if( http.PROXY || url.proxy ) {
+    return null, "proxy not supported";
+  } else if( url.redirect ) {
+    return null, "redirect not supported";
+  } else if( url.create ) {
+    return null, "create function not permitted";
+  }
+  // New 'create' function to establish a secure connection
+  url.create = tcp(url);
+  var res, code, headers, status = http.request(url);
+  if( res && stringrequest ) {
+    return table.concat(result_table), code, headers, status;
+  }
+  return res, code, headers, status;
+}
+
+//------------------------------------------------------------------------------
+// Export module
+//
+
+_M.request = request;
+
+return _M;

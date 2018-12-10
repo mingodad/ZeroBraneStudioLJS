@@ -1,0 +1,41 @@
+var mac = ide.osname == 'Macintosh';
+var win = ide.osname == "Windows";
+if( mac ) {
+  var defaultsize = 11;
+  filetree.fontsize = defaultsize;
+  if( ide.wxver >= "2.9.5" ) {
+    editor.fontsize = defaultsize+1;
+    output.fontsize = defaultsize;
+    console.fontsize = defaultsize;
+  }
+
+  editor.fontname = "Monaco";
+  output.fontname = editor.fontname;
+  console.fontname = editor.fontname;
+} else {
+  var defaultsize = 10;
+  editor.fontsize = defaultsize+1;
+  output.fontsize = defaultsize;
+  console.fontsize = defaultsize;
+
+  var sysid, major, minor = wx.wxGetOsVersion();
+  editor.fontname =
+    win && (major == 5 && "Courier New" || "Consolas") || "Monospace";
+  output.fontname = editor.fontname;
+  console.fontname = editor.fontname;
+}
+
+singleinstance = ! mac;
+
+unhidewindow = { // allow unhiding of GUI windows
+  // 1 - show if hidden, 0 - ignore, 2 -- hide if shown
+  ConsoleWindowClass = 2,
+  // ignore the following windows when "showing all"
+  IME = 0,
+  wxDisplayHiddenWindow = 0,
+  // window added when Microsoft.Windows.Common-Controls is enabled in the manifest
+  tooltips_class32 = 0,
+  ['MSCTFIME UI'] = 0,
+  // GLUT/opengl/SDL applications (for example, moai or love2d)
+  GLUT = 1, FREEGLUT = 1, SDL_app = 1,
+};

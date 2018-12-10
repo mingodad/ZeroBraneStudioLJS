@@ -1,0 +1,285 @@
+//---------------------------------------------------------------------------
+// FTP support for the Lua language
+// LuaSocket toolkit.
+// Author: Diego Nehab
+//---------------------------------------------------------------------------
+
+//---------------------------------------------------------------------------
+// Declare module and import dependencies
+//---------------------------------------------------------------------------
+var base = _G;
+var table = require("table");
+var string = require("string");
+var math = require("math");
+var socket = require("socket");
+var url = require("socket.url");
+var tp = require("socket.tp");
+var ltn12 = require("ltn12");
+socket.ftp = {};
+var _M = socket.ftp;
+//---------------------------------------------------------------------------
+// Program constants
+//---------------------------------------------------------------------------
+// timeout in seconds before the program gives up on a connection
+_M.TIMEOUT = 60;
+// default port for ftp service
+_M.PORT = 21;
+// this is the default anonymous password. used when no password is
+// provided in url. should be changed to your e-mail.
+_M.USER = "ftp";
+_M.PASSWORD = "anonymous@anonymous.org";
+
+//---------------------------------------------------------------------------
+// Low level FTP API
+//---------------------------------------------------------------------------
+var metat = { __index = {} };
+
+function _M.open(server, port, create) {
+    var tp = socket.try(tp.connect(server, port || _M.PORT, _M.TIMEOUT, create));
+    var f = base.setmetatable({ tp = tp }, metat);
+    // make sure everything gets closed in an exception
+    f.try = socket.newtry(function() { f->close(); });
+    return f;
+}
+
+function metat.__index::portconnect() {
+    this.try(this.server->settimeout(_M.TIMEOUT));
+    this.data = this.try(this.server->accept());
+    this.try(this.data->settimeout(_M.TIMEOUT));
+}
+
+function metat.__index::pasvconnect() {
+    this.data = this.try(socket.tcp());
+    this.try(this.data->settimeout(_M.TIMEOUT));
+    this.try(this.data->connect(this.pasvt.ip, this.pasvt.port));
+}
+
+function metat.__index::login(user, password) {
+    this.try(this.tp->command("user", user || _M.USER));
+    var code, reply = this.try(this.tp->check({"2..", 331}));
+    if( code == 331 ) {
+        this.try(this.tp->command("pass", password || _M.PASSWORD));
+        this.try(this.tp->check("2.."));
+    }
+    return 1;
+}
+
+function metat.__index::pasv() {
+    this.try(this.tp->command("pasv"));
+    var code, reply = this.try(this.tp->check("2.."));
+    var pattern = "(%d+)%D(%d+)%D(%d+)%D(%d+)%D(%d+)%D(%d+)";
+    var a, b, c, d, p1, p2 = socket.skip(2, string.find(reply, pattern));
+    this.try(a && b && c && d && p1 && p2, reply);
+    this.pasvt = {
+        ip = string.format("%d.%d.%d.%d", a, b, c, d),
+        port = p1*256 + p2
+    };
+    if( this.server ) {
+        this.server->close();
+        this.server = null;
+    }
+    return this.pasvt.ip, this.pasvt.port;
+}
+
+function metat.__index::port(ip, port) {
+    this.pasvt = null;
+    if( ! ip ) {
+        ip, port = this.try(this.tp->getcontrol()->getsockname());
+        this.server = this.try(socket.bind(ip, 0));
+        ip, port = this.try(this.server->getsockname());
+        this.try(this.server->settimeout(_M.TIMEOUT));
+    }
+    var pl = math.mod(port, 256);
+    var ph = (port - pl)/256;
+    var arg = string.gsub(string.format("%s,%d,%d", ip, ph, pl), "%.", ",");
+    this.try(this.tp->command("port", arg));
+    this.try(this.tp->check("2.."));
+    return 1;
+}
+
+function metat.__index::send(sendt) {
+    this.try(this.pasvt || this.server, "need port or pasv first");
+    // if there is a pasvt table, we already sent a PASV command
+    // we just get the data connection into self.data
+    if( this.pasvt ) { this->pasvconnect(); }
+    // get the transfer argument and command
+    var argument = sendt.argument ||
+        url.unescape(string.gsub(sendt.path || "", "^[/\\]", ""));
+    if( argument == "" ) { argument = null; }
+    var command = sendt.command || "stor";
+    // send the transfer command and check the reply
+    this.try(this.tp->command(command, argument));
+    var code, reply = this.try(this.tp->check({"2..", "1.."}));
+    // if there is not a a pasvt table, then there is a server
+    // and we already sent a PORT command
+    if( ! this.pasvt ) { this->portconnect(); }
+    // get the sink, source and step for the transfer
+    var step = sendt.step || ltn12.pump.step;
+    var readt = {this.tp.c};
+    var checkstep = function(src, snk) {
+        // check status in control connection while downloading
+        var readyt = socket.select(readt, null, 0);
+        if( readyt[tp] ) { code = this.try(this.tp->check("2..")); }
+        return step(src, snk);
+    };
+    var sink = socket.sink("close-when-done", this.data);
+    // transfer all data and check error
+    this.try(ltn12.pump.all(sendt.source, sink, checkstep));
+    if( string.find(code, "1..") ) { this.try(this.tp->check("2..")); }
+    // done with data connection
+    this.data->close();
+    // find out how many bytes were sent
+    var sent = socket.skip(1, this.data->getstats());
+    this.data = null;
+    return sent;
+}
+
+function metat.__index::receive(recvt) {
+    this.try(this.pasvt || this.server, "need port or pasv first");
+    if( this.pasvt ) { this->pasvconnect(); }
+    var argument = recvt.argument ||
+        url.unescape(string.gsub(recvt.path || "", "^[/\\]", ""));
+    if( argument == "" ) { argument = null; }
+    var command = recvt.command || "retr";
+    this.try(this.tp->command(command, argument));
+    var code,reply = this.try(this.tp->check({"1..", "2.."}));
+    if( (code >= 200) && (code <= 299) ) {
+        recvt.sink(reply);
+        return 1;
+    }
+    if( ! this.pasvt ) { this->portconnect(); }
+    var source = socket.source("until-closed", this.data);
+    var step = recvt.step || ltn12.pump.step;
+    this.try(ltn12.pump.all(source, recvt.sink, step));
+    if( string.find(code, "1..") ) { this.try(this.tp->check("2..")); }
+    this.data->close();
+    this.data = null;
+    return 1;
+}
+
+function metat.__index::cwd(dir) {
+    this.try(this.tp->command("cwd", dir));
+    this.try(this.tp->check(250));
+    return 1;
+}
+
+function metat.__index::type(type) {
+    this.try(this.tp->command("type", type));
+    this.try(this.tp->check(200));
+    return 1;
+}
+
+function metat.__index::greet() {
+    var code = this.try(this.tp->check({"1..", "2.."}));
+    if( string.find(code, "1..") ) { this.try(this.tp->check("2..")); }
+    return 1;
+}
+
+function metat.__index::quit() {
+    this.try(this.tp->command("quit"));
+    this.try(this.tp->check("2.."));
+    return 1;
+}
+
+function metat.__index::close() {
+    if( this.data ) { this.data->close(); }
+    if( this.server ) { this.server->close(); }
+    return this.tp->close();
+}
+
+//---------------------------------------------------------------------------
+// High level FTP API
+//---------------------------------------------------------------------------
+var function override(t) {
+    if( t.url ) {
+        var u = url.parse(t.url);
+        for( i,v in base.pairs(t) ) {
+            u[i] = v;
+        }
+        return u;
+    } else { return t; }
+}
+
+var function tput(putt) {
+    putt = override(putt);
+    socket.try(putt.host, "missing hostname");
+    var f = _M.open(putt.host, putt.port, putt.create);
+    f->greet();
+    f->login(putt.user, putt.password);
+    if( putt.type ) { f->type(putt.type); }
+    f->pasv();
+    var sent = f->send(putt);
+    f->quit();
+    f->close();
+    return sent;
+}
+
+var default = {
+    path = "/",
+    scheme = "ftp"
+};
+
+var function parse(u) {
+    var t = socket.try(url.parse(u, default));
+    socket.try(t.scheme == "ftp", "wrong scheme '" .. t.scheme .. "'");
+    socket.try(t.host, "missing hostname");
+    var pat = "^type=(.)$";
+    if( t.params ) {
+        t.type = socket.skip(2, string.find(t.params, pat));
+        socket.try(t.type == "a" || t.type == "i",
+            "invalid type '" .. t.type .. "'");
+    }
+    return t;
+}
+
+var function sput(u, body) {
+    var putt = parse(u);
+    putt.source = ltn12.source.string(body);
+    return tput(putt);
+}
+
+_M.put = socket.protect(function(putt, body) {
+    if( base.type(putt) == "string" ) { return sput(putt, body);
+    } else { return tput(putt); }
+});
+
+var function tget(gett) {
+    gett = override(gett);
+    socket.try(gett.host, "missing hostname");
+    var f = _M.open(gett.host, gett.port, gett.create);
+    f->greet();
+    f->login(gett.user, gett.password);
+    if( gett.type ) { f->type(gett.type); }
+    f->pasv();
+    f->receive(gett);
+    f->quit();
+    return f->close();
+}
+
+var function sget(u) {
+    var gett = parse(u);
+    var t = {};
+    gett.sink = ltn12.sink.table(t);
+    tget(gett);
+    return table.concat(t);
+}
+
+_M.command = socket.protect(function(cmdt) {
+    cmdt = override(cmdt);
+    socket.try(cmdt.host, "missing hostname");
+    socket.try(cmdt.command, "missing command");
+    var f = open(cmdt.host, cmdt.port, cmdt.create);
+    f->greet();
+    f->login(cmdt.user, cmdt.password);
+    f.try(f.tp->command(cmdt.command, cmdt.argument));
+    if( cmdt.check ) { f.try(f.tp->check(cmdt.check)); }
+    f->quit();
+    return f->close();
+});
+
+_M.get = socket.protect(function(gett) {
+    if( base.type(gett) == "string" ) { return sget(gett);
+    } else { return tget(gett); }
+});
+
+return _M;

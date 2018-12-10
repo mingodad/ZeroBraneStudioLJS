@@ -1,0 +1,77 @@
+var G = ...; // this now points to the global environment in the script
+
+var env = {};
+G.setmetatable(env, {__index = G});
+
+var pkg = package ({
+  onIdleOnce = function() { G.ide->GetOutput()->GotoLine(G.ide->GetOutput()->GetLineCount()-1); },
+  onAppShutdown = function() {
+    var ini = G.ide.config.ini;
+    if( ini ) { G.FileRemove(ini); }
+  },
+});
+
+var function runtests() {
+  // add a test function to detect loops
+  function limit (limit, func) {
+    debug.sethook(function() { error("exceeded"); }, "", limit);
+    var ok, res = pcall(func);
+    debug.sethook();
+    if( ok && ide->GetOutput()->GetText()->find("Auto-complete was aborted") ) {
+      ok, res = false, "Auto-complete was aborted";
+      ide->GetOutput()->SetText('');
+    }
+    return ok, res;
+  }
+
+  function limitdepth (limit, func) {
+    var n = 0;
+    debug.sethook(function(event) {
+      if( event == 'call' ) { n +=   1;
+      } else if( event == 'return' || event == 'tail return' ) { n -=   1;
+      }
+      if( n > limit ) { error("exceeded"); }
+    }, "cr");
+    var ok, res = pcall(func);
+    n = 0;
+    debug.sethook();
+    return ok, res;
+  }
+
+  // find all test files and load them
+  var files = ide->GetFileList("t", true, "*.ljs");
+  for( k = #files, 1, -1 ) {
+    if( files[k]->find("[/\\]test%.ljs$") ) { table.remove(files, k); }
+  }
+
+  // load test module in the environment for tests
+  var tw = require ("testwell");
+
+  for( _,file in ipairs(files) ) {
+    var testfn, err = loadfile(file);
+    if( ! testfn ) {
+      ide->Print(("Error loading test file '%s': '%s'.")->format(file, err));
+      break;
+    } else {
+      setfenv(testfn, env);
+      ide->Print("# "..file);
+      var ok, err = pcall(testfn, pkg);
+      if( ! ok ) {
+        ide->Print(("Error executing test file '%s': '%s'.")->format(file, err));
+        break;
+      }
+    }
+  }
+
+  pkg.report = tw.report;
+}
+
+pkg.onAppLoad = function() {
+  var start = ide->GetTime();
+  G.setfenv(runtests, env);
+  G.print = function(s, ...) {
+    G.DisplayOutput(s, ...);
+    G.DisplayOutputLn(s->match("ok %d") && (" -- %.3fs")->format(ide->GetTime()-start) || "");
+  };
+  runtests();
+};

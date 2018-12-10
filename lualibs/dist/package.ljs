@@ -1,0 +1,597 @@
+// Package functions
+
+module ("dist.package", package.seeall);
+
+var cfg = require ("dist.config");
+var git = require ("dist.git");
+var sys = require ("dist.sys");
+var mf = require ("dist.manifest");
+var utils = require ("dist.utils");
+var depends = require ("dist.depends");
+
+// Return whether the package in given 'pkg_dir' is of a source type.
+function is_source_type(pkg_dir) {
+    assert(type(pkg_dir) == "string", "package.is_source_type: Argument 'pkg_dir' is not a string.");
+    pkg_dir = sys.abs_path(pkg_dir);
+    return utils.to_boolean(sys.exists(sys.make_path(pkg_dir, "CMakeLists.txt")));
+}
+
+// Ensure proper arch and type for the given source 'dist_info' table and return it.
+// WARNING: this function should be used only for 'dist_info' tables of modules that are of a source type!
+function ensure_source_arch_and_type(dist_info) {
+    assert(type(dist_info) == "table", "package.ensure_source_arch_and_type: Argument 'dist_info' is not a table.");
+    dist_info.arch = dist_info.arch || "Universal";
+    dist_info.type = dist_info.type || "source";
+    return dist_info;
+}
+
+// Remove package from 'pkg_distinfo_dir' of 'deploy_dir'.
+function remove_pkg(pkg_distinfo_dir, deploy_dir) {
+    deploy_dir = deploy_dir || cfg.root_dir;
+    assert(type(pkg_distinfo_dir) == "string", "package.remove_pkg: Argument 'pkg_distinfo_dir' is not a string.");
+    assert(type(deploy_dir) == "string", "package.remove_pkg: Argument 'deploy_dir' is not a string.");
+    deploy_dir = sys.abs_path(deploy_dir);
+
+    var abs_pkg_distinfo_dir = sys.make_path(deploy_dir, pkg_distinfo_dir);
+
+    // check for 'dist.info'
+    var info, err = mf.load_distinfo(sys.make_path(abs_pkg_distinfo_dir, "dist.info"));
+    if( ! info ) { return null, "Error removing package from '" .. pkg_distinfo_dir .. "' - it doesn't contain valid 'dist.info' file."; }
+    if( ! info.files ) { return null, "File '" .. sys.make_path(pkg_distinfo_dir, "dist.info") .."' doesn't contain list of installed files."; }
+
+    // remove files installed as components of this package
+    for( _, component in ipairs(cfg.components) ) {
+        if( info.files[component] ) {
+            for( i = #info.files[component], 1, -1 ) {
+                var f = info.files[component][i];
+                f = sys.make_path(deploy_dir,f);
+                if( sys.is_file(f) ) {
+                    sys.delete(f);
+                } else if( sys.is_dir(f) ) {
+                    var dir_files, err = sys.get_file_list(f);
+                    if( ! dir_files ) { return null, "Error removing package in '" .. abs_pkg_distinfo_dir .. "': " .. err; }
+                    if( #dir_files == 0 ) { sys.delete(f); }
+                }
+                // delete also all parent directories if empty
+                var parents = sys.parents_up_to(f, deploy_dir);
+                for( _, parent in ipairs(parents) ) {
+                    if( sys.is_dir(parent) ) {
+                        var dir_files, err = sys.get_file_list(parent);
+                        if( ! dir_files ) { return null, "Error removing package in '" .. abs_pkg_distinfo_dir .. "': " .. err; }
+                        if( #dir_files == 0 ) {
+                            sys.delete(parent);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // remove removed components also from 'dist.info'
+    for( _, component in ipairs(cfg.components) ) {
+        info.files[component] = null;
+    }
+
+    // delete the package information from deploy_dir
+    var ok = sys.delete(abs_pkg_distinfo_dir);
+    if( ! ok ) { return null, "Error removing package in '" .. abs_pkg_distinfo_dir .. "'."; }
+
+    // if the package was not completely removed (e.g. some components remain),
+    // save the new version of its 'dist.info'
+    var comp_num = 0;
+    for( _, _ in pairs(info.files) ) { comp_num  +=   1; }
+    if( comp_num != 0 ) {
+        sys.make_dir(abs_pkg_distinfo_dir);
+        var ok, err = mf.save_distinfo(info, sys.make_path(abs_pkg_distinfo_dir, "dist.info"));
+        if( ! ok ) { return null, "Error resaving the 'dist.info': " .. err; }
+    }
+
+    return ok;
+}
+
+// Install package from 'pkg_dir' to 'deploy_dir', using optional CMake 'variables'.
+// Optional 'preserve_pkg_dir' argument specified whether to preserve the 'pkg_dir'.
+function install_pkg(pkg_dir, deploy_dir, variables, preserve_pkg_dir) {
+    deploy_dir = deploy_dir || cfg.root_dir;
+    variables = variables || {};
+    preserve_pkg_dir = preserve_pkg_dir || false;
+
+    assert(type(pkg_dir) == "string", "package.install_pkg: Argument 'pkg_dir' is not a string.");
+    assert(type(deploy_dir) == "string", "package.install_pkg: Argument 'deploy_dir' is not a string.");
+    assert(type(variables) == "table", "package.install_pkg: Argument 'variables' is not a table.");
+    assert(type(preserve_pkg_dir) == "boolean", "package.install_pkg: Argument 'preserve_pkg_dir' is not a boolean.");
+
+    pkg_dir = sys.abs_path(pkg_dir);
+    deploy_dir = sys.abs_path(deploy_dir);
+
+    // check for dist.info
+    var info, err = mf.load_distinfo(sys.make_path(pkg_dir, "dist.info"));
+    if( ! info ) { return null, "Error installing: the directory '" .. pkg_dir .. "' doesn't exist or doesn't contain valid 'dist.info' file."; }
+
+    // check if the package is source
+    if( is_source_type(pkg_dir) ) { info = ensure_source_arch_and_type(info); }
+
+    // check package's architecture
+    if( ! (info.arch == "Universal" || info.arch == cfg.arch) ) {
+        return null, "Error installing '" .. info.name .. "-" .. info.version .. "': architecture '" .. info.arch .. "' is not suitable for this machine.";
+    }
+
+    // check package's type
+    if( ! (info.type == "all" || info.type == "source" || info.type == cfg.type) ) {
+        return null, "Error installing '" .. info.name .. "-" .. info.version .. "': architecture type '" .. info.type .. "' is not suitable for this machine.";
+    }
+
+    var ok;
+
+    // if package is of binary type, just deploy it
+    if( info.type != "source" ) {
+        ok, err = deploy_binary_pkg(pkg_dir, deploy_dir);
+
+    // else build and then deploy
+    } else {
+
+        // check if we have cmake
+        ok = utils.system_dependency_available("cmake", "cmake --version");
+        if( ! ok ) { return null, "Error when installing: Command 'cmake' not available on the system."; }
+
+        // set cmake variables
+        var cmake_variables = {};
+
+        // set variables from config file
+        for( k, v in pairs(cfg.variables) ) {
+            cmake_variables[k] = v;
+        }
+
+        // set variables specified as argument
+        for( k, v in pairs(variables) ) {
+            cmake_variables[k] = v;
+        }
+
+        cmake_variables.CMAKE_INCLUDE_PATH = table.concat({cmake_variables.CMAKE_INCLUDE_PATH || "", sys.make_path(deploy_dir, "include")}, ";");
+        cmake_variables.CMAKE_LIBRARY_PATH = table.concat({cmake_variables.CMAKE_LIBRARY_PATH || "", sys.make_path(deploy_dir, "lib"), sys.make_path(deploy_dir, "bin")}, ";");
+        cmake_variables.CMAKE_PROGRAM_PATH = table.concat({cmake_variables.CMAKE_PROGRAM_PATH || "", sys.make_path(deploy_dir, "bin")}, ";");
+
+        // build the package and deploy it
+        ok, err = build_pkg(pkg_dir, deploy_dir, cmake_variables);
+        if( ! ok ) { return null, err; }
+
+    }
+
+    // delete directory of fetched package
+    if( ! (cfg.debug || preserve_pkg_dir) ) { sys.delete(pkg_dir); }
+
+    return ok, err;
+}
+
+// Build and deploy package from 'src_dir' to 'deploy_dir' using 'variables'.
+// Return directory to which the package was built or nil on error.
+// 'variables' is table of optional CMake variables.
+function build_pkg(src_dir, deploy_dir, variables) {
+    deploy_dir = deploy_dir || cfg.root_dir;
+    variables = variables || {};
+
+    assert(type(src_dir) == "string", "package.build_pkg: Argument 'src_dir' is not a string.");
+    assert(type(deploy_dir) == "string", "package.build_pkg: Argument 'deploy_dir' is not a string.");
+    assert(type(variables) == "table", "package.build_pkg: Argument 'variables' is not a table.");
+
+    src_dir = sys.abs_path(src_dir);
+    deploy_dir = sys.abs_path(deploy_dir);
+
+    // check for dist.info
+    var info, err = mf.load_distinfo(sys.make_path(src_dir, "dist.info"));
+    if( ! info ) { return null, "Error building package from '" .. src_dir .. "': it doesn't contain valid 'dist.info' file."; }
+    var pkg_name = info.name .. "-" .. info.version;
+
+    // set machine information
+    info.arch = cfg.arch;
+    info.type = cfg.type;
+
+    // create CMake build dir
+    var cmake_build_dir = sys.abs_path(sys.make_path(deploy_dir, cfg.temp_dir, pkg_name .. "-CMake-build"));
+    sys.make_dir(cmake_build_dir);
+
+    // create cmake cache
+    variables["CMAKE_INSTALL_PREFIX"] = deploy_dir;
+    var cache_file = io.open(sys.make_path(cmake_build_dir, "cache.cmake"), "w");
+    if( ! cache_file ) { return null, "Error creating CMake cache file in '" .. cmake_build_dir .. "'"; }
+
+    // Fill in cache variables
+    for( k,v in pairs(variables) ) {
+        cache_file->write("SET(" .. k .. " " .. sys.quote(v)->gsub("\\+", "/") .. " CACHE STRING \"\" FORCE)\n");
+    }
+
+    // If user cache file is provided then append it
+    if( cfg.cache_file != "" ) {
+        var user_cache = io.open(sys.abs_path(cfg.cache_file), "r");
+        if( user_cache ) {
+            cache_file->write(user_cache->read("*all").."\n");
+            user_cache->close();
+        }
+    }
+    cache_file->close();
+
+    src_dir = sys.abs_path(src_dir);
+    print("Building " .. sys.extract_name(src_dir) .. "...");
+
+    // set cmake cache command
+    var cache_command = cfg.cache_command;
+    if( cfg.debug ) { cache_command = cache_command .. " " .. cfg.cache_debug_options; }
+
+    // set cmake build command
+    var build_command = cfg.build_command;
+    if( cfg.debug ) { build_command = build_command .. " " .. cfg.build_debug_options; }
+
+    // set the cmake cache
+    var ok = sys.exec("cd " .. sys.quote(cmake_build_dir) .. " && " .. cache_command .. " " .. sys.quote(src_dir));
+    if( ! ok ) { return null, "Error preloading the CMake cache script '" .. sys.make_path(cmake_build_dir, "cache.cmake") .. "'"; }
+
+    // build with cmake
+    ok = sys.exec("cd " .. sys.quote(cmake_build_dir) .. " && " .. build_command);
+    if( ! ok ) { return null, "Error building with CMake in directory '" .. cmake_build_dir .. "'"; }
+
+    // if this is only simulation, exit sucessfully, skipping the next actions
+    if( cfg.simulate ) {
+        return true, "Simulated build and deployment of package '" .. pkg_name .. "' sucessfull.";
+    }
+
+    // table to collect files installed in the components
+    info.files = {};
+
+    // install the components
+    for( _, component in ipairs(cfg.components) ) {
+        var strip_option = "";
+        if( ! cfg.debug && component != "Library" ) { strip_option = cfg.strip_option; }
+
+        var ok = sys.exec("cd " .. sys.quote(cmake_build_dir) .. " && " .. cfg.cmake .. " " .. strip_option .. " " ..cfg.install_component_command->gsub("#COMPONENT#", component));
+
+        if( ! ok ) { return null, "Error when installing the component '" .. component .. "' with CMake in directory '" .. cmake_build_dir .. "'"; }
+
+        var install_mf = sys.make_path(cmake_build_dir, "install_manifest_" .. component .. ".txt");
+        var mf, err;
+        var component_files = {};
+
+        // collect files installed in this component
+        if( sys.exists(install_mf) ) {
+            mf, err = io.open(install_mf, "r");
+            if( ! mf ) { return null, "Error when opening the CMake installation manifest '" .. install_mf .. "': " .. err; }
+            for( line in mf->lines() ) {
+                line = sys.check_separators(line);
+                var file = line->gsub(utils.escape_magic(deploy_dir .. sys.path_separator()), "");
+                table.insert(component_files, file);
+            }
+            mf->close();
+
+            // add list of component files to the 'dist.info'
+            if( #component_files > 0 ) { info.files[component] = component_files; }
+        }
+    }
+//    if bookmark == 0 then return nil, "Package did not install any files!" end
+
+    // test with ctest
+    if( cfg.test ) {
+        print("Testing " .. sys.extract_name(src_dir) .. " ...");
+        ok = sys.exec("cd " .. sys.quote(deploy_dir) .. " && " .. cfg.test_command);
+        if( ! ok ) { return null, "Error when testing the module '" .. pkg_name .. "' with CTest."; }
+    }
+
+    // save modified 'dist.info' file
+    var pkg_distinfo_dir = sys.make_path(deploy_dir, cfg.distinfos_dir, pkg_name);
+    sys.make_dir(pkg_distinfo_dir);
+    ok, err = mf.save_distinfo(info, sys.make_path(pkg_distinfo_dir, "dist.info"));
+    if( ! ok ) { return null, err; }
+
+    // clean up
+    if( ! cfg.debug ) { sys.delete(cmake_build_dir); }
+
+    return true, "Package '" .. pkg_name .. "' successfully builded and deployed to '" .. deploy_dir .. "'.";
+}
+
+// Deploy binary package from 'pkg_dir' to 'deploy_dir' by copying.
+function deploy_binary_pkg(pkg_dir, deploy_dir) {
+    deploy_dir = deploy_dir || cfg.root_dir;
+
+    assert(type(pkg_dir) == "string", "package.deploy_binary_pkg: Argument 'pkg_dir' is not a string.");
+    assert(type(deploy_dir) == "string", "package.deploy_binary_pkg: Argument 'deploy_dir' is not a string.");
+
+    pkg_dir = sys.abs_path(pkg_dir);
+    deploy_dir = sys.abs_path(deploy_dir);
+
+    // check for dist.info
+    var info, err = mf.load_distinfo(sys.make_path(pkg_dir, "dist.info"));
+    if( ! info ) { return null, "Error deploying package from '" .. pkg_dir .. "': it doesn't contain valid 'dist.info' file."; }
+    var pkg_name = info.name .. "-" .. info.version;
+
+    // if this is only simulation, exit sucessfully, skipping the next actions
+    if( cfg.simulate ) {
+        return true, "Simulated deployment of package '" .. pkg_name .. "' sucessfull.";
+    }
+
+    // copy all components of the module to the deploy_dir
+    for( _, component in ipairs(cfg.components) ) {
+        if( info.files[component] ) {
+            for( _, file in ipairs(info.files[component]) ) {
+                var dest_dir = sys.make_path(deploy_dir, sys.parent_dir(file));
+
+                var ok, err = sys.make_dir(dest_dir);
+                if( ! ok ) { return null, "Error when deploying package '" .. pkg_name .. "': cannot create directory '" .. dest_dir .. "': " .. err; }
+
+                ok, err = sys.copy(sys.make_path(pkg_dir, file), dest_dir);
+                if( ! ok ) { return null, "Error when deploying package '" .. pkg_name .. "': cannot copy file '" .. file .. "' to the directory '" .. dest_dir .. "': " .. err; }
+            }
+        }
+    }
+
+    // copy dist.info to register the module as installed
+    var pkg_distinfo_dir = sys.make_path(deploy_dir, cfg.distinfos_dir, pkg_name);
+    sys.make_dir(pkg_distinfo_dir);
+    ok, err = mf.save_distinfo(info, sys.make_path(pkg_distinfo_dir, "dist.info"));
+    if( ! ok ) { return null, err; }
+
+    return true, "Package '" .. pkg_name .. "' successfully deployed to '" .. deploy_dir .. "'.";
+}
+
+// Fetch package (table 'pkg') to download_dir. Return the original 'pkg' table
+// with 'pkg.download_dir' containing path to the directory of the
+// downloaded package.
+//
+// When optional 'suppress_printing' parameter is set to true, then messages
+// for the user won't be printed during run of this function.
+//
+// If the 'pkg' already contains the information about download directory (pkg.download_dir),
+// we assume the package was already downloaded there and won't download it again.
+function fetch_pkg(pkg, download_dir, suppress_printing) {
+    download_dir = download_dir || sys.current_dir();
+    suppress_printing = suppress_printing || false;
+    assert(type(pkg) == "table", "package.fetch_pkg: Argument 'pkg' is not a table.");
+    assert(type(download_dir) == "string", "package.fetch_pkg: Argument 'download_dir' is not a string.");
+    assert(type(suppress_printing) == "boolean", "package.fetch_pkg: Argument 'suppress_printing' is not a boolean.");
+    assert(type(pkg.name) == "string", "package.fetch_pkg: Argument 'pkg.name' is not a string.");
+    assert(type(pkg.version) == "string", "package.fetch_pkg: Argument 'pkg.version' is not a string.");
+
+    // if the package is already downloaded don't download it again
+    if( pkg.download_dir ) { return pkg; }
+
+    assert(type(pkg.path) == "string", "package.fetch_pkg: Argument 'pkg.path' is not a string.");
+    download_dir = sys.abs_path(download_dir);
+
+    var pkg_full_name = pkg.name .. "-" .. pkg.version;
+    var repo_url = pkg.path;
+    var clone_dir = sys.abs_path(sys.make_path(download_dir, pkg_full_name));
+    pkg.download_dir = clone_dir;
+
+    // check if download_dir already exists, assuming the package was already downloaded
+    if( sys.exists(sys.make_path(clone_dir, "dist.info")) ) {
+        if( cfg.cache && ! utils.cache_timeout_expired(cfg.cache_timeout, clone_dir) ) {
+            if( ! suppress_printing ) { print("'" .. pkg_full_name .. "' already in cache, skipping downloading (use '-cache=false' to force download)."); }
+            return pkg;
+        } else {
+            sys.delete(sys.make_path(clone_dir));
+        }
+    }
+
+    var bin_tag = pkg.version .. "-" .. cfg.arch .. "-" .. cfg.type;
+    var use_binary = false;
+
+    if( cfg.binary ) {
+        // check if binary version of the module for this arch & type available
+        var avail_tags, err = git.get_remote_tags(repo_url);
+        if( ! avail_tags ) { return null, err; }
+
+        if( utils.contains(avail_tags, bin_tag) ) {
+            use_binary = true;
+        }
+    }
+
+    // init the git repository
+    var ok, err = git.create_repo(clone_dir);
+    if( ! ok ) { return null, err; }
+
+    // Fetch the desired ref (from the pkg's remote repo) and checkout into it.
+
+    if( use_binary ) {
+
+        if( ! suppress_printing ) { print("Getting " .. pkg_full_name .. " (binary)..."); }
+
+        // We fetch the binary tag.
+        var sha;
+        if( ok ) { sha, err = git.fetch_tag(clone_dir, repo_url, bin_tag); }
+        if( sha ) { ok, err = git.checkout_sha(sha, clone_dir); }
+
+    } else if( cfg.source ) {
+
+        if( ! suppress_printing ) { print("Getting " .. pkg_full_name .. " (source)..."); }
+
+        // If we want the 'scm' version, we fetch the 'master' branch, otherwise
+        // we fetch the tag, matching the desired package version.
+        if( ok && pkg.version != "scm" ) {
+            var sha;
+            sha, err = git.fetch_tag(clone_dir, repo_url, pkg.version);
+            if( sha ) { ok, err = git.checkout_sha(sha, clone_dir); }
+        } else if( ok ) {
+            var sha;
+            sha, err = git.fetch_branch(clone_dir, repo_url, "master");
+            if( sha ) { ok, err = git.checkout_sha(sha, clone_dir); }
+        }
+
+    } else {
+        ok = false;
+        if( cfg.binary ) {
+            err = "Binary version of module not available and using source modules disabled.";
+        } else {
+            err = "Using both binary and source modules disabled.";
+        }
+    }
+
+    if( ! ok ) {
+        // clean up
+        if( ! cfg.debug ) { sys.delete(clone_dir); }
+        return null, "Error fetching package '" .. pkg_full_name .. "' from '" .. pkg.path .. "' to '" .. download_dir .. "': " .. err;
+    }
+
+    // delete '.git' directory
+    if( ! cfg.debug ) { sys.delete(sys.make_path(clone_dir, ".git")); }
+
+    return pkg;
+}
+
+// Return table with information about available versions of 'package'.
+//
+// When optional 'suppress_printing' parameter is set to true, then messages
+// for the user won't be printed during run of this function.
+function retrieve_versions(package, manifest, suppress_printing) {
+    suppress_printing = suppress_printing || false;
+    assert(type(package) == "string", "package.retrieve_versions: Argument 'string' is not a string.");
+    assert(type(manifest) == "table", "package.retrieve_versions: Argument 'manifest' is not a table.");
+    assert(type(suppress_printing) == "boolean", "package.retrieve_versions: Argument 'suppress_printing' is not a boolean.");
+
+    // get package table
+    var pkg_name = depends.split_name_constraint(package);
+    var tmp_packages = depends.find_packages(pkg_name, manifest);
+
+    if( #tmp_packages == 0 ) {
+        return null, "No suitable candidate for package '" .. package .. "' found.";
+    } else {
+        package = tmp_packages[1];
+    }
+
+    // if the package's already downloaded, we assume it's desired to install the downloaded version
+    if( package.download_dir ) {
+        var pkg_type = "binary";
+        if( is_source_type(package.download_dir) ) { pkg_type = "source"; }
+        if( ! suppress_printing ) { print("Using " .. package.name .. "-" .. package.version .. " (" .. pkg_type .. ") provided by " .. package.download_dir); }
+        return {package};
+    }
+
+    if( ! suppress_printing ) { print("Finding out available versions of " .. package.name .. "..."); }
+
+    // get available versions
+    var tags, err = git.get_remote_tags(package.path);
+    if( ! tags ) { return null, "Error when retrieving versions of package '" .. package.name .. "': " .. err; }
+
+    // filter out tags of binary packages
+    var versions = utils.filter(tags, function (tag) { return tag->match("^[^%-]+%-?[^%-]*$") && true; });
+
+    packages = {};
+
+    // create package information
+    for( _, version in pairs(versions) ) {
+        pkg = {};
+        pkg.name = package.name;
+        pkg.version = version;
+        pkg.path = package.path;
+        table.insert(packages, pkg);
+    }
+
+    return packages;
+}
+
+// Return table with information from package's dist.info and path to downloaded
+// package. Optional argument 'deploy_dir' is used just as a temporary
+// place to place the downloaded packages into.
+//
+// When optional 'suppress_printing' parameter is set to true, then messages
+// for the user won't be printed during the execution of this function.
+function retrieve_pkg_info(package, deploy_dir, suppress_printing) {
+    deploy_dir = deploy_dir || cfg.root_dir;
+    assert(type(package) == "table", "package.retrieve_pkg_info: Argument 'package' is not a table.");
+    assert(type(deploy_dir) == "string", "package.retrieve_pkg_info: Argument 'deploy_dir' is not a string.");
+    deploy_dir = sys.abs_path(deploy_dir);
+
+    var tmp_dir = sys.abs_path(sys.make_path(deploy_dir, cfg.temp_dir));
+
+    // download the package
+    var fetched_pkg, err = fetch_pkg(package, tmp_dir, suppress_printing);
+    if( ! fetched_pkg ) { return null, "Error when retrieving the info about '" .. package.name .. "': " .. err; }
+
+    // load information from 'dist.info'
+    var info;
+    info, err = mf.load_distinfo(sys.make_path(fetched_pkg.download_dir, "dist.info"));
+    if( ! info ) { return null, err; }
+
+    // add other attributes
+    if( package.path ) { info.path = package.path; }
+    if( package.was_scm_version ) { info.was_scm_version = package.was_scm_version; }
+
+    // set default arch/type if not explicitly stated and package is of source type
+    if( is_source_type(fetched_pkg.download_dir) ) {
+        info = ensure_source_arch_and_type(info);
+    } else if( ! (info.arch && info.type) ) {
+        return null, fetched_pkg.download_dir .. ": binary package missing arch or type in 'dist.info'.";
+    }
+
+    return info, fetched_pkg.download_dir;
+}
+
+// Return manifest, augmented with info about all available versions
+// of package 'pkg'. Optional argument 'deploy_dir' is used just as a temporary
+// place to place the downloaded packages into.
+// Optional argument 'installed' is manifest of all installed packages. When
+// specified, info from installed packages won't be downloaded from repo,
+// but the dist.info from installed package will be used.
+function get_versions_info(pkg, manifest, deploy_dir, installed) {
+    deploy_dir = deploy_dir || cfg.root_dir;
+    assert(type(pkg) == "string", "package.get_versions_info: Argument 'pkg' is not a string.");
+    assert(type(manifest) == "table", "package.get_versions_info: Argument 'manifest' is not a table.");
+    assert(type(deploy_dir) == "string", "package.get_versions_info: Argument 'deploy_dir' is not a string.");
+    deploy_dir = sys.abs_path(deploy_dir);
+
+    // find all available versions of package
+    var versions, err = retrieve_versions(pkg, manifest);
+    if( ! versions ) { return null, err; }
+
+    // collect info about all retrieved versions
+    var infos = {};
+    for( _, version in pairs(versions) ) {
+
+        var info, path_or_err;
+        var installed_version = {};
+
+        // find out whether this 'version' is installed so we can use it's dist.info
+        if( type(installed) == "table" ) { installed_version = depends.find_packages(version.name .. "-" .. version.version, installed); }
+
+        // get info
+        if( #installed_version > 0 ) {
+            print("Using dist.info from installed " .. version.name .. "-" .. version.version);
+            info = installed_version[1];
+            info.path = version.path;
+            info.from_installed = true;  // flag that dist.info of installed package was used
+        } else {
+            info, path_or_err = retrieve_pkg_info(version, deploy_dir);
+            if( ! info ) { return null, path_or_err; }
+            sys.delete(path_or_err);
+        }
+        table.insert(infos, info);
+    }
+
+    // found and add an implicit 'scm' version
+    var pkg_name = depends.split_name_constraint(pkg);
+    var found = depends.find_packages(pkg_name, manifest);
+    if( #found == 0 ) { return null, "No suitable candidate for package '" .. pkg .. "' found."; }
+    var scm_info, path_or_err = retrieve_pkg_info({name = pkg_name, version = "scm", path = found[1].path});
+    if( ! scm_info ) { return null, path_or_err; }
+    sys.delete(path_or_err);
+    scm_info.version = "scm";
+    table.insert(infos, scm_info);
+
+    var tmp_manifest = utils.deepcopy(manifest);
+
+    // add collected info to the temp. manifest, replacing existing tables
+    for( _, info in pairs(infos) ) {
+        var already_in_manifest = false;
+        // find if this version is already in manifest
+        for( idx, pkg in ipairs(tmp_manifest) ) {
+            // if yes, replace it
+            if( pkg.name == info.name && pkg.version == info.version ) {
+                tmp_manifest[idx] = info;
+                already_in_manifest = true;
+                break;
+            }
+        }
+        // if not, just normally add to the manifest
+        if( ! already_in_manifest ) {
+            table.insert(tmp_manifest, info);
+        }
+    }
+
+    return tmp_manifest;
+}

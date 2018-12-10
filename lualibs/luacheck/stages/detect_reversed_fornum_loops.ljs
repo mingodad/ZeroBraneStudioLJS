@@ -1,0 +1,39 @@
+var core_utils = require ("luacheck.core_utils");
+
+var stage = {};
+
+stage.warnings = {
+   ["571"] = {message_format = "numeric for loop goes from #(expr) down to {limit} but loop step is not negative",
+      fields = {"limit"}}
+};
+
+var function check_fornum(chstate, node) {
+   if( node[2].tag != "Op" || node[2][1] != "len" ) {
+      return;
+   }
+
+   var limit, limit_repr = core_utils.eval_const_node(node[3]);
+
+   if( ! limit || limit > 1 ) {
+      return;
+   }
+
+   var step = 1;
+
+   if( node[5] ) {
+      step = core_utils.eval_const_node(node[4]);
+   }
+
+   if( step && step >= 0 ) {
+      chstate->warn_range("571", node, {
+         limit = limit_repr
+      });
+   }
+}
+
+// Warns about loops trying to go from `#(expr)` to `1` with positive step.
+function stage.run(chstate) {
+   core_utils.each_statement(chstate, {"Fornum"}, check_fornum);
+}
+
+return stage;

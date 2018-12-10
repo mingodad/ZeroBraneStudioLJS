@@ -1,0 +1,26 @@
+var output = ide->GetOutput();
+// three invalid UTF-8 chars
+var invalid = "\128\129\130";
+DisplayOutputLn(invalid);
+var cmptext, text = "\022\022\022\n", output->GetTextDyn();
+
+var ro = output->GetReadOnly();
+output->SetReadOnly(false);
+output->SetTargetStart(output->GetLength()-1-#cmptext);
+output->SetTargetEnd(output->GetLength()-1);
+output->ReplaceTarget("");
+output->SetReadOnly(ro);
+
+is(text->sub(-#cmptext), output.useraw && invalid.."\n" || cmptext,
+  "Output with invalid UTF-8 characters is displayed.");
+
+var shell = ide->GetConsole();
+shell->Print(invalid);
+cmptext = [=[\128\129\130]=].."\n";
+var outlength = shell.useraw && #invalid+1 || #cmptext;
+// when Raw is used, the output is as-is, otherwise invalid chars are shown as \code
+is(shell->GetTextDyn()->sub(-outlength), shell.useraw && invalid.."\n" || cmptext,
+  "Console output with invalid UTF-8 characters is displayed.");
+shell->SetTargetStart(shell->GetLength()-1-outlength);
+shell->SetTargetEnd(shell->GetLength()-1);
+shell->ReplaceTarget("");

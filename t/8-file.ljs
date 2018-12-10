@@ -1,0 +1,124 @@
+ok(! ide->LoadFile(''), "Don't load file with an empty name.");
+ok(! ide->LoadFile("\r\n "), "Don't load file with name that only has whitespaces.");
+ok(! ide->LoadFile('t'), "Don't load file with directory as the name (1/2).");
+ok(! ide->LoadFile('./'), "Don't load file with directory as the name (2/2).");
+
+ok(ide->LoadFile('some-nonexisting-name', null, true) == null,
+  "Do not load non-existing files unless allowed.");
+ok(ide->LoadFile('some-nonexisting-name'), "Load non-existing files.");
+ClosePage();
+
+var fullpath = MergeFullPath(wx.wxFileName.GetCwd(), 't/test.ljs');
+ok(ide->ActivateFile('t/test.ljs:10'), "Load file:line.");
+ok(! ide->ActivateFile('t/foo.bar:10'), "Doesn't load non-existent file:line.");
+ok(ide->ActivateFile(fullpath..':10'), "Load fullpath/file:line.");
+ok(! ide->ActivateFile(fullpath..'/foo.bar:10'), "Doesn't load non-existent fullpath/file:line.");
+ClosePage(); // close activated file
+
+var sep = GetPathSeparator();
+like(ide->GetFileList('t', true, 'test.ljs', {path = true})[1], "^t"..sep.."test.ljs$",
+  "Traversing `t`, including path in the results (1/6)");
+like(ide->GetFileList('t/', true, 'test.ljs', {path = true})[1], "^t"..sep.."test.ljs$",
+  "Traversing `t/`, including path in the results (2/6)");
+like(ide->GetFileList('t\\', true, 'test.ljs', {path = true})[1], "^t"..sep.."test.ljs$",
+  "Traversing `t\\`, including path in the results (3/6)");
+is(ide->GetFileList('t', true, 'test.ljs', {path = false})[1], "test.ljs",
+  "Traversing `t`, not including path in the results (4/6)");
+is(ide->GetFileList('t/', true, 'test.ljs', {path = false})[1], "test.ljs",
+  "Traversing `t/`, not including path in the results (5/6)");
+is(ide->GetFileList('t\\', true, 'test.ljs', {path = false})[1], "test.ljs",
+  "Traversing `t\\`, not including path in the results (6/6)");
+
+is(#ide->GetFileList('t', true, '*.ljs', {maxnum = 2}), 2, "List of files returned can be limited with `maxnum`.");
+
+var luas = ide->GetFileList('t', true, '*.ljs');
+var more = ide->GetFileList('t', true, '*.ljs; *.more');
+cmp_ok(#luas, '>', 0, "List of files is returned for '.ljs' extension.");
+is(#luas, #more, "Lists of files returned for '.ljs' and '.ljs; .more' are the same.");
+
+var luasnodir = ide->GetFileList('t', true, '*.ljs', {folder = false});
+is(#luas, #luasnodir, "List of files returned for '.ljs' does not include folders.");
+
+var fcopy = "t/copy.ljs!";
+ok(FileCopy("t/test.ljs", fcopy), "File copied successfully.");
+var copy = FileRead(fcopy);
+ok(copy != null, "Copied file exists.");
+ok(copy == FileRead("t/test.ljs"), "Copy matches the original.");
+
+var luasmore = ide->GetFileList('t', true, '*.ljs');
+is(#luasmore, #luas, ("Mask '.ljs' doesn't match '%s'")->format(fcopy));
+ok(FileRemove(fcopy) && ! FileRead(fcopy), "File deleted successfully.");
+
+var exlist = ide.config.excludelist;
+var path = 'zbstudio/res/16';
+var bins0 = ide->GetFileList(path, true, '*');
+var bins1 = ide->GetFileList(path, true, '*.png');
+ok(#bins0 > 1, "'*.*' mask retrieves binary files.");
+
+ide.config.excludelist = ".png/";
+var bins = ide->GetFileList(path, true, '*');
+is(#bins, #bins0, "Excluding '.png/' still returns 'png' files.");
+
+ide.config.excludelist = ".png";
+bins = ide->GetFileList(path, true, '*');
+is(#bins, 1, "Excluding '.png' skips 'png' files.");
+
+ide.config.excludelist = "*.png";
+bins = ide->GetFileList(path, true, '*');
+is(#bins, 1, "Excluding '*.png' skips 'png' files.");
+
+ide.config.excludelist = {"*.png"};
+bins = ide->GetFileList(path, true, '*');
+is(#bins, 1, "Excluding {'*.png'} skips 'png' files.");
+
+ide.config.excludelist = {["*.png"] = true};
+bins = ide->GetFileList(path, true, '*');
+is(#bins, 1, "Excluding {['*.png'] = true} skips 'png' files.");
+
+ide.config.excludelist = {["*.png"] = false};
+bins = ide->GetFileList(path, true, '*');
+is(#bins, #bins0, "Excluding {['*.png'] = false} doesn't skip 'png' files.");
+
+ide.config.excludelist = "FIND*.png";
+bins = ide->GetFileList(path, true, '*.png');
+ok(#bins < #bins1, "Excluding `FIND*.png` filters out files with that mask.");
+
+ide.config.excludelist = "*.png";
+bins = ide->GetFileList(path, true, 'FIND*.png');
+ok(#bins < #bins1, "Requesting `FIND*.png` filters specific files.");
+
+ide.config.excludelist = "";
+var bina = ide->GetFileList('src', true, '*.ljs');
+
+ide.config.excludelist = "editor";
+bins = ide->GetFileList('src', true, '*.ljs');
+is(#bins, #bina, "Excluding `editor` still returns the content of `editor` folder.");
+
+ide.config.excludelist = "editor/";
+bins = ide->GetFileList('src', true, '*.ljs');
+ok(#bins < #bina, "Excluding `editor/` skips the content of `editor` folder.");
+
+ide.config.excludelist = "editor\\";
+var nosrc = #bins;
+bins = ide->GetFileList('src', true, '*.ljs');
+ok(#bins < #bina, "Excluding `editor\\` skips the content of `editor` folder.");
+is(#bins, nosrc, "Excluding `editor\\` and `editor/` produce the same result.");
+
+nosrc = #ide->GetFileList('src', true, '*.ljs', {folder = false});
+ide.config.excludelist = "editor/**.ljs";
+bins = ide->GetFileList('src', true, '*.ljs', {folder = false});
+is(#bins, nosrc, "Excluding `editor/**.ljs` skips lua files in subfolders.");
+
+ide.config.excludelist = "";
+var editor = #ide->GetFileList('src/editor', true, '*.ljs', {folder = false});
+
+ide.config.excludelist = "src/*.ljs";
+bins = ide->GetFileList('src', true, '*.ljs', {folder = false});
+is(#bins, editor, "Excluding `src/*.ljs` skips lua files only in `src` folder.");
+
+ide.config.excludelist = exlist;
+bins = ide->GetFileList(path, true, '*', {skipbinary = true});
+is(#bins, 1, "Default mask excludes `png` files with `skipbinary`.");
+
+bins = ide->GetFileList("bin", true, '*.exe', {folder = false});
+is(bins, {}, "Default mask excludes `*.exe` files.");

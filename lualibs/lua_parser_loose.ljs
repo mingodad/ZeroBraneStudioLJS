@@ -1,0 +1,345 @@
+/*
+ lua_parser_loose.lua.
+ Loose parsing of Lua code.  See README.
+ (c) 2013 David Manura. MIT License.
+--*/
+
+var PARSE = {};
+
+var unpack = table.unpack || unpack;
+var LEX = require ('lua_lexer_loose');
+
+/*
+ Loose parser.
+
+ lx - lexer stream of Lua tokens.
+ f(event...) - callback function to send events to.
+
+ Events generated:
+   'Var', name, lineinfo - variable declaration that immediately comes into scope.
+   'VarSelf', name, lineinfo - same as 'Var' but for implicit 'self' parameter
+     in method definitions.  lineinfo is zero-width space after '('
+   'VarNext', name, lineinfo - variable definition that comes into scope
+     upon next statement.
+   'VarInside', name, lineinfo - variable definition that comes into scope
+     inside following block.  Used for control variables in 'for' statements.
+   'Id', name, lineinfo - reference to variable.
+   'String', name - string or table field.
+   'Scope', opt - beginning of scope block.
+   'EndScope', nil, lineinfo - end of scope block.
+   'FunctionCall', name, lineinfo - function call (in addition to other events).
+   'Function', name, lineinfo - function definition.
+--*/
+function PARSE.parse_scope(lx, f, level) {
+  var cprev = {tag='Eof'};
+  
+  // stack of scopes.
+  var scopes = {{}};
+  for( l = 2, (level || 1) ) { scopes[l] = {}; }
+  
+  var function scope_begin(opt, lineinfo, nobreak) {
+    scopes[#scopes+1] = {};
+    f('Scope', opt, lineinfo, nobreak);
+  }
+  var function scope_end(opt, lineinfo) {
+    var scope = #scopes;
+    if( scope > 1 ) { table.remove(scopes); }
+    var inside_local = false;
+    for( scope = scope-1, 1, -1 ) {
+      if( scopes[scope].inside_local ) { inside_local = true; break; }
+    }
+    f('EndScope', opt, lineinfo, inside_local);
+  }
+  
+  var function parse_function_list(has_self, name, pos) {
+    var c = lx->next(); assert(c[1] == '(');
+    f('Statement', c[1], c.lineinfo, true); // generate Statement for function definition
+    scope_begin(c[1], c.lineinfo, true);
+
+    var vars = {}; // accumulate vars (if any) to send after 'Function'
+    if( has_self ) {
+      var lineinfo = c.lineinfo+1; // zero size
+      table.insert(vars, {'VarSelf', 'self', lineinfo, true});
+    }
+    while( true ) {
+      var n = lx->peek();
+      if( ! (n.tag == 'Id' || n.tag == 'Keyword' && n[1] == '...') ) { break; }
+      var c = lx->next();
+      if( c.tag == 'Id' ) { table.insert(vars, {'Var', c[1], c.lineinfo, true}); }
+      // ignore '...' in this case
+      if( lx->peek()[1] == ',' ) { lx->next(); }
+    }
+    if( lx->peek()[1] == ')' ) {
+      lx->next();
+      f('Function', name, pos || c.lineinfo, true);
+    }
+    for( _, _v_var in ipairs(vars) ) { f(unpack(_v_var)); }
+  }
+  
+  while( true ) {
+    var c = lx->next();
+
+    // Detect end of previous statement
+    if( c.tag == 'Eof' // trigger 'Statement' at the end of file
+    || c.tag == 'Keyword' && (
+       c[1] == 'break' || c[1] == 'goto' || c[1] == 'do' || c[1] == 'while' ||
+       c[1] == 'repeat' || c[1] == 'if' || c[1] == 'for' || c[1] == 'function' && lx->peek().tag == 'Id' ||
+       c[1] == 'local' || c[1] == ';' || c[1] == 'until' || c[1] == 'return' || c[1] == 'end') ||
+       c.tag == 'Id' &&
+           (cprev.tag == 'Id' ||
+            cprev.tag == 'Keyword' &&
+               (cprev[1] == ']' || cprev[1] == ')' || cprev[1] == '}' ||
+                cprev[1] == '...' || cprev[1] == 'end' ||
+                cprev[1] == 'true' || cprev[1] == 'false' ||
+                cprev[1] == 'nil') ||
+            cprev.tag == 'Number' || cprev.tag == 'String')
+    ) {
+      if( scopes[#scopes].inside_until ) { scope_end(null, c.lineinfo); }
+      var scope = #scopes;
+      if( ! scopes[scope].inside_table ) { scopes[scope].inside_local = null; }
+      f('Statement', c[1], c.lineinfo,
+        scopes[scope].inside_local || c[1] == 'local' || c[1] == 'function' || c[1] == 'end');
+    }
+
+    if( c.tag == 'Eof' ) { break; }
+    
+    // Process token(s)
+    if( c.tag == 'Keyword' ) {
+    
+      if( c[1] == 'local' && lx->peek().tag == 'Keyword' && lx->peek()[1] == 'function' ) {
+        // local function
+        var c = lx->next(); assert(c[1] == 'function');
+        if( lx->peek().tag == 'Id' ) {
+          c = lx->next();
+          f('Var', c[1], c.lineinfo, true);
+          if( lx->peek()[1] == '(' ) { parse_function_list(null, c[1], c.lineinfo); }
+        }
+      } else if( c[1] == 'function' ) {
+        if( lx->peek()[1] == '(' ) { // inline function
+          parse_function_list();
+        } else if( lx->peek().tag == 'Id' ) { // function definition statement
+          c = lx->next(); assert(c.tag == 'Id');
+          var name = c[1];
+          var pos = c.lineinfo;
+          f('Id', name, pos, true);
+          var has_self;
+          while( lx->peek()[1] != '(' && lx->peek().tag != 'Eof' ) {
+            c = lx->next();
+            name = name .. c[1];
+            if( c.tag == 'Id' ) {
+              f('String', c[1], c.lineinfo, true);
+            } else if( c.tag == 'Keyword' && c[1] == ':' ) {
+              has_self = true;
+            }
+          }
+          if( lx->peek()[1] == '(' ) { parse_function_list(has_self, name, pos); }
+        }
+      } else if( c[1] == 'local' && lx->peek().tag == 'Id' ) {
+        scopes[#scopes].inside_local = true;
+        c = lx->next();
+        f('VarNext', c[1], c.lineinfo, true);
+        while( lx->peek().tag == 'Keyword' && lx->peek()[1] == ',' ) {
+          c = lx->next(); if( lx->peek().tag != 'Id' ) { break; }
+          c = lx->next();
+          f('VarNext', c[1], c.lineinfo, true);
+        }
+      } else if( c[1] == 'for' && lx->peek().tag == 'Id' ) {
+        c = lx->next();
+        f('VarInside', c[1], c.lineinfo, true);
+        while( lx->peek().tag == 'Keyword' && lx->peek()[1] == ',' ) {
+          c = lx->next(); if( lx->peek().tag != 'Id' ) { break; }
+          c = lx->next();
+          f('VarInside', c[1], c.lineinfo, true);
+        }
+      } else if( c[1] == 'goto' && lx->peek().tag == 'Id' ) {
+        lx->next();
+      } else if( c[1] == 'do' ) {
+        scope_begin('do', c.lineinfo);
+        // note: do/while/for statement scopes all begin at 'do'.
+      } else if( c[1] == 'repeat' || c[1] == 'then' ) {
+        scope_begin(c[1], c.lineinfo);
+      } else if( c[1] == 'end' || c[1] == 'elseif' ) {
+        scope_end(c[1], c.lineinfo);
+      } else if( c[1] == 'else' ) {
+        scope_end(null, c.lineinfo);
+        scope_begin(c[1], c.lineinfo);
+      } else if( c[1] == 'until' ) {
+        scopes[#scopes].inside_until = true;
+      } else if( c[1] == '{' ) {
+        scopes[#scopes].inside_table = (scopes[#scopes].inside_table || 0) + 1;
+      } else if( c[1] == '}' ) {
+        var newval = (scopes[#scopes].inside_table || 0) - 1;
+        newval = newval >= 1 && newval || null;
+        scopes[#scopes].inside_table = newval;
+      }
+    } else if( c.tag == 'Id' ) {
+      var scope = #scopes;
+      var inside_local = scopes[scope].inside_local != null;
+      var inside_table = scopes[scope].inside_table;
+      var cnext = lx->peek();
+      if( cnext.tag == 'Keyword' && (cnext[1] == '(' || cnext[1] == '{')
+      || cnext.tag == 'String' ) {
+        f('FunctionCall', c[1], c.lineinfo, inside_local);
+      }
+      // either this is inside a table or it continues from a comma,
+      // which may be a field assignment, so assume it's in a table
+      if( (inside_table || cprev[1] == ',') && cnext.tag == 'Keyword' && cnext[1] == '=' ) {
+        // table field; table fields are tricky to handle during incremental
+        // processing as "a = 1" may be either an assignment (in which case
+        // 'a' is Id) or a field initialization (in which case it's a String).
+        // Since it's not possible to decide between two cases in isolation,
+        // this is not a good place to insert a break; instead, the break is
+        // inserted at the location of the previous keyword, which allows
+        // to properly handle those cases. The desired location of
+        // the restart point is returned as the `nobreak` value.
+        f('String', c[1], c.lineinfo,
+          inside_local || cprev && cprev.tag == 'Keyword' && cprev.lineinfo);
+      } else if( cprev.tag == 'Keyword' && (cprev[1] == ':' || cprev[1] == '.') ) {
+        f('String', c[1], c.lineinfo, true);
+      } else {
+        f('Id', c[1], c.lineinfo, true);
+        // this looks like the left side of (multi-variable) assignment
+        // unless it's a part of `= var, field = value`, so skip if inside a table;
+        // also take into account possible field assignment: `a.b, c = value`.
+        // this still doesn't handle indexing with square brackets: `a[b], c = value`.
+        if( ! inside_table && ! (cprev && cprev.tag == 'Keyword' && cprev[1] == '=') ) {
+          var cpeek = lx->peek();
+          while( cpeek && cpeek.tag == 'Keyword' && (cpeek[1] == ',' || cpeek[1] == '.') ) {
+            var c = lx->next(); // skip the keyword
+            if( cpeek[1] == ',' && lx->peek().tag != 'Id' ) { break; }
+
+            c = lx->next();
+            f(cpeek[1] == ',' && 'Id' || 'String', c[1], c.lineinfo, true);
+
+            cpeek = lx->peek();
+          }
+          if( ! cpeek ) { break; }
+        }
+      }
+    }
+    
+    if( c.tag != 'Comment' ) { cprev = c; }
+  }
+}
+
+/*
+  This is similar to parse_scope but determines if variables are local or global.
+
+  lx - lexer stream of Lua tokens.
+  f(event...) - callback function to send events to.
+  
+  Events generated:
+    'Id', name, lineinfo, 'local'|'global'
+     (plus all events in parse_scope)
+--*/
+function PARSE.parse_scope_resolve(lx, f, vars) {
+  var NEXT = {};   // unique key
+  var INSIDE = {}; // unique key
+  var function newscope(vars, opt, lineinfo) {
+    var newvars = opt=='do' && vars[INSIDE] || {};
+    if( newvars == vars[INSIDE] ) { vars[INSIDE] = false; }
+    newvars[INSIDE]=false;
+    newvars[NEXT]=false;
+    var level = (vars[0] || 0) + 1;
+    newvars[0] = level; // keep the current level
+    newvars[-1] = lineinfo; // keep the start of the scope
+    newvars[level] = newvars; // reference the current vars table
+    return setmetatable(newvars, {__index=vars});
+  }
+  
+  vars = vars || newscope({[0] = 0}, null, 1);
+  vars[NEXT] = false; // vars that come into scope upon next statement
+  vars[INSIDE] = false; // vars that come into scope upon entering block
+  PARSE.parse_scope(lx, function(op, name, lineinfo, nobreak) {
+    // in some (rare) cases VarNext can follow Statement event (which copies
+    // vars[NEXT]). This may cause vars[0] to be `nil`, so default to 1.
+    var _v_var = op->find("^Var") &&
+      {fpos = lineinfo, at = (vars[0] || 1) + (op == 'VarInside' && 1 || 0),
+       masked = vars[name], this = (op == 'VarSelf') || null } || null;
+    if( op == 'Var' || op == 'VarSelf' ) {
+      vars[name] = _v_var;
+    } else if( op == 'VarNext' ) {
+      vars[NEXT] = vars[NEXT] || {};
+      vars[NEXT][name] = _v_var;
+    } else if( op == 'VarInside' ) {
+      vars[INSIDE] = vars[INSIDE] || {};
+      vars[INSIDE][name] = _v_var;
+    } else if( op == 'Scope' ) {
+      vars = newscope(vars, name, lineinfo);
+    } else if( op == 'EndScope' ) {
+      var mt = getmetatable(vars);
+      if( mt != null ) { vars = mt.__index; }
+    } else if( op == 'Id'
+    || op == 'String' || op == 'FunctionCall' || op == 'Function' ) {
+      // Just make callback
+    } else if( op == 'Statement' ) { // beginning of statement
+      // Apply vars that come into scope upon beginning of statement.
+      if( vars[NEXT] ) {
+        for( k,v in pairs(vars[NEXT]) ) {
+          vars[k] = v; vars[NEXT][k] = null;
+        }
+      }
+    } else {
+      assert(false);
+    }
+    f(op, name, lineinfo, vars, nobreak);
+  }, vars[0]);
+}
+
+function PARSE.extract_vars(code, f) {
+  var lx = LEX.lexc(code);
+  
+  var char0 = 1;  // next char offset to write
+  var function gen(char1, nextchar0) {
+    char0 = nextchar0;
+  }
+  
+  PARSE.parse_scope_resolve(lx, function(op, name, lineinfo, other) {
+    if( op == 'Id' ) {
+      f('Id', name, other, lineinfo);
+    } else if( op == 'Var' || op == 'VarNext' || op == 'VarInside' ) {
+      gen(lineinfo, lineinfo+#name);
+      f('Var', name, "local", lineinfo);
+    }  // ignore 'VarSelf' and others
+  });
+  gen(#code+1, null);
+}
+
+/*
+  Converts 5.2 code to 5.1 style code with explicit _ENV variables.
+  Example: "function f(_ENV, x) print(x, y)" -->
+            "function _ENV.f(_ENV, x) _ENV.print(x, _ENV.y) end"
+
+  code - string of Lua code.  Assumed to be valid Lua (FIX: 5.1 or 5.2?)
+  f(s) - call back function to send chunks of Lua code output to.  Example: io.stdout.
+--*/
+function PARSE.replace_env(code, f) {
+  if( ! f ) { return PARSE.accumulate(PARSE.replace_env, code); }
+  PARSE.extract_vars(code, function(op, name, other) {
+    if( op == 'Id' ) {
+      f(other == 'global' && '_ENV.' .. name || name);
+    } else if( op == 'Var' || op == 'Other' ) {
+      f(name);
+    }
+  });
+}
+
+// helper function.  Can be passed as argument `f` to functions
+// like `replace_env` above to accumulate fragments into a single string.
+function PARSE.accumulator() {
+  var ts = {};
+  var mt = {};
+  mt.__index = mt;
+  function mt::__call(s) { ts[#ts+1] = s; }
+  function mt::result() { return table.concat(ts); }
+  return setmetatable({}, mt);
+}
+
+// helper function
+function PARSE.accumulate(g, code) {
+  var accum = PARSE.accumulator();
+  g(code, accum);
+  return accum->result();
+}
+
+return PARSE;

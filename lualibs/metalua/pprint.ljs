@@ -1,0 +1,295 @@
+//-----------------------------------------------------------------------------
+// Copyright (c) 2006-2013 Fabien Fleutot and others.
+//
+// All rights reserved.
+//
+// This program and the accompanying materials are made available
+// under the terms of the Eclipse Public License v1.0 which
+// accompanies this distribution, and is available at
+// http://www.eclipse.org/legal/epl-v10.html
+//
+// This program and the accompanying materials are also made available
+// under the terms of the MIT public license which accompanies this
+// distribution, and is available at http://www.lua.org/license.html
+//
+// Contributors:
+//     Fabien Fleutot - API and implementation
+//
+//--------------------------------------------------------------------
+
+//--------------------------------------------------------------------
+//--------------------------------------------------------------------
+//
+// Lua objects pretty-printer
+//
+//--------------------------------------------------------------------
+//--------------------------------------------------------------------
+
+var M = { };
+
+M.DEFAULT_CFG = {
+    hide_hash      = false; // Print the non-array part of tables?
+    metalua_tag    = true;  // Use Metalua's backtick syntax sugar?
+    fix_indent     = null;   // If a number, number of indentation spaces;
+                            // If false, indent to the previous brace.
+    line_max       = null;   // If a number, tries to avoid making lines with
+                            // more than this number of chars.
+    initial_indent = 0;     // If a number, starts at this level of indentation
+    keywords       = { };   // Set of keywords which must not use Lua's field
+                            // shortcuts {["foo"]=...} -> {foo=...}
+};
+
+var function valid_id(cfg, x) {
+    if( type(x) != "string" ) { return false; }
+    if( ! x->match ("^[a-zA-Z_][a-zA-Z0-9_]*$") ) { return false; }
+    if( cfg.keywords && cfg.keywords[x] ) { return false; }
+    return true;
+}
+
+var __tostring_cache = setmetatable({ }, {__mode='k'});
+
+// Retrieve the string produced by `__tostring` metamethod if present,
+// return `false` otherwise. Cached in `__tostring_cache`.
+var function __tostring(x) {
+    var the_string = __tostring_cache[x];
+    if( the_string!=null ) { return the_string; }
+    var mt = getmetatable(x);
+    if( mt ) {
+        var __tostring = mt.__tostring;
+        if( __tostring ) {
+            the_string = __tostring(x);
+            __tostring_cache[x] = the_string;
+            return the_string;
+        }
+    }
+    if( x!=null ) { __tostring_cache[x] = false; } // nil is an illegal key
+    return false;
+}
+
+var xlen; // mutually recursive with `xlen_type`
+
+var xlen_cache = setmetatable({ }, {__mode='k'});
+
+// Helpers for the `xlen` function
+var xlen_type = {
+    ["nil"] = function ( ) { return 3; };
+    number  = function (x) { return #tostring(x); };
+    boolean = function (x) { return x && 4 || 5; };
+    string  = function (x) { return #string.format("%q",x); };
+};
+
+function xlen_type.table (adt, cfg, nested) {
+    var custom_string = __tostring(adt);
+    if( custom_string ) { return #custom_string; }
+
+    // Circular referenced objects are printed with the plain
+    // `tostring` function in nested positions.
+    if( nested [adt] ) { return #tostring(adt); }
+    nested [adt] = true;
+
+    var has_tag  = cfg.metalua_tag && valid_id(cfg, adt.tag);
+    var alen     = #adt;
+    var has_arr  = alen>0;
+    var has_hash = false;
+    var x = 0;
+
+    if( ! cfg.hide_hash ) {
+        // first pass: count hash-part
+        for( k, v in pairs(adt) ) {
+            if( k=="tag" && has_tag ) {
+                // this is the tag -> do nothing!
+            } else if( type(k)=="number" && k<=alen && math.fmod(k,1)==0 && k>0 ) {
+                // array-part pair -> do nothing!
+            } else {
+                has_hash = true;
+                if( valid_id(cfg, k) ) { x+=#k;
+                } else { x +=   xlen (k, cfg, nested) + 2; } // count surrounding brackets
+                x +=   xlen (v, cfg, nested) + 5;          // count " = " and ", "
+            }
+        }
+    }
+
+    for( i = 1, alen ) { x +=   xlen (adt[i], nested) + 2; } // count ", "
+
+    nested[adt] = false; // No more nested calls
+
+    if( ! (has_tag || has_arr || has_hash) ) { return 3; }
+    if( has_tag ) { x+=#adt.tag+1; }
+    if( ! (has_arr || has_hash) ) { return x; }
+    if( ! has_hash && alen==1 && type(adt[1])!="table" ) {
+        return x-2; // substract extraneous ", "
+    }
+    return x+2; // count "{ " and " }", substract extraneous ", "
+}
+
+
+// Compute the number of chars it would require to display the table
+// on a single line. Helps to decide whether some carriage returns are
+// required. Since the size of each sub-table is required many times,
+// it's cached in [xlen_cache].
+xlen = function (x, cfg, nested) {
+    // no need to compute length for 1-line prints
+    if( ! cfg.line_max ) { return 0; }
+    nested = nested || { };
+    if( x==null ) { return #"nil"; }
+    var len = xlen_cache[x];
+    if( len ) { return len; }
+    var f = xlen_type[type(x)];
+    if( ! f ) { return #tostring(x); }
+    len = f (x, cfg, nested);
+    xlen_cache[x] = len;
+    return len;
+};
+
+var function consider_newline(p, len) {
+    if( ! p.cfg.line_max ) { return; }
+    if( p.current_offset + len <= p.cfg.line_max ) { return; }
+    if( p.indent < p.current_offset ) {
+        p->acc ("\n"); p->acc ((" ")->rep(p.indent));
+        p.current_offset = p.indent;
+    }
+}
+
+var acc_value;
+
+var acc_type = {
+    ["nil"] = function(p) { p->acc("nil"); };
+    number  = function(p, adt) { p->acc (tostring (adt)); };
+    string  = function(p, adt) { p->acc ((string.format ("%q", adt)->gsub("\\\n", "\\n"))); };
+    boolean = function(p, adt) { p->acc (adt && "true" || "false"); } };
+
+// Indentation:
+// * if `cfg.fix_indent` is set to a number:
+//   * add this number of space for each level of depth
+//   * return to the line as soon as it flushes things further left
+// * if not, tabulate to one space after the opening brace.
+//   * as a result, it never saves right-space to return before first element
+
+function acc_type.table(p, adt) {
+    if( p.nested[adt] ) { p->acc(tostring(adt)); return; }
+    p.nested[adt]  = true;
+
+    var has_tag  = p.cfg.metalua_tag && valid_id(p.cfg, adt.tag);
+    var alen     = #adt;
+    var has_arr  = alen>0;
+    var has_hash = false;
+
+    var previous_indent = p.indent;
+
+    if( has_tag ) { p->acc("`"); p->acc(adt.tag); }
+
+    var function indent(p) {
+        if( ! p.cfg.fix_indent ) { p.indent = p.current_offset;
+        } else { p.indent = p.indent + p.cfg.fix_indent; }
+    }
+
+    // First pass: handle hash-part
+    if( ! p.cfg.hide_hash ) {
+        for( k, v in pairs(adt) ) {
+
+            if( has_tag && k=='tag' ) {  // pass the 'tag' field
+            } else if( type(k)=="number" && k<=alen && k>0 && math.fmod(k,1)==0 ) {
+                // pass array-part keys (consecutive ints less than `#adt`)
+            } else { // hash-part keys
+                if( has_hash ) { p->acc (", "); } else { // 1st hash-part pair ever found
+                    p->acc ("{ "); indent(p);
+                }
+
+                // Determine whether a newline is required
+                var is_id, expected_len=valid_id(p.cfg, k);
+                if( is_id ) { expected_len=#k+xlen(v, p.cfg, p.nested)+#" = , ";
+                } else { expected_len = xlen(k, p.cfg, p.nested)+xlen(v, p.cfg, p.nested)+#"[] = , "; }
+                consider_newline(p, expected_len);
+
+                // Print the key
+                if( is_id ) { p->acc(k); p->acc (" = "); } else {
+                    p->acc ("["); acc_value (p, k); p->acc ("] = ");
+                }
+
+                acc_value (p, v); // Print the value
+                has_hash = true;
+            }
+        }
+    }
+
+    // Now we know whether there's a hash-part, an array-part, and a tag.
+    // Tag and hash-part are already printed if they're present.
+    if( ! has_tag && ! has_hash && ! has_arr ) { p->acc ("{ }");
+    } else if( has_tag && ! has_hash && ! has_arr ) { // nothing, tag already in acc
+    } else {
+        assert (has_hash || has_arr); // special case { } already handled
+        var no_brace = false;
+        if( has_hash && has_arr ) { p->acc (", ");
+        } else if( has_tag && ! has_hash && alen==1 && type(adt[1])!="table" ) {
+            // No brace required; don't print "{", remember not to print "}"
+            p->acc (" "); acc_value (p, adt[1]); // indent= indent+(cfg.fix_indent or 0))
+            no_brace = true;
+        } else if( ! has_hash ) {
+            // Braces required, but not opened by hash-part handler yet
+            p->acc ("{ "); indent(p);
+        }
+
+        // 2nd pass: array-part
+        if( ! no_brace && has_arr ) {
+            var expected_len = xlen(adt[1], p.cfg, p.nested);
+            consider_newline(p, expected_len);
+            acc_value(p, adt[1]); // indent+(cfg.fix_indent or 0)
+            for( i=2, alen ) {
+                p->acc (", ");
+                consider_newline(p, xlen(adt[i], p.cfg, p.nested));
+                acc_value (p, adt[i]); //indent+(cfg.fix_indent or 0)
+            }
+        }
+        if( ! no_brace ) { p->acc (" }"); }
+    }
+    p.nested[adt] = false; // No more nested calls
+    p.indent = previous_indent;
+}
+
+
+function acc_value(p, v) {
+    var custom_string = __tostring(v);
+    if( custom_string ) { p->acc(custom_string); } else {
+        var f = acc_type[type(v)];
+        if( f ) { f(p, v); } else { p->acc(tostring(v)); }
+    }
+}
+
+
+// FIXME: new_indent seems to be always nil?!s detection
+// FIXME: accumulator function should be configurable,
+// so that print() doesn't need to bufferize the whole string
+// before starting to print.
+function M.tostring(t, cfg) {
+
+    cfg = cfg || M.DEFAULT_CFG || { };
+
+    var p = {
+        cfg = cfg;
+        indent = 0;
+        current_offset = cfg.initial_indent || 0;
+        buffer = { };
+        nested = { };
+        acc = function(this, str) {
+                  table.insert(this.buffer, str);
+                  this.current_offset = this.current_offset + #str;
+              };
+    };
+    acc_value(p, t);
+    return table.concat(p.buffer);
+}
+
+function M.print(...) { return print(M.tostring(...)); }
+function M.sprintf(fmt, ...) {
+    var args={...};
+    for( i, v in pairs(args) ) {
+        var t=type(v);
+        if( t=='table' ) { args[i]=M.tostring(v);
+        } else if( t=='nil' ) { args[i]='nil'; }
+    }
+    return string.format(fmt, unpack(args));
+}
+
+function M.printf(...) { print(M.sprintf(...)); }
+
+return M;

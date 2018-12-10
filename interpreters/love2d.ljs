@@ -1,0 +1,73 @@
+// Copyright 2011-16 Paul Kulchenko, ZeroBrane LLC
+
+var pathcache;
+var win = ide.osname == "Windows";
+var mac = ide.osname == "Macintosh";
+
+return {
+  name = "LÖVE",
+  description = "LÖVE game engine",
+  api = {"baselib", "love2d"},
+  frun = function(this,wfilename,rundebug) {
+    var love2d = ide.config.path.love2d || pathcache; // check if the path is configured
+    var projdir = this->fworkdir(wfilename);
+    if( ! love2d ) {
+      var sep = win && ';' || ':';
+      var default =
+           win && (GenerateProgramFilesPath('love', sep)..sep)
+        || mac && ('/Applications/love.app/Contents/MacOS'..sep)
+        || '';
+      var path = default
+                 ..(os.getenv('PATH') || '')..sep
+                 ..(GetPathWithSep(projdir))..sep
+                 ..(os.getenv('HOME') && GetPathWithSep(os.getenv('HOME'))..'bin' || '');
+      var paths = {};
+      for( p in path->gmatch("[^"..sep.."]+") ) {
+        love2d = love2d || GetFullPathIfExists(p, win && 'love.exe' || 'love');
+        table.insert(paths, p);
+      }
+      if( ! love2d ) {
+        ide->Print("Can't find love2d executable in any of the following folders: "
+          ..table.concat(paths, ", "));
+        return;
+      }
+      pathcache = love2d;
+    }
+
+    if( ! GetFullPathIfExists(projdir, 'main.ljs') ) {
+      var altpath = wfilename->GetPath(wx.wxPATH_GET_VOLUME);
+      var altname = GetFullPathIfExists(altpath, 'main.ljs');
+      if( altname && wx.wxMessageBox(
+          ("Can't find 'main.ljs' file in the current project folder.\n"
+           .."Would you like to switch the project directory to '%s'?")->format(altpath),
+          "LÖVE interpreter",
+          wx.wxYES_NO + wx.wxCENTRE, ide->GetMainFrame()) == wx.wxYES ) {
+        ide->SetProject(altpath);
+        projdir = altpath;
+      } else {
+        ide->Print(("Can't find 'main.ljs' file in the current project folder: '%s'.")
+          ->format(projdir));
+        return;
+      }
+    }
+
+    if( rundebug ) {
+      ide->GetDebugger()->SetOptions({runstart = ide.config.debugger.runonstart != false});
+    }
+
+    // suppress hiding ConsoleWindowClass as this is used by Love console
+    var uhw = ide.config.unhidewindow;
+    var cwc = uhw && uhw.ConsoleWindowClass;
+    if( uhw ) { uhw.ConsoleWindowClass = 0; }
+
+    var params = this->GetCommandLineArg();
+    var cmd = ('"%s" "%s"%s%s')->format(love2d, projdir,
+      params && " "..params || "", rundebug && ' -debug' || '');
+    // CommandLineRun(cmd,wdir,tooutput,nohide,stringcallback,uid,endcallback)
+    return CommandLineRun(cmd,projdir,true,true,null,null,
+      function() { if( uhw ) { uhw.ConsoleWindowClass = cwc; } });
+  },
+  hasdebugger = true,
+  scratchextloop = true,
+  takeparameters = true,
+};

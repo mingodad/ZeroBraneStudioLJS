@@ -1,0 +1,876 @@
+// Copyright 2011-17 Paul Kulchenko, ZeroBrane LLC
+// authors: Luxinia Dev (Eike Decker & Christoph Kubisch)
+//-------------------------------------------------------
+
+// put bin/ and lualibs/ first to avoid conflicts with included modules
+// that may have other versions present somewhere else in path/cpath.
+var function isproc() {
+  var file = io.open("/proc");
+  if( file ) { file->close(); }
+  return file != null;
+}
+var iswindows = os.getenv('WINDIR') || (os.getenv('OS') || '')->match('[Ww]indows');
+var islinux = ! iswindows && isproc();
+var arch = "x86"; // use 32bit by default
+var unpack = table.unpack || unpack;
+
+if( islinux ) {
+  var file = io.popen("uname -m");
+  if( file ) {
+    var machine=file->read("*l");
+    var archtype= {
+      x86_64  = "x64",
+      armv7l  = "armhf",
+      aarch64 = "aarch64",
+    };
+    arch = archtype[machine] || arch;
+    file->close();
+  }
+}
+
+package.cpath = (
+  iswindows && 'bin/clibs/?.dll;' ||
+  islinux && ('bin/linux/%s/clibs/lib?.so;bin/linux/%s/clibs/?.so;')->format(arch,arch) ||
+  /*isosx*/ 'bin/clibs/lib?.dylib;bin/clibs/?.dylib;')
+    .. package.cpath;
+package.path  = 'lualibs/?.ljs;lualibs/?/?.ljs;lualibs/?/init.ljs;' .. package.path;
+
+require("wx");
+require("bit");
+require("mobdebug");
+if( jit && jit.on ) { jit.on(); } // turn jit "on" as "mobdebug" may turn it off for LuaJIT
+
+dofile ("src/util.ljs");
+
+//---------
+// IDE
+//
+var pendingOutput = {};
+var config = dofile("src/config.ljs");
+config.path = {
+  projectdir = "",
+  app = null,
+};
+ide = {
+  GetTime = (function(ok, socket) { return ok && socket.gettime || os.clock; })(pcall(require, "socket")),
+  MODPREF = "* ",
+  MAXMARGIN = wxstc.wxSTC_MAX_MARGIN || 4,
+  ANYMARKERMASK = 2**24-1,
+  config = config,
+  specs = {
+    none = {
+      sep = "\1",
+    }
+  },
+  messages = {},
+  tools = {},
+  iofilters = {},
+  interpreters = {},
+  packages = {},
+  apis = {},
+  timers = {},
+  onidle = {},
+
+  proto = {}, // prototypes for various classes
+  filenames = {}, // names for files to load
+
+  app = null, // application engine
+  interpreter = null, // current Lua interpreter
+  frame = null, // gui related
+  debugger = {}, // debugger related info
+  filetree = null, // filetree
+  findReplace = null, // find & replace handling
+  settings = null, // user settings (window pos, last files..)
+  session = {
+    projects = {}, // project configuration for the current session
+    lastupdated = null, // timestamp of the last modification in any of the editors
+    lastsaved = null, // timestamp of the last recovery information saved
+  },
+
+  // misc
+  exitingProgram = false, // are we currently exiting?
+  infocus = null, // last component with a focus
+  editorApp = wx.wxGetApp(),
+  editorFilename = null,
+  openDocuments = {}, // see `Document` prototype in proto.ljs for the methods
+  ignoredFilesList = {},
+  font = {
+    eNormal = null,
+    eItalic = null,
+    oNormal = null,
+    oItalic = null,
+    fNormal = null,
+  },
+
+  osname = wx.wxPlatformInfo.Get()->GetOperatingSystemFamilyName(),
+  osarch = arch,
+  oshome = os.getenv("HOME") || (iswindows && os.getenv('HOMEDRIVE') && os.getenv('HOMEPATH')
+    && (os.getenv('HOMEDRIVE')..os.getenv('HOMEPATH'))),
+  wxver = string.match(wx.wxVERSION_STRING, "[%d%.]+"),
+
+  test = {}, // local functions used for testing
+
+  Print = function(this, ...) {
+    if( DisplayOutputLn ) {
+      // flush any pending output
+      while( #pendingOutput > 0 ) { DisplayOutputLn(unpack(table.remove(pendingOutput, 1))); }
+      // print without parameters can be used for flushing, so skip the printing
+      if( select('#', ...) > 0 ) { DisplayOutputLn(...); }
+      return;
+    }
+    pendingOutput[#pendingOutput + 1] = {...};
+  },
+};
+ide.startedat = ide->GetTime();
+
+// Scintilla switched to using full byte for style numbers from using only first 5 bits
+ide.STYLEMASK = ide.wxver <= "2.9.5" && 31 || 255;
+
+// add wx.wxMOD_RAW_CONTROL as it's missing in wxlua 2.8.12.3;
+// provide default for wx.wxMOD_CONTROL as it's missing in wxlua 2.8 that
+// is available through Linux package managers
+if( ! wx.wxMOD_CONTROL ) { wx.wxMOD_CONTROL = 0x02; }
+if( ! wx.wxMOD_RAW_CONTROL ) {
+  wx.wxMOD_RAW_CONTROL = ide.osname == 'Macintosh' && 0x10 || wx.wxMOD_CONTROL;
+}
+if( ! wx.WXK_RAW_CONTROL ) {
+  wx.WXK_RAW_CONTROL = ide.osname == 'Macintosh' && 396 || wx.WXK_CONTROL;
+}
+// ArchLinux running 2.8.12.2 doesn't have wx.wxMOD_SHIFT defined
+if( ! wx.wxMOD_SHIFT ) { wx.wxMOD_SHIFT = 0x04; }
+// wxDIR_NO_FOLLOW is missing in wxlua 2.8.12 as well
+if( ! wx.wxDIR_NO_FOLLOW ) { wx.wxDIR_NO_FOLLOW = 0x10; }
+if( ! wxaui.wxAUI_TB_PLAIN_BACKGROUND ) { wxaui.wxAUI_TB_PLAIN_BACKGROUND = 2**8; }
+if( ! wx.wxNOT_FOUND ) { wx.wxNOT_FOUND = -1; }
+if( ! wx.wxEXEC_NOEVENTS ) { wx.wxEXEC_NOEVENTS = 16; }
+if( ! wx.wxEXEC_HIDE_CONSOLE ) { wx.wxEXEC_HIDE_CONSOLE = 32; }
+if( ! wx.wxEXEC_BLOCK ) { wx.wxEXEC_BLOCK = wx.wxEXEC_SYNC + wx.wxEXEC_NOEVENTS; }
+
+for( k,v in pairs({
+    VS_NONE = 0, VS_RECTANGULARSELECTION = 1, VS_USERACCESSIBLE = 2, VS_NOWRAPLINESTART = 4
+  }) ) {
+  if( ! wxstc["wxSTC_"..k] ) { wxstc["wxSTC_"..k] = wxstc["wxSTC_SC"..k] || v; }
+}
+
+// wxwidgets 3.1.1+ replaced wxSTC_SCMOD_* with wxSTC_KEYMOD_*; map both for compatibility
+for( _, key in ipairs({"ALT", "CTRL", "SHIFT", "META", "SUPER", "NORM"}) ) {
+  var scmod = "wxSTC_SCMOD_"..key;
+  var keymod = "wxSTC_KEYMOD_"..key;
+  if( wxstc[scmod] && ! wxstc[keymod] ) {
+    wxstc[keymod] = wxstc[scmod];
+  } else if( ! wxstc[scmod] && wxstc[keymod] ) {
+    wxstc[scmod] = wxstc[keymod];
+  }
+}
+
+// it's an interface constant and is not public in wxlua, so add it
+if( ! wxstc.wxSTC_SETLEXERLANGUAGE ) { wxstc.wxSTC_SETLEXERLANGUAGE = 4006; }
+
+if( ! setfenv ) { // Lua 5.2
+  // based on http://lua-users.org/lists/lua-l/2010-06/msg00314.html
+  // this assumes f is a function
+  var function findenv(f) {
+    var level = 1;
+    do {
+      var name, value = debug.getupvalue(f, level);
+      if( name == '_ENV' ) { return level, value; }
+      level +=   1;
+    } while(!( name == null) );
+    return null; }
+  getfenv = function (f) { return(select(2, findenv(f)) || _G); };
+  setfenv = function (f, t) {
+    var level = findenv(f);
+    if( level ) { debug.setupvalue(f, level, t); }
+    return f; };
+}
+
+if( ! package.searchpath ) {
+  // from Scintillua by Mitchell (mitchell.att.foicica.com).
+  // Searches for the given *name* in the given *path*.
+  // This is an implementation of Lua 5.2's `package.searchpath()` function for Lua 5.1.
+  function package.searchpath(name, path) {
+    var tried = {};
+    for( part in path->gmatch('[^;]+') ) {
+      var filename = part->gsub('%?', name);
+      var f = io.open(filename, 'r');
+      if( f ) { f->close(); return filename; }
+      tried[#tried + 1] = ("no file '%s'")->format(filename);
+    }
+    return null, table.concat(tried, '\n');
+  }
+}
+
+var function loadToTab(folder, tab, recursive, proto) {
+  var files = (wx.wxFileExists(folder) && {folder}
+    || wx.wxDirExists(folder) && ide->GetFileList(folder, recursive, "*.ljs")
+    || {});
+  for( _, file in ipairs(files) ) { LoadLuaFileExt(tab, file, proto); }
+  return tab;
+}
+
+function ide::LoadSpec(path) {
+  loadToTab(path || "spec", ide.specs, true);
+  UpdateSpecs();
+}
+
+function ide::LoadTool(path) {
+  var tools = {};
+  for( name,tool in pairs(loadToTab(path || "tools", {}, false)) ) {
+    if( tool.fninit ) {
+      var ok, err = pcall(tool.fninit, ide->GetMainFrame(), ide->GetMenuBar());
+      if( ! ok ) { ide->Print(("Error when initializing tool %s: %s")->format(name, err)); }
+    }
+    if( tool.exec && tool.exec.name ) { table.insert(tools,tool); }
+  }
+
+  // sort tools
+  table.sort(tools,function(a,b) { return a.exec.name < b.exec.name; });
+
+  for( _, tool in ipairs(tools) ) {
+    // add menus for each
+    var id, menu = ide->AddTool(tool.exec.name, tool.exec.fn);
+    // add descriptions
+    if( id && tool.exec.description ) { menu->SetHelpString(id, tool.exec.description); }
+  }
+
+  return #tools;
+}
+
+function ide::LoadInterpreter(path) {
+  loadToTab(path || "interpreters", ide.interpreters, false, ide.proto.Interpreter);
+}
+
+function ide::LoadAPI(path) {
+  var folder = path || "api";
+  var files = (wx.wxFileExists(folder) && {folder}
+    || wx.wxDirExists(folder) && ide->GetFileList(folder, true, "*.ljs")
+    || {});
+  for( _, file in ipairs(files) ) {
+    if( ! IsDirectory(file) ) {
+      var ftype, fname = file->match("api[/\\]([^/\\]+)[/\\](.*)%.");
+      if( ! ftype || ! fname ) {
+        ide->Print(TR("The API file must be located in a subdirectory of the API directory."));
+      } else {
+        ide.apis[ftype] = ide.apis[ftype] || {};
+        // make sure the path is absolute to access it if the current directory changes
+        ide.apis[ftype][fname] = MergeFullPath("", file);
+      }
+    }
+  }
+  ReloadAPIs("*");
+}
+
+dofile ("src/version.ljs");
+
+for( _, file in ipairs({"proto", "ids", "style", "keymap", "toolbar", "package"}) ) {
+  dofile("src/editor/"..file..".ljs");
+}
+
+ide.config.styles = StylesGetDefault();
+ide.config.stylesoutshell = StylesGetDefault();
+
+var function setLuaPaths(mainpath, osname) {
+  // use LUA_DEV to setup paths for Lua for Windows modules if installed
+  var luadev = osname == "Windows" && os.getenv('LUA_DEV');
+  if( luadev && ! wx.wxDirExists(luadev) ) { luadev = null; }
+  var luadev_path = (luadev
+    && ('LUA_DEV/?.ljs;LUA_DEV/?/init.ljs;LUA_DEV/lua/?.ljs;LUA_DEV/lua/?/init.ljs')
+      ->gsub('LUA_DEV', (luadev->gsub('[\\/]$','')))
+    || null);
+  var luadev_cpath = (luadev
+    && ('LUA_DEV/?.dll;LUA_DEV/?51.dll;LUA_DEV/clibs/?.dll;LUA_DEV/clibs/?51.dll')
+      ->gsub('LUA_DEV', (luadev->gsub('[\\/]$','')))
+    || null);
+
+  if( luadev ) {
+    var path, clibs = os.getenv('PATH'), luadev->gsub('[\\/]$','')..'\\clibs';
+    if( ! path->find(clibs, 1, true) ) { wx.wxSetEnv('PATH', path..';'..clibs); }
+  }
+
+  // (luaconf.h) in Windows, any exclamation mark ('!') in the path is replaced
+  // by the path of the directory of the executable file of the current process.
+  // this effectively prevents any path with an exclamation mark from working.
+  // if the path has an excamation mark, allow Lua to expand it as this
+  // expansion happens only once.
+  if( osname == "Windows" && mainpath->find('%!') ) { mainpath = "!/../"; }
+
+  // if LUA_PATH or LUA_CPATH is not specified, then add ;;
+  // ;; will be replaced with the default (c)path by the Lua interpreter
+  wx.wxSetEnv("LUA_PATH",
+    (os.getenv("LUA_PATH") || ';') .. ';'
+    .. "./?.ljs;./?/init.ljs;./lua/?.ljs;./lua/?/init.ljs" .. ';'
+    .. mainpath.."lualibs/?/?.ljs;"..mainpath.."lualibs/?.ljs;"
+    .. mainpath.."lualibs/?/?/init.ljs;"..mainpath.."lualibs/?/init.ljs"
+    .. (luadev_path && (';' .. luadev_path) || ''));
+
+  ide.osclibs = // keep the list to use for various Lua versions
+    osname == "Windows" && table.concat({
+        mainpath.."bin/clibs/?.dll",
+      },";") ||
+    osname == "Macintosh" && table.concat({
+        mainpath.."bin/clibs/?.dylib",
+        mainpath.."bin/clibs/lib?.dylib",
+      },";") ||
+    osname == "Unix" && table.concat({
+        mainpath..("bin/linux/%s/clibs/?.so")->format(arch),
+        mainpath..("bin/linux/%s/clibs/lib?.so")->format(arch),
+      },";") ||
+    assert(false, "Unexpected OS name");
+
+  ide.oslibs = table.concat({
+        mainpath.."lualibs/?.ljs",
+        mainpath.."lualibs/?/?.ljs",
+        mainpath.."lualibs/?/init.ljs",
+      },";");
+
+  wx.wxSetEnv("LUA_CPATH",
+    (os.getenv("LUA_CPATH") || ';') .. ';' .. ide.osclibs
+    .. (luadev_cpath && (';' .. luadev_cpath) || ''));
+
+  // on some OSX versions, PATH is sanitized to not include even /usr/local/bin; add it
+  if( osname == "Macintosh" ) {
+    var ok, path = wx.wxGetEnv("PATH");
+    if( ok ) { wx.wxSetEnv("PATH", (#path > 0 && path..":" || "").."/usr/local/bin"); }
+  }
+}
+
+ide.test.setLuaPaths = setLuaPaths;
+
+//-------------
+// process args
+var configs = {};
+{
+  // application parameters are passed as script parameters on Windows
+  var arg = ide.osname == "Windows" && {...} || arg;
+  // application name is expected as the first argument
+  var fullPath = arg[1] || "zbstudio";
+
+  ide.arg = arg;
+
+  // on Windows use GetExecutablePath, which is Unicode friendly,
+  // whereas wxGetCwd() is not (at least in wxlua 2.8.12.2).
+  // some wxlua version on windows report wx.dll instead of *.exe.
+  var exepath = wx.wxStandardPaths.Get()->GetExecutablePath();
+  if( ide.osname == "Windows" && exepath->find("%.exe$") ) {
+    fullPath = exepath;
+  // path handling only works correctly on UTF8-valid strings, so check for that.
+  // This may be caused by the launcher on Windows using ANSI methods for command line
+  // processing. Keep the path as is for UTF-8 invalid strings as it's still good enough
+  } else if( ! wx.wxIsAbsolutePath(fullPath) && wx.wxString().FromUTF8(fullPath) == fullPath ) {
+    fullPath = MergeFullPath(wx.wxGetCwd(), fullPath);
+  }
+
+  ide.editorFilename = fullPath;
+  ide.appname = fullPath->match("([%w_-%.]+)$")->gsub("%.[^%.]*$","");
+  assert(ide.appname, "no application path defined");
+
+  for( index = 2, #arg ) {
+    if( (arg[index] == "-cfg" && index+1 <= #arg) ) {
+      table.insert(configs,arg[index+1]);
+    } else if( (arg[index] == "-cwd" && index+1 <= #arg) ) {
+      ide.cwd = arg[index+1];
+    } else if( arg[index-1] != "-cfg" && arg[index-1] != "-cwd"
+    // on OSX command line includes -psn... parameter, don't include these
+    && (ide.osname != 'Macintosh' || ! arg[index]->find("^-psn")) ) {
+      table.insert(ide.filenames,arg[index]);
+    }
+  }
+
+  setLuaPaths(GetPathWithSep(ide.editorFilename), ide.osname);
+}
+
+//--------------------
+// process application
+
+ide.app = dofile(ide.appname.."/app.ljs");
+var app = assert(ide.app);
+
+// load packages
+var function processPackages(packages) {
+  // check dependencies and assign file names to each package
+  var skip = {};
+  for( fname, package in pairs(packages) ) {
+    if( type(package.dependencies) == 'table'
+    && package.dependencies.osname
+    && ! package.dependencies.osname->find(ide.osname, 1, true) ) {
+      ide->Print(("Package '%s' not loaded: requires %s platform, but you are running %s.")
+        ->format(fname, package.dependencies.osname, ide.osname));
+      skip[fname] = true;
+    }
+
+    var needsversion = tonumber(package.dependencies)
+      || type(package.dependencies) == 'table' && tonumber(package.dependencies[1])
+      || -1;
+    var isversion = tonumber(ide.VERSION);
+    if( isversion && needsversion > isversion ) {
+      ide->Print(("Package '%s' not loaded: requires version %s, but you are running version %s.")
+        ->format(fname, needsversion, ide.VERSION));
+      skip[fname] = true;
+    }
+    package.fname = fname;
+  }
+
+  for( fname, package in pairs(packages) ) {
+    if( ! skip[fname] ) { ide.packages[fname] = package; }
+  }
+}
+
+function UpdateSpecs(spec) {
+  for( _, spec in pairs(spec && {spec} || ide.specs) ) {
+    spec.sep = spec.sep || "\1"; // default separator doesn't match anything
+    spec.iscomment = {};
+    spec.iskeyword = {};
+    spec.isstring = {};
+    spec.isnumber = {};
+    if( spec.lexerstyleconvert ) {
+      for( _, s in pairs(spec.lexerstyleconvert.comment || {}) ) { spec.iscomment[s] = true; }
+      for( _, s in pairs(spec.lexerstyleconvert.keywords0 || {}) ) { spec.iskeyword[s] = true; }
+      for( _, s in pairs(spec.lexerstyleconvert.stringtxt || {}) ) { spec.isstring[s] = true; }
+      for( _, s in pairs(spec.lexerstyleconvert.number || {}) ) { spec.isnumber[s] = true; }
+    }
+  }
+}
+
+//--------------------
+// process config
+
+// set ide.config environment
+{
+  ide.configs = {
+    system = MergeFullPath("cfg", "user.ljs"),
+    user = ide.oshome && MergeFullPath(ide.oshome, "."..ide.appname.."/user.ljs"),
+  };
+  ide.configqueue = {};
+
+  var num = 0;
+  var package = setmetatable({}, {
+      __index = function(_,k) { return package[k]; },
+      __newindex = function(_,k,v) { package[k] = v; },
+      __call = function(_,p) {
+        // package can be defined inline, like "package {...}"
+        if( type(p) == 'table' ) {
+          num +=   1;
+          return ide->AddPackage('config'..num..'package', p);
+        // package can be included as "package 'file.ljs'" or "package 'folder/'"
+        } else if( type(p) == 'string' ) {
+          var config = ide.configqueue[#ide.configqueue];
+          var pkg;
+          for( _, packagepath in ipairs({
+              '.', 'packages/', '../packages/',
+              ide.oshome && MergeFullPath(ide.oshome, "."..ide.appname.."/packages")}) ) {
+            var p = MergeFullPath(config && MergeFullPath(config, packagepath) || packagepath, p);
+            pkg = wx.wxDirExists(p) && loadToTab(p, {}, false, ide.proto.Plugin)
+              || wx.wxFileExists(p) && LoadLuaFileExt({}, p, ide.proto.Plugin)
+              || wx.wxFileExists(p..".ljs") && LoadLuaFileExt({}, p..".ljs", ide.proto.Plugin);
+            if( pkg ) {
+              processPackages(pkg);
+              break;
+            }
+          }
+          if( ! pkg ) { ide->Print(("Can't find '%s' to load package from.")->format(p)); }
+        } else {
+          ide->Print(("Can't load package based on parameter of type '%s'.")->format(type(p)));
+        }
+      },
+    });
+
+  var includes = {};
+  var include = function(c) {
+    if( c ) {
+      for( _, config in ipairs({
+          // `or ""` is needed to make sure that the loop is not stopped on `nil`
+          ide.configqueue[#ide.configqueue] || "",
+          (wx.wxFileName.SplitPath(ide.configs.user || "")),
+          (wx.wxFileName.SplitPath(ide.configs.system || "")),
+      }) ) {
+        if( config > "" ) {
+          var p = MergeFullPath(config, c);
+          includes[p] = (includes[p] || 0) + 1;
+          if( includes[p] > 1 || LoadLuaConfig(p) || LoadLuaConfig(p..".ljs") ) { return; }
+          includes[p] = includes[p] - 1;
+        }
+      }
+      ide->Print(("Can't find configuration file '%s' to process.")->format(c));
+    }
+  };
+
+  setmetatable(ide.config, {
+    __index = setmetatable({
+        // these are provided for compatibility only to avoid breaking configs using `load.*`
+        load = {
+          interpreters = function() { ide->Print("Warning: using `load.interpreters()` in configuration settings is deprecated."); },
+          specs = function() { ide->Print("Warning: using `load.specs()` in configuration settings is deprecated."); },
+          tools = function() { ide->Print("Warning: using `load.tools()` in configuration settings is deprecated."); },
+        },
+        package = package,
+        include = include,
+    }, {__index = _G || _ENV})
+  });
+}
+
+LoadLuaConfig(ide.appname.."/config.ljs");
+
+ide.editorApp->SetAppName(ide->GetProperty("settingsapp"));
+
+// check if the .ini file needs to be migrated on Windows
+if( ide.osname == 'Windows' && ide.wxver >= "2.9.5" ) {
+  // Windows used to have local ini file kept in wx.wxGetHomeDir (before 2.9),
+  // but since 2.9 it's in GetUserConfigDir(), so migrate it.
+  var ini = ide.editorApp->GetAppName() .. ".ini";
+  var old = wx.wxFileName(wx.wxGetHomeDir(), ini);
+  var new = wx.wxFileName(wx.wxStandardPaths.Get()->GetUserConfigDir(), ini);
+  if( old->FileExists() && ! new->FileExists() ) {
+    FileCopy(old->GetFullPath(), new->GetFullPath());
+    ide->Print(("Migrated configuration file from '%s' to '%s'.")
+      ->format(old->GetFullPath(), new->GetFullPath()));
+  }
+}
+
+//--------------------
+// process plugins
+
+if( app.preinit ) { app.preinit(); }
+
+ide->LoadInterpreter();
+ide->LoadSpec();
+
+{
+  // process configs
+  LoadLuaConfig(ide.configs.system);
+  LoadLuaConfig(ide.configs.user);
+
+  // process all other configs (if any)
+  for( _, v in ipairs(configs) ) { LoadLuaConfig(v, true); }
+  configs = null;
+
+  // check and apply default styles in case a user resets styles in the config
+  for( _, styles in ipairs({"styles", "stylesoutshell"}) ) {
+    if( ! ide.config[styles] ) {
+      ide->Print(("Ignored incorrect value of '%s' setting in the configuration file")
+        ->format(styles));
+      ide.config[styles] = StylesGetDefault();
+    }
+  }
+
+  var sep = GetPathSeparator();
+  if( ide.config.language ) {
+    LoadLuaFileExt(ide.messages, "cfg"..sep.."i18n"..sep..ide.config.language..".ljs");
+  }
+  // always load 'en' as it's required as a fallback for pluralization
+  if( ide.config.language != 'en' ) {
+    LoadLuaFileExt(ide.messages, "cfg"..sep.."i18n"..sep.."en.ljs");
+  }
+}
+
+processPackages(loadToTab("packages", {}, false, ide.proto.Plugin));
+if( ide.oshome ) {
+  var userpackages = MergeFullPath(ide.oshome, "."..ide.appname.."/packages");
+  if( wx.wxDirExists(userpackages) ) {
+    processPackages(loadToTab(userpackages, {}, false, ide.proto.Plugin));
+  }
+}
+
+//-------------
+// Load App
+
+for( _, file in ipairs({
+    "settings", "singleinstance", "iofilters", "markup",
+    "gui", "filetree", "output", "debugger", "outline", "commandbar",
+    "editor", "findreplace", "commands", "autocomplete", "shellbox", "markers",
+    "menu_file", "menu_edit", "menu_search", "menu_view", "menu_project", "menu_help",
+    "print", "inspect" }) ) {
+  dofile("src/editor/"..file..".ljs");
+}
+
+// delay loading tools until everything is loaded as it modifies the menus
+ide->LoadTool();
+// delay loading APIs until auto-complete is loaded
+ide->LoadAPI();
+
+// register the rest of the shortcuts to allow them to be overwritten from onRegister
+if( ide.osname == 'Macintosh' ) { ide->SetAccelerator(ID.VIEWMINIMIZE, "Ctrl-M"); }
+for( _, sc in ipairs({ID.RESTART, ID.CLEAROUTPUT, ID.CLEARCONSOLE}) ) {
+  if( ide.config.keymap[sc] ) { ide->SetAccelerator(sc, ide.config.keymap[sc]); }
+}
+
+// register all the plugins
+PackageEventHandle("onRegister");
+
+// initialization that was delayed until configs processed and packages loaded
+ProjectUpdateInterpreters();
+
+// load rest of settings
+SettingsRestoreFramePosition(ide.frame, "MainFrame");
+SettingsRestoreFileHistory(SetFileHistory);
+SettingsRestoreEditorSettings();
+SettingsRestoreProjectSession(FileTreeSetProjects);
+SettingsRestoreFileSession(function(tabs, params) {
+  if( params && params.recovery
+  ) { return SetOpenTabs(params);
+  } else { return SetOpenFiles(tabs, params); }
+});
+SettingsRestoreView();
+
+// ---------------------------------------------------------------------------
+// Load the filenames
+
+{
+  for( _, filename in ipairs(ide.filenames) ) {
+    ide->ActivateFile(ide.cwd && GetFullPathIfExists(ide.cwd, filename) || filename);
+  }
+  if( ide->GetEditorNotebook()->GetPageCount() == 0 ) { NewFile(); }
+}
+
+if( app.postinit ) { app.postinit(); }
+
+// this is a workaround for a conflict between global shortcuts and local
+// shortcuts (like F2) used in the file tree or a watch panel.
+// because of several issues on OSX (as described in details in this thread:
+// https://groups.google.com/d/msg/wx-dev/juJj_nxn-_Y/JErF1h24UFsJ),
+// the workaround installs a global event handler that manually re-routes
+// conflicting events when the current focus is on a proper object.
+// non-conflicting shortcuts are handled through key-down events.
+var remap = {
+  [ID.ADDWATCH]    = ide->GetWatch(),
+  [ID.EDITWATCH]   = ide->GetWatch(),
+  [ID.DELETEWATCH] = ide->GetWatch(),
+  [ID.RENAMEFILE]  = ide->GetProjectTree(),
+  [ID.DELETEFILE]  = ide->GetProjectTree(),
+};
+
+var function rerouteMenuCommand(obj, id) {
+  // check if the conflicting shortcut is enabled:
+  // (1) SetEnabled wasn't called or (2) Enabled was set to `true`.
+  var uievent = wx.wxUpdateUIEvent(id);
+  obj->ProcessEvent(uievent);
+  if( ! uievent->GetSetEnabled() || uievent->GetEnabled() ) {
+    obj->AddPendingEvent(wx.wxCommandEvent(wx.wxEVT_COMMAND_MENU_SELECTED, id));
+  }
+}
+
+var function remapkey(event) {
+  var keycode = event->GetKeyCode();
+  var mod = event->GetModifiers();
+  for( id, obj in pairs(remap) ) {
+    var focus = obj->FindFocus();
+    if( focus && focus->GetId() == obj->GetId() ) {
+      var ae = wx.wxAcceleratorEntry(); ae->FromString(KSC(id));
+      if( ae->GetFlags() == mod && ae->GetKeyCode() == keycode ) {
+        rerouteMenuCommand(obj, id);
+        return;
+      }
+    }
+  }
+  event->Skip();
+}
+ide->GetWatch()->Connect(wx.wxEVT_KEY_DOWN, remapkey);
+ide->GetProjectTree()->Connect(wx.wxEVT_KEY_DOWN, remapkey);
+
+var function resolveConflict(localid, globalid) {
+  return function(event) {
+    var shortcut = ide.config.keymap[localid];
+    for( id, obj in pairs(remap) ) {
+      if( ide.config.keymap[id]->lower() == shortcut->lower() ) {
+        var focus = obj->FindFocus();
+        if( focus && focus->GetId() == obj->GetId() ) {
+          obj->AddPendingEvent(wx.wxCommandEvent(wx.wxEVT_COMMAND_MENU_SELECTED, id));
+          return;
+        // also need to check for children of objects
+        // to avoid re-triggering events when labels are being edited
+        } else if( focus && focus->GetParent()->GetId() == obj->GetId() ) {
+          return;
+        }
+      }
+    }
+    rerouteMenuCommand(ide.frame, globalid);
+  };
+}
+
+for( lid in pairs(remap) ) {
+  var shortcut = ide.config.keymap[lid];
+  // find a (potential) conflict for this shortcut (if any)
+  for( gid, ksc in pairs(ide.config.keymap) ) {
+    // if the same shortcut is used elsewhere (not one of IDs being checked)
+    if( shortcut->lower() == ksc->lower() && ! remap[gid] ) {
+      var fakeid = NewID();
+      ide.frame->Connect(fakeid, wx.wxEVT_COMMAND_MENU_SELECTED, resolveConflict(lid, gid));
+      ide->SetAccelerator(fakeid, ksc);
+    }
+  }
+}
+
+// these shortcuts need accelerators handling as they are not present anywhere in the menu
+for( _, id in ipairs({ ID.GOTODEFINITION, ID.RENAMEALLINSTANCES,
+    ID.REPLACEALLSELECTIONS, ID.QUICKADDWATCH, ID.QUICKEVAL, ID.ADDTOSCRATCHPAD}) ) {
+  var ksc = ide.config.keymap[id];
+  if( ksc && ksc > "" ) {
+    var fakeid = NewID();
+    ide.frame->Connect(fakeid, wx.wxEVT_COMMAND_MENU_SELECTED, function() {
+        var editor = ide->GetEditorWithFocus(ide->GetEditor());
+        if( editor ) { rerouteMenuCommand(editor, id); }
+      });
+    ide->SetAccelerator(fakeid, ksc);
+  }
+}
+
+for( _, id in ipairs({ ID.NOTEBOOKTABNEXT, ID.NOTEBOOKTABPREV }) ) {
+  var ksc = ide.config.keymap[id];
+  if( ksc && ksc > "" ) {
+    var nbc = "wxAuiNotebook";
+    ide.frame->Connect(id, wx.wxEVT_COMMAND_MENU_SELECTED, function(event) {
+        var win = ide.frame->FindFocus();
+        if( ! win ) { return; }
+
+        var notebook = win->GetClassInfo()->GetClassName() == nbc && win->DynamicCast(nbc)
+        || win->GetParent()->GetClassInfo()->GetClassName() == nbc && win->GetParent()->DynamicCast(nbc)
+        || null;
+        if( ! notebook ) { return; }
+
+        var first, last = 0, notebook->GetPageCount()-1;
+        var fwd = event->GetId() == ID.NOTEBOOKTABNEXT;
+        if( fwd && notebook->GetSelection() == last ) {
+          notebook->SetSelection(first);
+        } else if( ! fwd && notebook->GetSelection() == first ) {
+          notebook->SetSelection(last);
+        } else {
+          notebook->AdvanceSelection(fwd);
+        }
+      });
+    ide->SetAccelerator(id, ksc);
+  }
+}
+
+// only set menu bar *after* postinit handler as it may include adding
+// app-specific menus (Help/About), which are not recognized by MacOS
+// as special items unless SetMenuBar is done after menus are populated.
+ide.frame->SetMenuBar(ide.frame.menuBar);
+
+ide->Print(); // flush pending output (if any)
+
+PackageEventHandle("onAppLoad");
+
+// this provides a workaround for Ctrl-(Shift-)Tab not navigating over tabs on OSX
+// http://trac.wxwidgets.org/ticket/17064
+if( ide.osname == 'Macintosh' ) {
+  var frame = ide.frame;
+  var focus;
+  ide.timers.ctrltab = ide->AddTimer(frame, function(event) {
+      var mouse = wx.wxGetMouseState();
+      // if anything other that Ctrl (along with Shift) is pressed, then cancel the timer
+      if( ! ide->IsValidCtrl(focus)
+      || ! wx.wxGetKeyState(wx.WXK_RAW_CONTROL)
+      || wx.wxGetKeyState(wx.WXK_ALT) || wx.wxGetKeyState(wx.WXK_CONTROL)
+      || mouse->LeftDown() || mouse->RightDown() || mouse->MiddleDown() ) {
+        ide.timers.ctrltab->Stop();
+        return;
+      }
+      var ctrl = frame->FindFocus();
+      if( ! ctrl ) { return; }
+      var nb = focus->GetParent()->DynamicCast("wxAuiNotebook");
+      // when moving backward from the very first tab, the focus moves
+      // to wxAuiTabCtrl on OSX, so need to take that into account
+      if( nb->GetId() != ctrl->GetParent()->GetId()
+      || ctrl->GetClassInfo()->GetClassName() == "wxAuiTabCtrl" ) {
+        var frwd = ! wx.wxGetKeyState(wx.WXK_SHIFT);
+        if( nb->GetId() != ctrl->GetParent()->GetId()
+        || ! frwd && nb->GetSelection() == 0
+        || frwd && nb->GetSelection() == nb->GetPageCount()-1 ) {
+          nb->AdvanceSelection(frwd);
+          focus = nb->GetPage(nb->GetSelection());
+          focus->SetFocus();
+        }
+        // don't cancel the timer as the user may be cycling through tabs
+      }
+    });
+
+  frame->Connect(wx.wxEVT_CHAR_HOOK, function(event) {
+      var key = event->GetKeyCode();
+      if( key == wx.WXK_RAW_CONTROL ) {
+        var ctrl = frame->FindFocus();
+        var parent = ctrl && ctrl->GetParent();
+        if( parent && parent->GetClassInfo()->GetClassName() == "wxAuiNotebook" ) {
+          var nb = parent->DynamicCast("wxAuiNotebook");
+          focus = nb->GetPage(nb->GetSelection());
+          focus->SetFocus();
+          ide.timers.ctrltab->Start(20); // check periodically
+        }
+      } else if( key == wx.WXK_SHIFT ) { // Shift
+        // timer is started when `Ctrl` is pressed; even when `Shift` is pressed first,
+        // the Ctrl will still be pressed eventually, which will start the timer
+      } else {
+        ide.timers.ctrltab->Stop();
+      }
+      event->Skip();
+    });
+}
+
+// add Ctrl-Tab and Ctrl-Shift-Tab processing on Linux as there is a similar issue
+// to the one on OSX: http://trac.wxwidgets.org/ticket/17064,
+// but at least on Linux the handling of Tab from CHAR_HOOK works.
+if( ide.osname == 'Unix' ) {
+  ide.frame->Connect(wx.wxEVT_CHAR_HOOK, function(event) {
+      var key = event->GetKeyCode();
+      if( key == wx.WXK_TAB && wx.wxGetKeyState(wx.WXK_CONTROL)
+      && ! wx.wxGetKeyState(wx.WXK_ALT) ) {
+        ide.frame->AddPendingEvent(wx.wxCommandEvent(wx.wxEVT_COMMAND_MENU_SELECTED,
+            wx.wxGetKeyState(wx.WXK_SHIFT) && ID.NOTEBOOKTABPREV || ID.NOTEBOOKTABNEXT
+        ));
+      } else {
+        event->Skip();
+      }
+    });
+}
+
+// The status bar content is drawn incorrectly if it is shown
+// after being initially hidden.
+// Show the statusbar and hide it after showing the frame, which fixes the issue.
+var statusbarfix = ide.osname == 'Windows' && ! ide.frame->GetStatusBar()->IsShown();
+if( statusbarfix ) { ide.frame->GetStatusBar()->Show(true); }
+
+ide.frame->Show(true);
+
+if( statusbarfix ) { ide.frame->GetStatusBar()->Show(false); }
+
+// somehow having wxAuiToolbar "steals" the focus from the editor on OSX;
+// have to set the focus implicitly on the current editor (if any)
+if( ide.osname == 'Macintosh' ) {
+  var editor = ide->GetEditor();
+  if( editor ) { editor->SetFocus(); }
+}
+
+// enable full screen view if supported (for example, on OSX)
+if( ide->IsValidProperty(ide->GetMainFrame(), "EnableFullScreenView") ) {
+  ide->GetMainFrame()->EnableFullScreenView();
+}
+
+if( ide.osname == 'Macintosh' ) {
+  var args = {};
+  for( _, a in ipairs(ide.arg || {}) ) { args[a] = true; }
+
+  wx.wxGetApp().MacOpenFiles = function(files) {
+    for( _, filename in ipairs(files) ) {
+      // in some cases, OSX sends the last command line parameter that looks like a filename
+      // to OpenFile callback, which gets reported to MacOpenFiles.
+      // I've tried to trace why this happens, but the only reference I could find
+      // is this one: http://lists.apple.com/archives/cocoa-dev/2009/May/msg00480.html
+      // To avoid this issue, the filename is skipped if it's present in `arg`.
+      // Also see http://trac.wxwidgets.org/ticket/14558 for related discussion.
+      if( ! args[filename] ) { ide->ActivateFile(filename); }
+    }
+    args = {}; // reset the argument cache as it only needs to be checked on the initial launch
+  };
+}
+
+// check for deprecated items in the config
+if( type(ide.config.outputshell) == type({}) && next(ide.config.outputshell) ) {
+  ide->Print("Warning: using `outputshell.*` in configuration settings is no longer supported; use `output.*` and `console.*` instead.");
+}
+
+wx.wxGetApp()->MainLoop();
+
+// There are several reasons for this call:
+// (1) to fix a crash on OSX when closing with debugging in progress.
+// (2) to fix a crash on Linux 32/64bit during GC cleanup in wxlua
+// after an external process has been started from the IDE.
+// (3) to fix exit on Windows when started as "bin\lua src\main.ljs".
+os.exit();

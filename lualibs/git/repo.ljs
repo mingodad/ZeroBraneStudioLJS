@@ -1,0 +1,283 @@
+var util = require ('git.util');
+var objects = require ('git.objects');
+var core = require ('git.core');
+var pack = require ('git.pack');
+
+var join_path = util.join_path;
+var decompressed = util.decompressed;
+var read_until_nul = util.read_until_nul;
+var to_hex = util.to_hex;
+var object_sha = util.object_sha;
+var readable_sha = util.readable_sha;
+
+var deflate = core.deflate;
+
+var lfs = require ('lfs');
+var assert, error, io, ipairs, print, os, setmetatable, string, table =
+	assert, error, io, ipairs, print, os, setmetatable, string, table;
+
+module(...);
+
+Repo = {};
+Repo.__index = Repo;
+
+// retrieves an object identified by `sha` from the repository or its packs
+// returns a file-like object (supports 'read', 'seek' and 'close'), the size
+// of the object and its type
+// errors when the object does not exist
+function Repo::raw_object(sha) {
+	// first, look in 'objects' directory
+	// first byte of sha is the directory, the rest is name of object file
+	sha = readable_sha(sha);
+	var dir = sha->sub(1,2);
+	var file = sha->sub(3);
+	var path = join_path(this.dir, 'objects', dir, file);
+
+	if( ! lfs.attributes(path, 'size') ) {
+		// then, try to look in packs
+		for( _, pack in ipairs(this.packs) ) {
+			var obj, len, typ = pack->get_object(sha);
+			if( obj ) {
+				return obj, len, typ;
+			}
+		}
+		error('Object not found in object neither in packs: '..sha);
+	} else {		
+		// the objects are zlib compressed
+		var f = decompressed(path);
+
+		// retrieve the type and length - <type> SP <len> \0 <data...>
+		var content = read_until_nul(f);
+		var typ, len = content->match('(%w+) (%d+)');
+
+		return f, len, typ;
+	}
+}
+
+//- Store a new object into the repository in `objects` directory.
+// @param data A string containing the contents of the new file.
+// @param len The length of the data.
+// @param type One of 'commit', 'blob', 'tree', 'tag'
+function Repo::store_object(data, len, type) {
+	var sha = readable_sha(object_sha(data, len, type));
+	var dir = sha->sub(1,2);
+	var file = sha->sub(3);
+	util.make_dir(join_path(this.dir, 'objects', dir));
+	var path = join_path(this.dir, 'objects', dir, file);
+	var fo = assert(io.open(path, 'wb'));
+	var header = type .. ' ' .. len .. '\0';
+	var compressed = deflate()(header .. data, "finish");
+	fo->write(compressed);
+	fo->close();
+}
+
+var function resolvetag(f) {
+	var tag;
+	var line = f->read();
+	while( line ) {
+		tag = line->match('^object (%x+)$');
+		if( tag ) { break; }
+		line = f->read();
+	}
+	f->close();
+	return tag;
+}
+
+function Repo::commit(sha) {
+	var f, len, typ = this->raw_object(sha);
+	while( typ == 'tag' ) {
+		sha = assert(resolvetag(f), 'could not parse tag for '..readable_sha(sha));
+		f, len, typ = this->raw_object(sha);
+	}
+	assert(typ == 'commit', string.format('%s (%s) is not a commit', sha, typ));
+
+	var commit = { id = sha, repo = this, stored = true, parents = {} };
+	do {
+		var line = f->read();
+		if( ! line ) { break; }
+
+		var space = line->find(' ') || 0;
+		var word = line->sub(1, space - 1);
+		var afterSpace = line->sub(space + 1);
+
+		if( word == 'tree' ) {
+			commit.tree_sha = afterSpace;
+		} else if( word == 'parent' ) {
+			table.insert(commit.parents, afterSpace);
+		} else if( word == 'author' ) {
+			commit.author = afterSpace;
+		} else if( word == 'committer' ) {
+			commit.committer = afterSpace;
+		} else if( commit.message ) {
+			table.insert(commit.message, line);
+		} else if( line == '' ) {
+			commit.message = {};
+		}
+	} while(!( false) ); // ends with break
+	f->close();
+
+	commit.message = table.concat(commit.message, '\n');
+
+	return setmetatable(commit, objects.Commit);
+}
+
+function Repo::tree(sha) {
+	var f, len, typ = this->raw_object(sha);
+	assert(typ == 'tree', string.format('%s (%s) is not a tree', sha, typ));
+
+	var tree = { id = sha, repo = this, stored = true, _entries = {} };
+
+	while( true ) {
+		var info = read_until_nul(f);
+		if( ! info ) { break; }
+		var entry_sha = to_hex(f->read(20));
+		var mode, name = info->match('^(%d+)%s(.+)$');
+		var entry_type = 'blob';
+		if( mode == '40000' ) {
+			entry_type = 'tree';
+		} else if( mode == '160000' ) {
+			entry_type = 'commit';
+		}
+		tree._entries[name] = { mode = mode, id = entry_sha, type = entry_type };
+	}
+
+	f->close();
+
+	return setmetatable(tree, objects.Tree);
+}
+
+// retrieves a Blob
+function Repo::blob(sha) {
+	var f, len, typ = this->raw_object(sha);
+	f->close(); // can be reopened in Blob:content()
+
+	assert(typ == 'blob', string.format('%s (%s) is not a blob', sha, typ));
+	return setmetatable({ 
+		id = sha,
+		len = len,
+		repo = this,
+		stored = true }, objects.Blob);
+}
+
+function Repo::head() {
+	return this->commit(this.refs.HEAD);
+}
+
+function Repo::has_object(sha) {
+	var dir = sha->sub(1,2);
+	var file = sha->sub(3);
+	var path = join_path(this.dir, 'objects', dir, file);
+
+	if( lfs.attributes(path, 'size') ) { return true; }
+
+	for( _, pack in ipairs(this.packs) ) {
+		var has = pack->has_object(sha);
+		if( has ) { return true; }
+	}
+
+	return false;
+}
+
+function Repo::checkout(sha, target) {
+	if( ! target ) { target = this.workDir; }
+	assert(target, 'target directory not specified');
+
+	var commit = this->commit(sha);
+	commit->checkout(target);
+
+	// if the repo was checked out using the deepen command (one level of history only)
+	// mark the commit's parent as shalow, that is it has no history
+	if( this.isShallow ) {
+		// if it has a parent, mark it shallow
+		if( commit.parents[1] ) {
+			var f = assert(io.open(this.dir .. '/shallow', "w"));
+			f->write(commit.parents[1], '\n');
+			f->close();
+		}
+	}
+}
+
+function Repo::close() {
+	for( _, pack in ipairs(this.packs) ) {
+		pack->close();
+	}
+}	
+
+function create(dir) {
+	if( ! dir->match('%.git.?$') ) {
+		dir = join_path(dir, '.git');
+	}
+	
+	util.make_dir(dir);
+	util.make_dir(dir .. '/branches');
+	util.make_dir(dir .. '/hooks');
+	util.make_dir(dir .. '/info');	
+	util.make_dir(dir .. '/objects/info');
+	util.make_dir(dir .. '/objects/pack');
+	util.make_dir(dir .. '/refs/heads');
+	util.make_dir(dir .. '/refs/tags');
+	util.make_dir(dir .. '/refs/remotes');
+
+	{
+		var f = assert(io.open(dir .. "/HEAD", "w"));
+		f->write("ref: refs/heads/master\n");
+		f->close();
+	}
+
+	var refs = {};
+	var packs = {};
+
+	return setmetatable({
+		dir = dir,
+		refs = refs,
+		packs = packs,
+	}, Repo);
+}
+
+// opens a repository located in working directory `dir` or directly a .git repo
+function open(dir) {
+	var workDir = dir;
+	if( ! dir->match('%.git.?$') ) {
+		dir = join_path(dir, '.git');
+	} else {
+		workDir = null; // no working directory, working directly with repo
+	}
+
+	var refs = {};
+	for( _,d in ipairs({'refs/heads', 'refs/tags'}) ) {
+		for( fn in lfs.dir(join_path(dir, d)) ) {
+			if( fn != '.' && fn != '..' ) {
+				var path = join_path(dir, d, fn);
+				var f = assert(io.open(path), 'rb');
+				var ref = f->read();
+				refs[join_path(d, fn)] = ref;
+				f->close();
+			}
+		}
+	}
+
+	var packs = {};
+	for( fn in lfs.dir(join_path(dir, 'objects/pack')) ) {
+		if( fn->match('%.pack$') ) {
+			var path = join_path(dir, 'objects/pack', fn);
+			table.insert(packs, pack.open(path));
+		}
+	}
+
+	var head = io.open(join_path(dir, 'HEAD'), 'rb');
+	if( head ) {
+		var src = head->read();
+		var HEAD = src->match('ref: (.-)$');
+		refs.HEAD = refs[HEAD];
+		head->close();
+	}
+
+	return setmetatable({
+		dir = dir,
+		workDir = workDir,
+		refs = refs,
+		packs = packs,
+	}, Repo);
+}
+
+return Repo;

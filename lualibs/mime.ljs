@@ -1,0 +1,90 @@
+//---------------------------------------------------------------------------
+// MIME support for the Lua language.
+// Author: Diego Nehab
+// Conforming to RFCs 2045-2049
+//---------------------------------------------------------------------------
+
+//---------------------------------------------------------------------------
+// Declare module and import dependencies
+//---------------------------------------------------------------------------
+var base = _G;
+var ltn12 = require("ltn12");
+var mime = require("mime.core");
+var io = require("io");
+var string = require("string");
+var _M = mime;
+
+// encode, decode and wrap algorithm tables
+var encodet, decodet, wrapt = {},{},{};
+
+_M.encodet = encodet;
+_M.decodet = decodet;
+_M.wrapt   = wrapt;  
+
+// creates a function that chooses a filter by name from a given table
+var function choose(table) {
+    return function(name, opt1, opt2) {
+        if( base.type(name) != "string" ) {
+            name, opt1, opt2 = "default", name, opt1;
+        }
+        var f = table[name || "nil"];
+        if( ! f ) { 
+            base.error("unknown key (" .. base.tostring(name) .. ")", 3);
+        } else { return f(opt1, opt2); }
+    };
+}
+
+// define the encoding filters
+encodet['base64'] = function() {
+    return ltn12.filter.cycle(_M.b64, "");
+};
+
+encodet['quoted-printable'] = function(mode) {
+    return ltn12.filter.cycle(_M.qp, "",
+        (mode == "binary") && "=0D=0A" || "\r\n");
+};
+
+// define the decoding filters
+decodet['base64'] = function() {
+    return ltn12.filter.cycle(_M.unb64, "");
+};
+
+decodet['quoted-printable'] = function() {
+    return ltn12.filter.cycle(_M.unqp, "");
+};
+
+var function format(chunk) {
+    if( chunk ) {
+        if( chunk == "" ) { return "''";
+        } else { return string.len(chunk); }
+    } else { return "nil"; }
+}
+
+// define the line-wrap filters
+wrapt['text'] = function(length) {
+    length = length || 76;
+    return ltn12.filter.cycle(_M.wrp, length, length);
+};
+wrapt['base64'] = wrapt['text'];
+wrapt['default'] = wrapt['text'];
+
+wrapt['quoted-printable'] = function() {
+    return ltn12.filter.cycle(_M.qpwrp, 76, 76);
+};
+
+// function that choose the encoding, decoding or wrap algorithm
+_M.encode = choose(encodet);
+_M.decode = choose(decodet);
+_M.wrap = choose(wrapt);
+
+// define the end-of-line normalization filter
+function _M.normalize(marker) {
+    return ltn12.filter.cycle(_M.eol, 0, marker);
+}
+
+// high level stuffing filter
+function _M.stuff() {
+    return ltn12.filter.cycle(_M.dot, 2);
+}
+
+return _M;

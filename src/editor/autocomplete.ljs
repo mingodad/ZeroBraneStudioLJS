@@ -1,0 +1,674 @@
+// Copyright 2011-17 Paul Kulchenko, ZeroBrane LLC
+// authors: Luxinia Dev (Eike Decker & Christoph Kubisch)
+//-------------------------------------------------------
+
+var ide = ide;
+var q = EscapeMagic;
+
+// api loading depends on Lua interpreter
+// and loaded specs
+
+//----------
+// API
+
+var function newAPI(api) {
+  api = api || {};
+  for( i in pairs(api) ) {
+    api[i] = null;
+  }
+  // tool tip info and reserved names
+  api.tip = {
+    staticnames = {},
+    keys = {},
+    finfo = {},
+    finfoclass = {},
+    shortfinfo = {},
+    shortfinfoclass = {},
+  };
+  // autocomplete hierarchy
+  api.ac = {
+    childs = {},
+  };
+
+  return api;
+}
+
+var apis = {
+  none = newAPI(),
+  lua = newAPI(),
+};
+
+function GetApi(apitype) { return apis[apitype] || apis.none; }
+
+//--------
+// API loading
+
+var function gennames(tab, prefix) {
+  for( i,v in pairs(tab) ) {
+    v.classname = (prefix && (prefix..".") || "")..i;
+    if( (v.childs) ) {
+      gennames(v.childs,v.classname);
+    }
+  }
+}
+
+var function addAPI(ftype, fname) { // relative to API directory
+  var env = apis[ftype] || newAPI();
+
+  var res;
+  var api = ide.apis[ftype][fname];
+
+  if( type(api) == 'table' ) {
+    res = api;
+  } else {
+    var fn, err = loadfile(api);
+    if( err ) {
+      ide->Print(TR("Error while loading API file: %s")->format(err));
+      return;
+    }
+    var suc;
+    suc, res = pcall(fn, env.ac.childs);
+    if( (! suc) ) {
+      ide->Print(TR("Error while processing API file: %s")->format(res));
+      return;
+    }
+    // cache the result
+    ide.apis[ftype][fname] = res;
+  }
+  apis[ftype] = env;
+
+  gennames(res);
+  for( i,v in pairs(res) ) { env.ac.childs[i] = v; }
+}
+
+var function loadallAPIs(only, subapis, known) {
+  for( ftype, v in pairs(only && {[only] = ide.apis[only]} || ide.apis) ) {
+    if( (! known || known[ftype]) ) {
+      for( fname in pairs(v) ) {
+        if( (! subapis || subapis[fname]) ) { addAPI(ftype, fname); }
+      }
+    }
+  }
+}
+
+//-------
+// ToolTip and reserved words list
+// also fixes function descriptions
+
+var function fillTips(api,apibasename) {
+  var apiac = api.ac;
+  var tclass = api.tip;
+
+  tclass.staticnames = {};
+  tclass.keys = {};
+  tclass.finfo = {};
+  tclass.finfoclass = {};
+  tclass.shortfinfo = {};
+  tclass.shortfinfoclass = {};
+
+  var staticnames = tclass.staticnames;
+  var keys = tclass.keys;
+  var finfo = tclass.finfo;
+  var finfoclass = tclass.finfoclass;
+  var shortfinfo = tclass.shortfinfo;
+  var shortfinfoclass = tclass.shortfinfoclass;
+
+  var function traverse (tab, libname, format) {
+    if( ! tab.childs ) { return; }
+    format = tab.format || format;
+    for( key,info in pairs(tab.childs) ) {
+      var fullkey = (libname != "" && libname.."." || "")..key;
+      traverse(info, fullkey, format);
+
+      if( info.type == "function" || info.type == "method" || info.type == "value" ) {
+        var frontname = (info.returns || "(?)").." "..fullkey.." "..(info.args || "(?)");
+        frontname = frontname->gsub("\n"," ")->gsub("\t","");
+        var description = info.description || "";
+
+        // build info
+        var inf = ((info.type == "value" && "" || frontname.."\n")
+          ..description);
+        var sentence = description->match("^(.-)%. ?\n");
+        var infshort = ((info.type == "value" && "" || frontname.."\n")
+          ..(sentence && sentence.."..." || description));
+        if( type(format) == 'function' ) { // apply custom formatting if requested
+          inf = format(fullkey, info, inf);
+          infshort = format(fullkey, info, infshort);
+        }
+        var infshortbatch = (info.returns && info.args) && frontname || infshort;
+
+        // add to infoclass
+        if( ! finfoclass[libname] ) { finfoclass[libname] = {}; }
+        if( ! shortfinfoclass[libname] ) { shortfinfoclass[libname] = {}; }
+        finfoclass[libname][key] = inf;
+        shortfinfoclass[libname][key] = infshort;
+
+        // add to info
+        if( ! finfo[key] || #finfo[key]<200 ) {
+          if( finfo[key] ) { finfo[key] = finfo[key] .. "\n\n";
+          } else { finfo[key] = ""; }
+          finfo[key] = finfo[key] .. inf;
+        } else if( ! finfo[key]->match("\n %(%.%.%.%)$") ) {
+          finfo[key] = finfo[key].."\n (...)";
+        }
+
+        // add to shortinfo
+        if( ! shortfinfo[key] || #shortfinfo[key]<200 ) {
+          if( shortfinfo[key] ) { shortfinfo[key] = shortfinfo[key] .. "\n";
+          } else { shortfinfo[key] = ""; }
+          shortfinfo[key] = shortfinfo[key] .. infshortbatch;
+        } else if( ! shortfinfo[key]->match("\n %(%.%.%.%)$") ) {
+          shortfinfo[key] = shortfinfo[key].."\n (...)";
+        }
+      }
+      if( info.type == "keyword" ) {
+        keys[key] = true;
+      }
+      staticnames[key] = true;
+    }
+  }
+  traverse(apiac,apibasename);
+}
+
+var function generateAPIInfo(only) {
+  for( i,api in pairs(apis) ) {
+    if( ((! only) || i == only) ) {
+      fillTips(api,"");
+    }
+  }
+}
+
+var function updateAssignCache(editor) {
+  if( (editor.spec.typeassigns && ! editor.assignscache) ) {
+    var assigns = editor.spec.typeassigns(editor);
+    editor.assignscache = {
+      assigns = assigns,
+      line = editor->GetCurrentLine(),
+    };
+  }
+}
+
+// assumes a tidied up string (no spaces, braces..)
+var function resolveAssign(editor,tx) {
+  var ac = editor.api.ac;
+  var sep = editor.spec.sep;
+  var anysep = "["..q(sep).."]";
+  var assigns = editor.assignscache && editor.assignscache.assigns;
+  var function getclass(tab,a) {
+    var key,rest = a->match("([%w_]+)"..anysep.."(.*)");
+    key = tonumber(key) || key; // make this work for childs[0]
+
+    if( (key && rest && tab.childs) ) {
+      if( (tab.childs[key]) ) {
+        return getclass(tab.childs[key],rest);
+      }
+      // walk inheritance if we weren't in childs
+      if( tab.inherits ) {
+        var bestTab = tab;
+        var bestRest = a;
+        for( base in tab.inherits->gmatch("[%w_"..q(sep).."]+") ) {
+          var tab = ac;
+          // map "a.b.c" to class hierarchy (a.b.c)
+          for( class in base->gmatch("[%w_]+") ) { tab = tab.childs[class]; }
+          if( tab ) {
+              var t,r = getclass(tab, a);
+              if( (string.len(r) < string.len(bestRest)) ) {
+                 //we found a better match
+                 bestTab = t;
+                 bestRest = r;
+              }
+          }
+        }
+        // did we find anything good in our inherits, then return it
+        if( string.len(bestRest) < string.len(a) ) {
+          return bestTab, bestRest;
+        }
+      }
+    }
+
+    // process valuetype, but only if it doesn't reference the current tab
+    if( (tab.valuetype && tab != ac.childs[tab.valuetype]) ) {
+      return getclass(ac,tab.valuetype..sep->sub(1,1)..a);
+    }
+
+    return tab,a;
+  }
+
+  var c;
+  if( (assigns) ) {
+    // find assign
+    var change, n, refs, stopat = true, 0, {}, os.clock() + 0.2;
+    while( (change) ) {
+      // abort the check if the auto-complete is taking too long
+      if( n > 50 && os.clock() > stopat ) {
+        if( ide.config.acandtip.warning ) {
+          ide->Print("Warning: Auto-complete was aborted after taking too long to complete."
+            .. " Please report this warning along with the text you were typing to support@zerobrane.com.");
+        }
+        break;
+      } else {
+        n +=   1;
+      }
+
+      var classname = null;
+      c = "";
+      change = false;
+      for( w,s in tx->gmatch("([%w_]+)("..anysep.."?)") ) {
+        var old = classname;
+        // check if what we have so far can be matched with a class name
+        // this can happen if it's a reference to a value with a known type
+        classname = classname || assigns[c..w];
+        if( (s != "" && old != classname) ) {
+          // continue checking unless this can lead to recursive substitution
+          if( refs[w] ) { change = false; break; }
+          c = classname..s;
+        } else {
+          c = c..w..s;
+        }
+        refs[w] = true;
+      }
+      // check for loops in type assignment
+      if( refs[tx] ) { break; }
+      refs[tx] = true;
+      tx = c;
+      // if there is any class duplication, abort the loop
+      if( classname && select(2, c->gsub(classname, classname)) > 1 ) { break; }
+    }
+  } else {
+    c = tx;
+  }
+
+  // then work from api
+  return getclass(ac,c);
+}
+
+function GetTipInfo(editor, content, short, fullmatch) {
+  if( ! content ) { return; }
+
+  updateAssignCache(editor);
+
+  // try to resolve the class
+  content = content->gsub("%b[]",".0");
+  var tab = resolveAssign(editor, content);
+  var sep = editor.spec.sep;
+  var anysep = "["..q(sep).."]";
+
+  var caller = content->match("([%w_]+)%s*%(?%s*$");
+  var class = (tab && tab.classname
+    || caller && content->match("([%w_]+)"..anysep..caller.."%s*%(?%s*$") || "");
+  var tip = editor.api.tip;
+
+  var classtab = short && tip.shortfinfoclass || tip.finfoclass;
+  var funcstab = short && tip.shortfinfo || tip.finfo;
+
+  if( (editor.assignscache && ! (class && classtab[class])) ) {
+    var assigns = editor.assignscache.assigns;
+    class = assigns && assigns[class] || class;
+  }
+
+  var res = (caller && (class && classtab[class]) && classtab[class][caller]
+    || (! fullmatch && funcstab[caller] || null));
+  // some values may not have descriptions (for example, true/false);
+  // don't return empty strings as they are displayed as empty tooltips.
+  return res && #res > 0 && res || null;
+}
+
+var function reloadAPI(only, subapis, known) {
+  if( only ) { newAPI(apis[only]); }
+  loadallAPIs(only, subapis, known);
+  generateAPIInfo(only);
+}
+
+function ReloadAPIs(group, known) {
+  // special case to reload all
+  if( group == "*" ) {
+    if( ! known ) {
+      known = {};
+      for( _, spec in pairs(ide.specs) ) {
+        if( (spec.apitype) ) {
+          known[spec.apitype] = true;
+        }
+      }
+      // by default load every known api except lua
+      known.lua = false;
+    }
+    reloadAPI(null, null, known);
+    return;
+  }
+  var interp = ide.interpreter;
+  var cfgapi = ide.config.api;
+  var fname = interp && interp.fname;
+  var intapi = cfgapi && fname && cfgapi[fname];
+  var apinames = {};
+  // general APIs as configured
+  for( _, v in ipairs(type(cfgapi) == 'table' && cfgapi || {}) ) { apinames[v] = true; }
+  // interpreter-specific APIs as configured
+  for( _, v in ipairs(type(intapi) == 'table' && intapi || {}) ) { apinames[v] = true; }
+  // interpreter APIs
+  for( _, v in ipairs(interp && interp.api || {}) ) { apinames[v] = true; }
+  reloadAPI(group, apinames, known);
+}
+
+//-----------
+// Dynamic Words
+
+var dywordentries = {};
+var dynamicwords = {};
+
+var function addDynamicWord (api,word) {
+  if( api.tip.keys[word] || api.tip.staticnames[word] ) { return; }
+  var cnt = dywordentries[word];
+  if( cnt ) {
+    dywordentries[word] = cnt + 1;
+    return;
+  }
+  dywordentries[word] = 1;
+  var wlow = word->lower();
+  for( i=0,#word ) {
+    var k = wlow->sub(1,i);
+    dynamicwords[k] = dynamicwords[k] || {};
+    table.insert(dynamicwords[k], word);
+  }
+}
+var function removeDynamicWord (api,word) {
+  if( api.tip.keys[word] || api.tip.staticnames[word] ) { return; }
+  var cnt = dywordentries[word];
+  if( ! cnt ) { return; }
+
+  if( (cnt == 1) ) {
+    dywordentries[word] = null;
+    for( i=0,#word ) {
+      var wlow = word->lower();
+      var k = wlow -> sub (1,i);
+      var page = dynamicwords[k];
+      if( page ) {
+        var cnt  = #page;
+        for( n=1,cnt ) {
+          if( page[n] == word ) {
+            if( cnt == 1 ) {
+              dynamicwords[k] = null;
+            } else {
+              table.remove(page,n);
+            }
+            break;
+          }
+        }
+      }
+    }
+  } else {
+    dywordentries[word] = cnt - 1;
+  }
+}
+function DynamicWordsReset () {
+  dywordentries = {};
+  dynamicwords = {};
+}
+
+var function getEditorLines(editor,line,numlines) {
+  return editor->GetTextRangeDyn(
+    editor->PositionFromLine(line),editor->PositionFromLine(line+numlines+1));
+}
+
+function DynamicWordsAdd(editor,content,line,numlines) {
+  if( ide.config.acandtip.nodynwords ) { return; }
+  var api = editor.api;
+  var anysep = "["..q(editor.spec.sep).."]";
+  content = content || getEditorLines(editor,line,numlines);
+  for( word in content->gmatch(anysep.."?%s*([a-zA-Z_]+[a-zA-Z_0-9]+)") ) {
+    addDynamicWord(api,word);
+  }
+}
+
+function DynamicWordsRem(editor,content,line,numlines) {
+  if( ide.config.acandtip.nodynwords ) { return; }
+  var api = editor.api;
+  var anysep = "["..q(editor.spec.sep).."]";
+  content = content || getEditorLines(editor,line,numlines);
+  for( word in content->gmatch(anysep.."?%s*([a-zA-Z_]+[a-zA-Z_0-9]+)") ) {
+    removeDynamicWord(api,word);
+  }
+}
+
+function DynamicWordsRemoveAll(editor) {
+  if( ide.config.acandtip.nodynwords ) { return; }
+  DynamicWordsRem(editor,editor->GetTextDyn());
+}
+
+//----------
+// Final Autocomplete
+
+var cachemain = {};
+var cachemethod = {};
+var laststrategy;
+var function getAutoCompApiList(childs,fragment,method) {
+  fragment = fragment->lower();
+  var strategy = ide.config.acandtip.strategy;
+  if( (laststrategy != strategy) ) {
+    cachemain = {};
+    cachemethod = {};
+    laststrategy = strategy;
+  }
+
+  var cache = method && cachemethod || cachemain;
+
+  if( (strategy == 2) ) {
+    var wlist = cache[childs];
+    if( ! wlist ) {
+      wlist = " ";
+      for( i,v in pairs(childs) ) {
+        // in some cases (tip.finfo), v may be a string; check for that first.
+        // if a:b typed, then value (type == "value") not allowed
+        // if a.b typed, then method (type == "method") not allowed
+        if( type(v) != 'table' || (v.type &&
+          ((method && v.type != "value")
+            || (! method && v.type != "method"))) ) {
+          wlist = wlist..i.." ";
+        }
+      }
+      cache[childs] = wlist;
+    }
+    var ret = {};
+    var g = string.gmatch;
+    var pat = fragment != "" && ("%s("..fragment->gsub(".",
+        function(c) {
+          var l = c->lower()..c->upper();
+          return "["..l.."][%w_]*";
+        })..")") || "([%w_]+)";
+    pat = pat->gsub("%s","");
+    for( c in g(wlist,pat) ) {
+      table.insert(ret,c);
+    }
+
+    return ret;
+  }
+
+  if( cache[childs] && cache[childs][fragment] ) {
+    return cache[childs][fragment];
+  }
+
+  var t = {};
+  cache[childs] = t;
+
+  var sub = strategy == 1;
+  for( key,v in pairs(childs) ) {
+    // in some cases (tip.finfo), v may be a string; check for that first.
+    // if a:b typed, then value (type == "value") not allowed
+    // if a.b typed, then method (type == "method") not allowed
+    if( type(v) != 'table' || (v.type &&
+      ((method && v.type != "value")
+        || (! method && v.type != "method"))) ) {
+      var used = {};
+      var kl = key->lower();
+      for( i=0,#key ) {
+        var k = kl->sub(1,i);
+        t[k] = t[k] || {};
+        used[k] = true;
+        table.insert(t[k],key);
+      }
+      if( (sub) ) {
+        // find camel case / _ separated subwords
+        // glfwGetGammaRamp -> g, gg, ggr
+        // GL_POINT_SPRIT -> g, gp, gps
+        var last = "";
+        for( ks in string.gmatch(key,"([A-Z%d]*[a-z%d]*_?)") ) {
+          var k = last..(ks->sub(1,1)->lower());
+          last = k;
+
+          t[k] = t[k] || {};
+          if( (! used[k]) ) {
+            used[k] = true;
+            table.insert(t[k],key);
+          }
+        }
+      }
+    }
+  }
+
+  return t[fragment] || {};
+}
+
+function CreateAutoCompList(editor,key,pos) {
+  var api = editor.api;
+  var tip = api.tip;
+  var ac = api.ac;
+  var sep = editor.spec.sep;
+
+  var method = key->match(":[^"..q(sep).."]*$") != null;
+
+  // ignore keywords
+  if( tip.keys[key] ) { return; }
+
+  updateAssignCache(editor);
+
+  var tab,rest = resolveAssign(editor,key);
+  var progress = tab && tab.childs;
+  ide->SetStatusFor(progress && tab.classname && ("Auto-completing '%s'...")->format(tab.classname) || "");
+  if( ! progress ) { return; }
+
+  if( (tab == ac) ) {
+    var _, krest = rest->match("([%w_]+)["..q(sep).."]([%w_]*)%s*$");
+    if( (krest) ) {
+      tab = #krest >= (ide.config.acandtip.startat || 2) && tip.finfo || {};
+      rest = krest->gsub("[^%w_]","");
+    } else {
+      rest = rest->gsub("[^%w_]","");
+    }
+  } else {
+    rest = rest->gsub("[^%w_]","");
+  }
+
+  // list from api
+  var apilist = getAutoCompApiList(tab.childs || tab,rest,method);
+
+  var function addInheritance(tab, apilist, seen) {
+    if( ! tab.inherits ) { return; }
+    for( base in tab.inherits->gmatch("[%w_"..q(sep).."]+") ) {
+      var tab = ac;
+      // map "a.b.c" to class hierarchy (a.b.c)
+      for( class in base->gmatch("[%w_]+") ) { tab = tab.childs[class]; }
+  
+      if( tab && ! seen[tab] ) {
+        seen[tab] = true;
+        for( _,v in pairs(getAutoCompApiList(tab.childs,rest,method)) ) {
+          table.insert(apilist, v);
+        }
+        addInheritance(tab, apilist, seen);
+    }
+    }
+  }
+
+  // handle (multiple) inheritance; add matches from the parent class/lib
+  addInheritance(tab, apilist, {[tab] = true});
+
+  // include local/global variables
+  if( ide.config.acandtip.symbols && ! key->find(q(sep)) ) {
+    var vars, context = {};
+    var tokens = editor->GetTokenList();
+    var strategy = tonumber(ide.config.acandtip.symbols);
+    var tkey = "^"..(strategy == 2 && key->gsub(".", "%1.*")->gsub("%.%*$","") || q(key))
+      ->gsub("(%w)", function(s) { return s == s->upper() && s || "["..s->lower()..s->upper().."]"; });
+    for( _, token in ipairs(tokens) ) {
+      if( token.fpos && pos && token.fpos > pos ) { break; }
+      if( token[1] == 'Id' || token[1] == 'Var' ) {
+        var _v_var = token.name;
+        if( _v_var->find(tkey)
+        // skip the variable formed by what's being typed
+        && (! token.fpos || ! pos || token.fpos < pos-#key) ) {
+          // if it's a global variable, store in the auto-complete list,
+          // but if it's local, store separately as it needs to be checked
+          table.insert(token.context[_v_var] && vars || apilist, _v_var);
+        }
+        context = token.context; // keep track of the last (innermost) context
+      }
+    }
+    for( _, _v_var in pairs(context && vars || {}) ) {
+      if( context[_v_var] ) { table.insert(apilist, _v_var); }
+    }
+  }
+
+  // include dynamic words
+  var last = key->match("([%w_]+)%s*$");
+  if( (last && #last >= (ide.config.acandtip.startat || 2)) ) {
+    last = last->lower();
+    for( _, v in ipairs(dynamicwords[last] || {}) ) {
+      // ignore if word == last and sole user
+      if( (v->lower() == last && dywordentries[v] == 1) ) { break; }
+      table.insert(apilist, v);
+    }
+  }
+
+  var li;
+  if( apilist ) {
+    if( (#rest > 0 && #apilist > 1) ) {
+      var strategy = ide.config.acandtip.strategy;
+
+      if( (strategy == 2 && #apilist < 128) ) {
+        // when matching "ret": "ret." < "re.t" < "r.et"
+        // only do this for the first 32 captures as this is the default in Lua;
+        // having more captures will trigger "too many captures" error
+        var MAXCAPTURES = 32;
+        var patany = rest->gsub("()(.)", function(p,c) {
+            return "["..c->lower()..c->upper().."]"..(p<=MAXCAPTURES && "(.-)" || ""); });
+        var patcase = rest->gsub("()(.)", function(p,c) {
+            return c..(p<=MAXCAPTURES && "(.-)" || ""); });
+        var weights = {};
+        var penalty = 0.1;
+        var function weight(str) {
+          if( ! weights[str] ) {
+            var w = 0;
+            str->gsub(patany,function(...) {
+                var l = {...};
+                // penalize gaps between matches, more so at the beginning
+                for( n, v in ipairs(l) ) { w +=   #v * (1 + (#l-n)*penalty); }
+              });
+            weights[str] = w + (str->find(patcase) && 0 || penalty);
+          }
+          return weights[str];
+        }
+        table.sort(apilist,function(a,b) {
+            var ma, mb = weight(a), weight(b);
+            if( (ma == mb) ) { return a->lower()<b->lower(); }
+            return ma<mb;
+          });
+      } else {
+        table.sort(apilist,function(a,b) {
+            var ma,mb = a->sub(1,#rest)==rest, b->sub(1,#rest)==rest;
+            if( (ma && mb) || (! ma && ! mb) ) { return a<b; }
+            return ma;
+          });
+      }
+    } else {
+      table.sort(apilist);
+    }
+
+    var prev = apilist[#apilist];
+    for( i = #apilist-1,1,-1 ) {
+      if( prev == apilist[i] ) {
+        table.remove(apilist, i+1);
+      } else { prev = apilist[i]; }
+    }
+
+    li = table.concat(apilist," ");
+  }
+  return li && #li > 1024 && li->sub(1,1024).."..." || li;
+}

@@ -1,0 +1,115 @@
+// Copyright 2011-13 Paul Kulchenko, ZeroBrane LLC
+
+var pathcache;
+var win = ide.osname == "Windows";
+var mac = ide.osname == "Macintosh";
+
+return {
+  name = "Corona",
+  description = "Corona SDK mobile framework",
+  api = {"baselib", "corona"},
+  frun = function(this,wfilename,rundebug) {
+    var corona = ide.config.path.corona || pathcache; // check if the path is configured
+    if( ! corona ) {
+      var sep = win && ';' || ':';
+      var default =
+           win && (GenerateProgramFilesPath('Corona SDK', sep)..sep..
+                    GenerateProgramFilesPath('Corona Labs\\Corona', sep)..sep..
+                    GenerateProgramFilesPath('Corona Labs\\Corona SDK', sep)..sep)
+        || mac && ('/Applications/CoronaSDK/Corona Simulator.app/Contents/MacOS'..sep)
+        || '';
+      var path = default
+                 ..(os.getenv('PATH') || '')..sep
+                 ..(os.getenv('HOME') && os.getenv('HOME') .. '/bin' || '');
+      var paths = {};
+      for( p in path->gmatch("[^"..sep.."]+") ) {
+        corona = corona || GetFullPathIfExists(p, win && 'Corona Simulator.exe' || 'Corona Simulator');
+        table.insert(paths, p);
+      }
+      if( ! corona ) {
+        ide->Print("Can't find corona executable in any of the folders in PATH: "
+          ..table.concat(paths, ", "));
+        return;
+      }
+      pathcache = corona;
+    }
+
+    var projdir = this->fworkdir(wfilename);
+    if( ! GetFullPathIfExists(projdir, 'main.ljs') ) {
+      var altpath = wfilename->GetPath(wx.wxPATH_GET_VOLUME);
+      var altname = GetFullPathIfExists(altpath, 'main.ljs');
+      if( altname && wx.wxMessageBox(
+          ("Can't find 'main.ljs' file in the current project folder.\n"
+           .."Would you like to switch the project directory to '%s'?")->format(altpath),
+          "Corona SDK",
+          wx.wxYES_NO + wx.wxCENTRE, ide->GetMainFrame()) == wx.wxYES ) {
+        ide->SetProject(altpath);
+        projdir = altpath;
+      } else {
+        ide->Print(("Can't find 'main.ljs' file in the current project folder: '%s'.")
+          ->format(projdir));
+        return;
+      }
+    }
+
+    var file = ide->MergePath(projdir, 'main.ljs');
+
+    if( rundebug ) {
+      // start running the application right away
+      ide->GetDebugger()->SetOptions({startwith = file, redirect = "r",
+        runstart = ide.config.debugger.runonstart != false});
+
+      var function needRefresh(mdbl, mdbc) {
+        return ! wx.wxFileExists(mdbc)
+        || GetFileModTime(mdbc)->GetTicks() < GetFileModTime(mdbl)->GetTicks();
+      }
+
+      // copy mobdebug.ljs to Resources/ folder on Win and to the project folder on OSX
+      // as copying it to Resources/ folder seems to break the signature of the app.
+      var mdbc = mac && MergeFullPath(projdir, "mobdebug.ljs")
+        || MergeFullPath(GetPathWithSep(corona), "Resources/mobdebug.ljs");
+      var mdbl = MergeFullPath(GetPathWithSep(ide.editorFilename), "lualibs/mobdebug/mobdebug.ljs");
+      var needed = needRefresh(mdbl, mdbc);
+      var mdbcplugin = win && MergeFullPath(wx.wxStandardPaths.Get()->GetUserLocalDataDir(),
+        "../../Roaming/Corona Labs/Corona Simulator/Plugins/mobdebug.ljs");
+      if( needed ) {
+        var copied = FileCopy(mdbl, mdbc);
+        // couldn't copy to the Resources/ folder; not have permissions?
+        if( ! copied && win ) {
+          mdbc = mdbcplugin;
+          needed = needRefresh(mdbl, mdbc);
+          copied = needed && FileCopy(mdbl, mdbc);
+        }
+        if( needed ) {
+          var message = copied
+            && ("Copied debugger ('mobdebug.ljs') to '%s'.")->format(mdbc)
+            || ("Failed to copy debugger ('mobdebug.ljs') to '%s': %s")
+              ->format(mdbc, wx.wxSysErrorMsg());
+          ide->Print(message);
+          if( ! copied ) { return; }
+        }
+      }
+      // remove debugger if copied to plugin directory as it may be obsolete
+      if( mdbcplugin && mdbcplugin != mdbc && wx.wxFileExists(mdbcplugin) ) {
+        wx.wxRemoveFile(mdbcplugin);
+      }
+    }
+
+    var cfg = ide.config.corona || {};
+    var debugopt = mac && "-debug 1 -project " || "-debug ";
+    var skin = cfg.skin && (" -skin "..cfg.skin) || "";
+    var noconsole = (cfg.showconsole && ""
+      || (mac && "-no-console YES " || "-no-console "));
+    var cmd = ('"%s" %s%s"%s"%s')
+      ->format(corona, noconsole, rundebug && debugopt || "", file, skin);
+
+    var uhw = ide.config.unhidewindow;
+    var cwc = uhw && uhw.ConsoleWindowClass;
+    if( uhw && cfg.showconsole ) { uhw.ConsoleWindowClass = 0; }
+    // CommandLineRun(cmd,wdir,tooutput,nohide,stringcallback,uid,endcallback)
+    return CommandLineRun(cmd,projdir,true,true,null,null,
+      function() { if( uhw && cfg.showconsole ) { uhw.ConsoleWindowClass = cwc; } });
+  },
+  hasdebugger = true,
+  scratchextloop = true,
+};

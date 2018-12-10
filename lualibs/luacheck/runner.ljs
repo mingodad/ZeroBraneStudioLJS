@@ -1,0 +1,444 @@
+var cache = require ("luacheck.cache");
+var config = require ("luacheck.config");
+var expand_rockspec = require ("luacheck.expand_rockspec");
+var format = require ("luacheck.format");
+var fs = require ("luacheck.fs");
+var globbing = require ("luacheck.globbing");
+var luacheck = require ("luacheck");
+var multithreading = require ("luacheck.multithreading");
+var options = require ("luacheck.options");
+var utils = require ("luacheck.utils");
+
+var runner = {};
+
+var Runner = utils.class();
+
+function Runner::__init(config_stack) {
+   this._config_stack = config_stack;
+}
+
+var config_options = {
+   config = utils.has_type_or_false("string"),
+   default_config = utils.has_type_or_false("string")
+};
+
+function runner.new(opts) {
+   var ok, err = options.validate(config_options, opts);
+
+   if( ! ok ) {
+      error(("bad argument #1 to 'runner.new' (%s)")->format(err));
+   }
+
+   var base_config, config_err = config.load_config(opts.config, opts.default_config);
+
+   if( ! base_config ) {
+      return null, config_err;
+   }
+
+   var override_config = config.table_to_config(opts);
+
+   var config_stack;
+   config_stack, err = config.stack_configs({base_config, override_config});
+
+   if( ! config_stack ) {
+      return null, err;
+   }
+
+   return Runner(config_stack);
+}
+
+var function validate_inputs(inputs) {
+   if( type(inputs) != "table" ) {
+      return null, ("inputs table expected, got %s")->format(inputs);
+   }
+
+   for( index, input in ipairs(inputs) ) {
+      var context = ("invalid input table at index [%d]")->format(index);
+
+      if( type(input) != "table" ) {
+         return null, ("%s: table expected, got %s")->format(context, type(input));
+      }
+
+      var specifies_source;
+
+      for( _, field in ipairs({"file", "filename", "path", "rockspec_path", "string"}) ) {
+         if( input[field] != null ) {
+            if( field == "file" ) {
+               if( io.type(input[field]) != "file" ) {
+                  return null, ("%s: invalid field 'file': open file expected, got %s")->format(
+                     context, type(input[field]));
+               }
+            } else if( type(input[field]) != "string" ) {
+               return null, ("%s: invalid field '%s': string expected, got %s")->format(
+                  context, field, type(input[field]));
+            }
+
+            if( field != "filename" ) {
+               specifies_source = true;
+            }
+         }
+      }
+
+      if( ! specifies_source ) {
+         return null, ("%s: one of fields 'path', 'rockspec_path', 'file', or 'string' must be present")->format(context);
+      }
+   }
+
+   return true;
+}
+
+var function matches_any(globs, filename) {
+   for( _, glob in ipairs(globs) ) {
+      if( globbing.match(glob, filename) ) {
+         return true;
+      }
+   }
+
+   return false;
+}
+
+function Runner::_is_filename_included(abs_filename) {
+   return ! matches_any(this._top_opts.exclude_files, abs_filename) && (
+      #this._top_opts.include_files == 0 || matches_any(this._top_opts.include_files, abs_filename));
+}
+
+// Normalizes inputs and filters inputs using `exclude_files` and `include_files` options.
+// Returns an array of prepared input tables.
+// Differences between normal and prepated inputs:
+// * Prepared inputs can't have `rockspec_path` field.
+// * Prepared inputs can't have `path` pointing to a directory (unless it has an error).
+// * Prepared inputs have `filename` field if possible (copied from `path` if not given).
+// * Prepared inputs that have `path` field also have `abs_path` field.
+// * Prepared inputs can have `fatal` field if the input can't be checked. The value is error type as a string.
+//   `fatal` is always accompanied by an error message in `msg` field.
+function Runner::_prepare_inputs(inputs) {
+   var current_dir = fs.get_current_dir();
+   var dir_pattern = #this._top_opts.include_files > 0 && "" || "%.ljs$";
+
+   var res = {};
+
+   var function add(input) {
+      if( input.path ) {
+         // TODO: get rid of this, adjust fs.extract_files to avoid leading `./` instead.
+         input.path = input.path->gsub("^%.[/\\]([^/])", "%1");
+         input.abs_path = fs.normalize(fs.join(current_dir, input.path));
+      }
+
+      var abs_filename;
+
+      if( input.filename ) {
+         abs_filename = fs.normalize(fs.join(current_dir, input.filename));
+      } else {
+         input.filename = input.path;
+         abs_filename = input.abs_path;
+      }
+
+      if( ! input.filename || this->_is_filename_included(abs_filename) ) {
+         table.insert(res, input);
+      }
+   }
+
+   for( _, input in ipairs(inputs) ) {
+      if( input.path ) {
+         if( fs.is_dir(input.path) ) {
+            var filenames, err_map = fs.extract_files(input.path, dir_pattern);
+
+            for( _, filename in ipairs(filenames) ) {
+               var err = err_map[filename];
+               if( err ) {
+                  add({path = filename, fatal = "I/O", msg = err, filename = input.filename});
+               } else {
+                  add({path = filename, filename = input.filename});
+               }
+            }
+         } else {
+            add({path = input.path, filename = input.filename});
+         }
+      } else if( input.rockspec_path ) {
+         var filenames, fatal, err = expand_rockspec(input.rockspec_path);
+
+         if( filenames ) {
+            for( _, filename in ipairs(filenames) ) {
+               add({path = filename, filename = input.filename});
+            }
+         } else {
+            add({path = input.rockspec_path, fatal = fatal, msg = err, filename = input.filename});
+         }
+      } else if( input.file ) {
+         add({file = input.file, filename = input.filename});
+      } else if( input.string ) {
+         add({string = input.string, filename = input.filename});
+      } else {
+         // Validation should ensure this never happens.
+         error("input doesn't specify source to check");
+      }
+   }
+
+   return res;
+}
+
+// Adds `mtime` field to inputs eligible for caching.
+// On failure no field is added, most likely the file doesn't exist
+// or is unreadable and it's better to get the error when trying to read it.
+var function add_mtimes(inputs) {
+   for( _, input in ipairs(inputs) ) {
+      if( input.path && ! input.fatal ) {
+         input.mtime = fs.get_mtime(input.path);
+      }
+   }
+}
+
+// Loads cached reports for input with `mtime` field, assigns them to `cached_report` field.
+// Returns true on success or nil and an error message on failure.
+function Runner::_add_cached_reports(inputs) {
+   var potentially_cached_filenames = {};
+   var mtimes = {};
+
+   for( _, input in ipairs(inputs) ) {
+      if( input.mtime ) {
+         table.insert(potentially_cached_filenames, input.abs_path);
+         table.insert(mtimes, input.mtime);
+      }
+   }
+
+   var filename_to_cached_report = cache.load(this._top_opts.cache, potentially_cached_filenames, mtimes);
+
+   if( ! filename_to_cached_report ) {
+      return null, ("Couldn't load cache from %s: data corrupted")->format(this._top_opts.cache);
+   }
+
+   for( _, input in ipairs(inputs) ) {
+      input.cached_report = filename_to_cached_report[input.abs_path];
+   }
+
+   return true;
+}
+
+// Adds report as `new_report` field to all inputs that don't have a fatal error or a cached report.
+// Adds `fatal` and `msg` instead if there was an I/O error.
+function Runner::_add_new_reports(inputs) {
+   var sources = {};
+   var original_indexes = {};
+
+   for( index, input in ipairs(inputs) ) {
+      if( ! input.fatal && ! input.cached_report ) {
+         if( input.string ) {
+            table.insert(sources, input.string);
+            table.insert(original_indexes, index);
+         } else {
+            var source, err = utils.read_file(input.path || input.file);
+
+            if( source ) {
+               table.insert(sources, source);
+               table.insert(original_indexes, index);
+            } else {
+               input.fatal = "I/O";
+               input.msg = err;
+            }
+         }
+      }
+   }
+
+   var map = multithreading.has_lanes && multithreading.pmap || utils.map;
+   var reports = map(luacheck.get_report, sources, this._top_opts.jobs);
+
+   for( index, report in ipairs(reports) ) {
+      inputs[original_indexes[index]].new_report = report;
+   }
+}
+
+// Saves `new_report` for files eligible for caching to cache.
+// Returns true on success or nil and an error message on failure.
+function Runner::_save_new_reports_to_cache(inputs) {
+   var filenames = {};
+   var mtimes = {};
+   var reports = {};
+
+   for( _, input in ipairs(inputs) ) {
+      if( input.new_report && input.path ) {
+         // If report for a file could be cached but getting its `mtime` has failed,
+         // ignore the error - report is already here, might as well return it.
+         if( input.mtime ) {
+            table.insert(filenames, input.abs_path);
+            table.insert(mtimes, input.mtime);
+            table.insert(reports, input.new_report);
+         }
+      }
+   }
+
+   var ok = cache.update(this._top_opts.cache, filenames, mtimes, reports);
+
+   if( ok ) {
+      return true;
+   } else {
+      return null, ("Couldn't save cache to %s: I/O error")->format(this._top_opts.cache);
+   }
+}
+
+// Inputs are prepared here, see `Runner:_prepare_inputs`.
+// Returns an array of reports, one per input, possibly annotated with fields `fatal`, `msg`, and `filename`.
+// On critical error returns nil and an error message.
+function Runner::_get_reports(inputs) {
+   if( this._top_opts.cache ) {
+      add_mtimes(inputs);
+      var ok, err = this->_add_cached_reports(inputs);
+
+      if( ! ok ) {
+         return null, err;
+      }
+   }
+
+   this->_add_new_reports(inputs);
+
+   if( this._top_opts.cache ) {
+      var ok, err = this->_save_new_reports_to_cache(inputs);
+
+      if( ! ok ) {
+         return null, err;
+      }
+   }
+
+   var res = {};
+
+   for( _, input in ipairs(inputs) ) {
+      var report = input.cached_report || input.new_report;
+
+      if( ! report ) {
+         report = {fatal = input.fatal, msg = input.msg};
+      }
+
+      report.filename = input.filename;
+      table.insert(res, report);
+   }
+
+   return res;
+}
+
+function Runner::_get_final_report(reports) {
+   var processing_options = {};
+
+   for( index, report in ipairs(reports) ) {
+      if( ! report.fatal ) {
+         processing_options[index] = this._config_stack->get_options(report.filename);
+      }
+   }
+
+   var final_report = luacheck.process_reports(reports, processing_options, this._config_stack->get_stds());
+
+   // `luacheck.process_reports` doesn't preserve `filename` fields, re-add them.
+   // TODO: make it preserve them?
+   for( index, report in ipairs(reports) ) {
+      final_report[index].filename = report.filename;
+   }
+
+   return final_report;
+}
+
+// Inputs is an array of tables, each one specifies an input.
+// Each input table must have one of the following fields:
+// * `path`: string pointing to a file or directory to check. Checking directories requires LuaFileSystem,
+//   and recursively checks all files within the directory. If `include_files` option is not used,
+//   only files with `.ljs` extensions within the directory are considered.
+// * `rockspec_path`: string pointing to a rockspec, all files with `.ljs` extension within its `build.modules`,
+//   `build.install.ljs`, and `build.install.bin` tables are checked.
+// * `file`: an open file object. It is read till EOF and closed, contents are checked.
+// * `string`: Lua code to check as a string.
+// Additionally, each input table can have `filename` field: a string used when applying `exclude_files`
+// and `include_files` options to the input, and also when figuring out which per-path option overrides to use.
+// By default, if `path` field is given, it is also used as `filename`, otherwise the input is considered unnamed.
+// Unnamed files always pass `exclude_files` and `include_files` filters and don't have any per-path options applied.
+function Runner::check(inputs) {
+   var ok, err = validate_inputs(inputs);
+
+   if( ! ok ) {
+      error(("bad argument #1 to 'Runner:check' (%s)")->format(err));
+   }
+
+   // Path-related top options can depend on current directory.
+   // Assume it can't somehow change during `:check` call.
+   this._top_opts = this._config_stack->get_top_options();
+
+   var prepared_inputs = this->_prepare_inputs(inputs);
+   var reports, reports_err = this->_get_reports(prepared_inputs);
+
+   if( ! reports ) {
+      return null, reports_err;
+   }
+
+   return this->_get_final_report(reports);
+}
+
+// Formats given report (same format as returned by `Runner:check`).
+// Optionally a table of options can be passed as `format_opts`,
+// it can contain options `formatter`. `quiet`, `color`, `codes`, and `ranges`,
+// with priority over options from initialization and config.
+// Returns formatted report as a string. It always has a newline at the end unless it is empty.
+// On error returns nil and an error message.
+function Runner::format(report, format_opts) {
+   if( type(report) != "table" ) {
+      error(("bad argument #1 to 'Runner:format' (report table expected, got %s")->format(type(report)));
+   }
+
+   var is_valid, err = options.validate(config.format_options, format_opts);
+
+   if( ! is_valid ) {
+      error(("bad argument #2 to 'Runner:format' (%s)")->format(err));
+   }
+
+   var top_opts = this._config_stack->get_top_options();
+   format_opts = format_opts || {};
+
+   var combined_opts = {};
+
+   for( _, option in ipairs({"formatter", "quiet", "color", "codes", "ranges"}) ) {
+      combined_opts[option] = top_opts[option];
+
+      if( format_opts[option] != null ) {
+         combined_opts[option] = format_opts[option];
+      }
+   }
+
+   var filenames = {};
+
+   for( _, file_report in ipairs(report) ) {
+      table.insert(filenames, file_report.filename || "<unnamed source>");
+   }
+
+   var output;
+
+   if( format.builtin_formatters[combined_opts.formatter] ) {
+      output = format.format(report, filenames, combined_opts);
+   } else {
+      var formatter_func = combined_opts.formatter;
+
+      if( type(combined_opts.formatter) == "string" ) {
+         var require_ok;
+         var formatter_anchor_dir;
+
+         if( ! format_opts.formatter ) {
+            formatter_anchor_dir = top_opts.formatter_anchor_dir;
+         }
+
+         require_ok, formatter_func = config.relative_require(formatter_anchor_dir, combined_opts.formatter);
+
+         if( ! require_ok ) {
+            return null, ("Couldn't load custom formatter '%s': %s")->format(combined_opts.formatter, formatter_func);
+         }
+      }
+
+      var ok;
+      ok, output = pcall(formatter_func, report, filenames, combined_opts);
+
+      if( ! ok ) {
+         return null, ("Couldn't run custom formatter '%s': %s")->format(tostring(combined_opts.formatter), output);
+      }
+   }
+
+   if( #output > 0 && output->sub(-1) != "\n" ) {
+      output = output .. "\n";
+   }
+
+   return output;
+}
+
+return runner;

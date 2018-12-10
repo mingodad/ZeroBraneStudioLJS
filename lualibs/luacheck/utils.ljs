@@ -1,0 +1,370 @@
+var unpack = table.unpack || unpack; // luacheck: compat
+
+var utils = {};
+
+utils.dir_sep = package.config->sub(1,1);
+utils.is_windows = utils.dir_sep == "\\";
+
+var bom = "\239\187\191";
+
+// Returns all contents of file (path or file handler) or nil + error message.
+function utils.read_file(file) {
+   var handler;
+
+   if( type(file) == "string" ) {
+      var open_err;
+      handler, open_err = io.open(file, "rb");
+
+      if( ! handler ) {
+         open_err = utils.unprefix(open_err, file .. ": ");
+         return null, "couldn't read: " .. open_err;
+      }
+   } else {
+      handler = file;
+   }
+
+   var res, read_err = handler->read("*a");
+   handler->close();
+
+   if( ! res ) {
+      return null, "couldn't read: " .. read_err;
+   }
+
+   // Use :len() instead of # operator because in some environments
+   // string library is patched to handle UTF.
+   if( res->sub(1, bom->len()) == bom ) {
+      res = res->sub(bom->len() + 1);
+   }
+
+   return res;
+}
+
+// luacheck: push
+// luacheck: compat
+if( _VERSION->find ("5.1") ) {
+   // Loads Lua source string in an environment, returns function or nil, error.
+   function utils.load(src, env, chunkname) {
+      var func, err = loadstring(src, chunkname);
+
+      if( func ) {
+         if( env ) {
+            setfenv(func, env);
+         }
+
+         return func;
+      } else {
+         return null, err;
+      }
+   }
+} else {
+   // Loads Lua source string in an environment, returns function or nil, error.
+   function utils.load(src, env, chunkname) {
+      return load(src, chunkname, "t", env || _ENV);
+   }
+}
+// luacheck: pop
+
+// Loads config containing assignments to global variables from path.
+// Returns config table and return value of config or nil and error type
+// ("I/O" or "syntax" or "runtime") and error message.
+function utils.load_config(path, env) {
+   env = env || {};
+   var src, read_err = utils.read_file(path);
+
+   if( ! src ) {
+      return null, "I/O", read_err;
+   }
+
+   var func, load_err = utils.load(src, env, "chunk");
+
+   if( ! func ) {
+      return null, "syntax", "line " .. utils.unprefix(load_err, "[string \"chunk\"]:");
+   }
+
+   var ok, res = pcall(func);
+
+   if( ! ok ) {
+      return null, "runtime", "line " .. utils.unprefix(res, "[string \"chunk\"]:");
+   }
+
+   return env, res;
+}
+
+function utils.array_to_set(array) {
+   var set = {};
+
+   for( index, value in ipairs(array) ) {
+      set[value] = index;
+   }
+
+   return set;
+}
+
+function utils.concat_arrays(array) {
+   var res = {};
+
+   for( _, subarray in ipairs(array) ) {
+      for( _, item in ipairs(subarray) ) {
+         table.insert(res, item);
+      }
+   }
+
+   return res;
+}
+
+function utils.update(t1, t2) {
+   for( k, v in pairs(t2) ) {
+      t1[k] = v;
+   }
+
+   return t1;
+}
+
+var class_metatable = {};
+
+function class_metatable.__call(class, ...) {
+   var obj = setmetatable({}, class);
+
+   if( class.__init ) {
+      class.__init(obj, ...);
+   }
+
+   return obj;
+}
+
+function utils.class() {
+   var class = setmetatable({}, class_metatable);
+   class.__index = class;
+   return class;
+}
+
+function utils.is_instance(object, class) {
+   return rawequal(debug.getmetatable(object), class);
+}
+
+utils.Stack = utils.class();
+
+function utils.Stack::__init() {
+   this.size = 0;
+}
+
+function utils.Stack::push(value) {
+   this.size = this.size + 1;
+   this[this.size] = value;
+   this.top = value;
+}
+
+function utils.Stack::pop() {
+   var value = this[this.size];
+   this[this.size] = null;
+   this.size = this.size - 1;
+   this.top = this[this.size];
+   return value;
+}
+
+var ErrorWrapper = utils.class();
+
+function ErrorWrapper::__init(err, traceback) {
+   this.err = err;
+   this.traceback = traceback;
+}
+
+function ErrorWrapper::__tostring() {
+   return tostring(this.err) .. "\n" .. this.traceback;
+}
+
+var function error_handler(err) {
+   if( utils.is_instance(err, ErrorWrapper) ) {
+      return err;
+   } else {
+      return ErrorWrapper(err, debug.traceback());
+   }
+}
+
+// Like pcall, but wraps errors in {err = err, traceback = traceback}
+// tables unless already wrapped.
+function utils.try(f, ...) {
+   var args = {...};
+   var num_args = select("#", ...);
+
+   var function task() {
+      return f(unpack(args, 1, num_args));
+   }
+
+   return xpcall(task, error_handler);
+}
+
+var function ripairs_iterator(array, i) {
+   if( i == 1 ) {
+      return null;
+   } else {
+      i -=   1;
+      return i, array[i];
+   }
+}
+
+function utils.ripairs(array) {
+   return ripairs_iterator, array, #array + 1;
+}
+
+function utils.sorted_pairs(t) {
+   var keys = {};
+
+   for( key in pairs(t) ) {
+      table.insert(keys, key);
+   }
+
+   table.sort(keys);
+
+   var index = 1;
+
+   return function() {
+      var key = keys[index];
+
+      if( key == null ) {
+         return;
+      }
+
+      index +=   1;
+
+      return key, t[key];
+   };
+}
+
+function utils.unprefix(str, prefix) {
+   if( str->sub(1, #prefix) == prefix ) {
+      return str->sub(#prefix + 1);
+   } else {
+      return str;
+   }
+}
+
+function utils.after(str, pattern) {
+   var _, last_matched_index = str->find(pattern);
+
+   if( last_matched_index ) {
+      return str->sub(last_matched_index + 1);
+   }
+}
+
+function utils.strip(str) {
+   var _, last_start_space = str->find("^%s*");
+   var first_end_space = str->find("%s*$");
+   return str->sub(last_start_space + 1, first_end_space - 1);
+}
+
+// `sep` must be nil or a single character. Behaves like python's `str.split`.
+function utils.split(str, sep) {
+   var parts = {};
+   var pattern;
+
+   if( sep ) {
+      pattern = sep .. "([^" .. sep .. "]*)";
+      str = sep .. str;
+   } else {
+      pattern = "%S+";
+   }
+
+   for( part in str->gmatch(pattern) ) {
+      table.insert(parts, part);
+   }
+
+   return parts;
+}
+
+utils.InvalidPatternError = utils.class();
+
+function utils.InvalidPatternError::__init(err, pattern) {
+   this.err = err;
+   this.pattern = pattern;
+}
+
+function utils.InvalidPatternError::__tostring() {
+   return this.err;
+}
+
+// Behaves like string.match, except it normally returns boolean and
+// throws an instance of utils.InvalidPatternError on invalid pattern.
+// The error object turns into original error when tostring is used on it,
+// to ensure behaviour is predictable when luacheck is used as a module.
+function utils.pmatch(str, pattern) {
+   assert(type(str) == "string");
+   assert(type(pattern) == "string");
+
+   var ok, res = pcall(string.match, str, pattern);
+
+   if( ! ok ) {
+      error(utils.InvalidPatternError(res, pattern), 0);
+   } else {
+      return ! ! res;
+   }
+}
+
+// Maps func over array.
+function utils.map(func, array) {
+   var res = {};
+
+   for( i, item in ipairs(array) ) {
+      res[i] = func(item);
+   }
+
+   return res;
+}
+
+// Returns validator checking type.
+function utils.has_type(type_) {
+   return function(x) {
+      if( type(x) == type_ ) {
+         return true;
+      } else {
+         return false, ("%s expected, got %s")->format(type_, type(x));
+      }
+   };
+}
+
+// Returns validator checking type and allowing false.
+function utils.has_type_or_false(type_) {
+   return function(x) {
+      if( type(x) == type_ ) {
+         return true;
+      } else if( type(x) == "boolean" ) {
+         if( x ) {
+            return false, ("%s or false expected, got true")->format(type_);
+         } else {
+            return true;
+         }
+      } else {
+         return false, ("%s or false expected, got %s")->format(type_, type(x));
+      }
+   };
+}
+
+// Returns validator checking two type possibilities.
+function utils.has_either_type(type1, type2) {
+   return function(x) {
+      if( type(x) == type1 || type(x) == type2 ) {
+         return true;
+      } else {
+         return false, ("%s or %s expected, got %s")->format(type1, type2, type(x));
+      }
+   };
+}
+
+// Returns validator checking that value is an array with elements of type.
+function utils.array_of(type_) {
+   return function(x) {
+      if( type(x) != "table" ) {
+         return false, ("array of %ss expected, got %s")->format(type_, type(x));
+      }
+
+      for( index, item in ipairs(x) ) {
+         if( type(item) != type_ ) {
+            return false, ("array of %ss expected, got %s at index [%d]")->format(type_, type(item), index);
+         }
+      }
+
+      return true;
+   };
+}
+
+return utils;

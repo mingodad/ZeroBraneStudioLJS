@@ -1,0 +1,718 @@
+// Copyright 2011-18 Paul Kulchenko, ZeroBrane LLC
+// authors: Luxinia Dev (Eike Decker & Christoph Kubisch)
+// Lomtik Software (J. Winwood & John Labenski)
+//-------------------------------------------------------
+
+var ide = ide;
+var unpack = table.unpack || unpack;
+
+{ var config = ide.config.editor;
+  ide.font.editor = wx.wxFont(config.fontsize || 10, wx.wxFONTFAMILY_MODERN,
+    wx.wxFONTSTYLE_NORMAL, wx.wxFONTWEIGHT_NORMAL, false, config.fontname || "",
+    config.fontencoding || wx.wxFONTENCODING_DEFAULT);
+}
+
+// treeCtrl font requires slightly different handling
+{ var font, config = wx.wxTreeCtrl()->GetFont(), ide.config.filetree;
+  if( config.fontsize ) { font->SetPointSize(config.fontsize); }
+  if( config.fontname ) { font->SetFaceName(config.fontname); }
+  ide.font.tree = font;
+}
+
+// ----------------------------------------------------------------------------
+// Create the wxFrame
+// ----------------------------------------------------------------------------
+var function createFrame() {
+  var frame = ide->GetMainFrame(); // retrieve or create as needed
+  frame->Center();
+
+  // update best size of the toolbar after resizing
+  frame->Connect(wx.wxEVT_SIZE, function(event) {
+      var mgr = ide->GetUIManager();
+      var toolbar = mgr->GetPane("toolbar");
+      if( toolbar && toolbar->IsOk() ) {
+        toolbar->BestSize(event->GetSize()->GetWidth(), ide->GetToolBar()->GetClientSize()->GetHeight());
+        mgr->Update();
+      }
+    });
+
+  var menuBar = wx.wxMenuBar();
+  var statusBar = frame->CreateStatusBar(5);
+  var section_width = statusBar->GetTextExtent("OVRW");
+  statusBar->SetStatusStyles({wx.wxSB_FLAT, wx.wxSB_FLAT, wx.wxSB_FLAT, wx.wxSB_FLAT, wx.wxSB_FLAT});
+  statusBar->SetStatusWidths({-1, section_width, section_width, section_width*5, section_width*5});
+  statusBar->SetStatusText(ide->GetProperty("statuswelcome", ""));
+  statusBar->Connect(wx.wxEVT_LEFT_DOWN, function (event) {
+      var rect = wx.wxRect();
+      statusBar->GetFieldRect(4, rect);
+      if( rect->Contains(event->GetPosition()) ) { // click on the interpreter section
+        var interpreter = ide->GetInterpreter();
+        if( interpreter && interpreter.takeparameters && interpreter->GetCommandLineArg() ) {
+          rect->SetWidth(statusBar->GetTextExtent(ide->GetInterpreter()->GetName()..": "));
+          if( ! rect->Contains(event->GetPosition()) ) {
+            var menuitem = ide->FindMenuItem(ID.COMMANDLINEPARAMETERS);
+            if( menuitem ) {
+              var menu = ide->MakeMenu ({
+                { ID.COMMANDLINEPARAMETERS, TR("Command Line Parameters...")..KSC(ID.COMMANDLINEPARAMETERS) },
+              });
+              var cmdargs = ide->GetPackage("core.project")->GetCmdLines();
+              var curargs = interpreter->GetCommandLineArg();
+              if( #cmdargs > 1 || cmdargs[1] != curargs ) { menu->PrependSeparator(); }
+              var function setParams(ev) { ide->SetCommandLineParameters(menu->GetLabel(ev->GetId())); }
+              // do in the reverse order as `Prepend` is used;
+              // skip the currently set parameters
+              for( i = #cmdargs, 1, -1 ) {
+                if( cmdargs[i] != curargs ) {
+                  var id = ID("status.commandparameters."..i);
+                  menu->Prepend(id, cmdargs[i]);
+                  menu->Connect(id, wx.wxEVT_COMMAND_MENU_SELECTED, setParams);
+                }
+              }
+              statusBar->PopupMenu(menu);
+            }
+            return;
+          }
+        }
+        var menuitem = ide->FindMenuItem(ID.INTERPRETER);
+        if( menuitem ) {
+          var menu = ide->CloneMenu(menuitem->GetSubMenu());
+          if( menu ) { statusBar->PopupMenu(menu); }
+        }
+      }
+    });
+
+  var mgr = wxaui.wxAuiManager();
+  mgr->SetManagedWindow(frame);
+  // allow the panes to be larger than the defalt 1/3 of the main window size
+  mgr->SetDockSizeConstraint(0.8,0.8);
+
+  frame.menuBar = menuBar;
+  frame.statusBar = statusBar;
+  frame.uimgr = mgr;
+
+  return frame;
+}
+
+var function SCinB(id) { // shortcut in brackets
+  var osx = ide.osname == "Macintosh";
+  var shortcut = KSC(id)->gsub("\t","");
+  return shortcut && #shortcut > 0 && (" ("..shortcut->gsub("%f[%w]Ctrl", osx && "Cmd" || "Ctrl")..")") || "";
+}
+
+var function menuDropDownPosition(event) {
+  var tb = event->GetEventObject()->DynamicCast('wxAuiToolBar');
+  var rect = tb->GetToolRect(event->GetId());
+  return ide.frame->ScreenToClient(tb->ClientToScreen(rect->GetBottomLeft()));
+}
+
+var function tbIconSize() {
+  // use large icons by default on OSX and on large screens
+  var iconsize = tonumber(ide.config.toolbar && ide.config.toolbar.iconsize);
+  return (iconsize && (iconsize % 8) == 0 && iconsize
+    || ((ide.osname == 'Macintosh' || wx.wxGetClientDisplayRect()->GetWidth() >= 1500) && 24 || 16));
+}
+
+var function createToolBar(frame) {
+  var toolBar = wxaui.wxAuiToolBar(frame, wx.wxID_ANY, wx.wxDefaultPosition, wx.wxDefaultSize,
+    wxaui.wxAUI_TB_PLAIN_BACKGROUND);
+
+  // there are two sets of icons: use 24 on OSX and 16 on others.
+  var iconsize = tbIconSize();
+  var toolBmpSize = wx.wxSize(iconsize, iconsize);
+  var icons = ide.config.toolbar.icons;
+  var needseparator = false;
+  for( _, id in ipairs(icons) ) {
+    if( icons[id] != false ) { // skip explicitly disabled icons
+      if( id == ID.SEPARATOR && toolBar->GetToolCount() > 0 ) {
+        needseparator = true;
+      } else {
+        var iconmap = ide.config.toolbar.iconmap[id];
+        if( iconmap ) {
+          if( needseparator ) {
+            toolBar->AddSeparator();
+            needseparator = false;
+          }
+          var icon, description = unpack(iconmap);
+          var isbitmap = type(icon) == "userdata" && icon->GetClassInfo()->GetClassName() == "wxBitmap";
+          var bitmap = isbitmap && icon || ide->GetBitmap(icon, "TOOLBAR", toolBmpSize);
+          toolBar->AddTool(id, "", bitmap, (TR)(description)..SCinB(id));
+        }
+      }
+    }
+  }
+
+  toolBar->SetToolDropDown(ID.OPEN, true);
+  toolBar->Connect(ID.OPEN, wxaui.wxEVT_COMMAND_AUITOOLBAR_TOOL_DROPDOWN, function(event) {
+      if( event->IsDropDownClicked() ) {
+        var menu = wx.wxMenu({});
+        FileRecentListUpdate(menu);
+        toolBar->PopupMenu(menu, menuDropDownPosition(event));
+      } else {
+        event->Skip();
+      }
+    });
+
+  toolBar->SetToolDropDown(ID.PROJECTDIRCHOOSE, true);
+  toolBar->Connect(ID.PROJECTDIRCHOOSE, wxaui.wxEVT_COMMAND_AUITOOLBAR_TOOL_DROPDOWN, function(event) {
+      if( event->IsDropDownClicked() ) {
+        var menu = wx.wxMenu({});
+        FileTreeProjectListUpdate(menu, 0);
+        toolBar->PopupMenu(menu, menuDropDownPosition(event));
+      } else {
+        event->Skip();
+      }
+    });
+
+  toolBar->GetArtProvider()->SetElementSize(wxaui.wxAUI_TBART_GRIPPER_SIZE, 0);
+  toolBar->Realize();
+
+  frame.toolBar = toolBar;
+  return toolBar;
+}
+
+var function getTabWindow(event, nb) {
+  var tabctrl = event->GetEventObject()->DynamicCast("wxAuiTabCtrl");
+  var idx = event->GetSelection(); // index within the current tab ctrl
+  return idx != wx.wxNOT_FOUND && nb->GetPageIndex(tabctrl->GetPage(idx).window) || wx.wxNOT_FOUND, tabctrl;
+}
+
+var function isPreview(win) {
+  return ide.findReplace != null && ide.findReplace->IsPreview(win);
+}
+
+var function createNotebook(frame) {
+  // notebook for editors
+  var notebook = wxaui.wxAuiNotebook(frame, wx.wxID_ANY,
+    wx.wxDefaultPosition, wx.wxDefaultSize,
+    wxaui.wxAUI_NB_DEFAULT_STYLE + wxaui.wxAUI_NB_TAB_EXTERNAL_MOVE
+    + wxaui.wxAUI_NB_WINDOWLIST_BUTTON + wx.wxNO_BORDER);
+
+  // wxEVT_SET_FOCUS could be used, but it only works on Windows with wx2.9.5+
+  notebook->Connect(wxaui.wxEVT_COMMAND_AUINOTEBOOK_PAGE_CHANGED,
+    function (event) {
+      var ed = ide->GetEditor(notebook->GetSelection());
+      var doc = ed && ide->GetDocument(ed);
+
+      // skip activation when any of the following is true:
+      // (1) there is no document yet, the editor tab was just added,
+      // so no changes needed as there will be a proper later call;
+      // (2) the page change event was triggered after a tab is closed;
+      // (3) on OSX from AddPage event when changing from the last tab
+      // (this is to work around a duplicate event generated in this case
+      // that first activates the added tab and then some other tab (2.9.5)).
+
+      var double = (ide.osname == 'Macintosh'
+        && event->GetOldSelection() == notebook->GetPageCount()
+        && debug->traceback()->find("'AddPage'"));
+
+      if( doc && event->GetOldSelection() != wx.wxNOT_FOUND && ! double ) {
+        SetEditorSelection(notebook->GetSelection());
+      }
+    });
+
+  notebook->Connect(wxaui.wxEVT_COMMAND_AUINOTEBOOK_PAGE_CLOSE,
+    function (event) {
+      var idx = event->GetSelection();
+      if( idx != wx.wxNOT_FOUND ) { ClosePage(idx); }
+      event->Veto(); // don't propagate the event as the page is already closed
+    });
+
+  notebook->Connect(wxaui.wxEVT_COMMAND_AUINOTEBOOK_BG_DCLICK,
+    function (event) {
+      // as this event can be on different tab controls,
+      // need to find the control to add the page to
+      var tabctrl = event->GetEventObject()->DynamicCast("wxAuiTabCtrl");
+      // check if the active page is in the current control
+      var active = tabctrl->GetActivePage();
+      if( (active >= 0 && tabctrl->GetPage(active).window
+        != notebook->GetPage(notebook->GetSelection())) ) {
+        // if not, need to activate the control that was clicked on;
+        // find the last window and switch to it (assuming there is always one)
+        assert(tabctrl->GetPageCount() >= 1, "Expected at least one page in a notebook tab control.");
+        var lastwin = tabctrl->GetPage(tabctrl->GetPageCount()-1).window;
+        notebook->SetSelection(notebook->GetPageIndex(lastwin));
+      }
+      NewFile();
+    });
+
+  // tabs can be dragged around which may change their indexes;
+  // when this happens stored indexes need to be updated to reflect the change.
+  // there is DRAG_DONE event that I'd prefer to use, but it
+  // doesn't fire for some reason using wxwidgets 2.9.5 (tested on Windows).
+  if( ide.wxver >= "2.9.5" ) {
+    notebook->Connect(wxaui.wxEVT_COMMAND_AUINOTEBOOK_END_DRAG,
+      function (event) {
+        for( page = 0, notebook->GetPageCount()-1 ) {
+          var editor = ide->GetEditor(page);
+          var doc = editor && ide->GetDocument(editor);
+          if( doc ) { doc->SetTabIndex(page); }
+        }
+
+        var selection = getTabWindow(event, notebook);
+        if( selection == wx.wxNOT_FOUND ) { return; }
+        // set the selection on the dragged tab to reset its state
+        // workaround for wxwidgets issue http://trac.wxwidgets.org/ticket/15071
+        notebook->SetSelection(selection);
+        // select the content of the tab after drag is done
+        SetEditorSelection(selection);
+        event->Skip();
+      });
+  }
+
+  var selection;
+  notebook->Connect(wxaui.wxEVT_COMMAND_AUINOTEBOOK_TAB_RIGHT_UP,
+    function (event) {
+      // event:GetSelection() returns the index *inside the current tab*;
+      // for split notebooks, this may not be the same as the index
+      // in the notebook we are interested in here
+      var idx = event->GetSelection();
+      if( idx == wx.wxNOT_FOUND ) { return; }
+      var tabctrl = event->GetEventObject()->DynamicCast("wxAuiTabCtrl");
+
+      // save tab index the event is for
+      selection = notebook->GetPageIndex(tabctrl->GetPage(idx).window);
+      var tree = ide->GetProjectTree();
+      var startfile = tree->GetStartFile();
+
+      var menu = ide->MakeMenu ({
+        { ID.CLOSE, TR("&Close Page") },
+        { ID.CLOSEALL, TR("Close A&ll Pages") },
+        { ID.CLOSEOTHER, TR("Close &Other Pages") },
+        { ID.CLOSESEARCHRESULTS, TR("Close Search Results Pages") },
+        { },
+        { ID.SAVE, TR("&Save") },
+        { ID.SAVEAS, TR("Save &As...") },
+        { },
+        { ID.SETSTARTFILE, TR("Set As Start File") },
+        { ID.UNSETSTARTFILE, TR("Unset '%s' As Start File")->format(startfile || "<none>") },
+        { },
+        { ID.COPYFULLPATH, TR("Copy Full Path") },
+        { ID.SHOWLOCATION, TR("Show Location") },
+        { ID.REFRESHSEARCHRESULTS, TR("Refresh Search Results") },
+      });
+
+      var fpath = ide->GetDocument(ide->GetEditor(selection))->GetFilePath();
+      if( ! fpath || ! tree->FindItem(fpath) ) { menu->Enable(ID.SETSTARTFILE, false); }
+      if( ! startfile ) { menu->Destroy(ID.UNSETSTARTFILE); }
+
+      PackageEventHandle("onMenuEditorTab", menu, notebook, event, selection);
+
+      // popup statuses are not refreshed on Linux, so do it manually
+      if( ide.osname == "Unix" ) { UpdateMenuUI(menu, notebook); }
+      notebook->PopupMenu(menu);
+    });
+
+  var function IfAtLeastOneTab(event) { event->Enable(notebook->GetPageCount() > 0); }
+
+  notebook->Connect(ID.SETSTARTFILE, wx.wxEVT_COMMAND_MENU_SELECTED, function() {
+      var fpath = ide->GetDocument(ide->GetEditor(selection))->GetFilePath();
+      if( fpath ) { ide->GetProjectTree()->SetStartFile(fpath); }
+    });
+  notebook->Connect(ID.UNSETSTARTFILE, wx.wxEVT_COMMAND_MENU_SELECTED, function() {
+      ide->GetProjectTree()->SetStartFile();
+    });
+  notebook->Connect(ID.SAVE, wx.wxEVT_COMMAND_MENU_SELECTED, function() {
+      ide->GetDocument(ide->GetEditor(selection))->Save();
+    });
+  notebook->Connect(ID.SAVE, wx.wxEVT_UPDATE_UI, function(event) {
+      var doc = ide->GetDocument(ide->GetEditor(selection));
+      event->Enable(doc->IsModified() || doc->IsNew());
+    });
+  notebook->Connect(ID.SAVEAS, wx.wxEVT_COMMAND_MENU_SELECTED, function() {
+      SaveFileAs(ide->GetEditor(selection));
+    });
+  notebook->Connect(ID.SAVEAS, wx.wxEVT_UPDATE_UI, IfAtLeastOneTab);
+
+  // the following three methods require handling of closing in the idle event,
+  // because of wxwidgets issue that causes crash on OSX when the last page is closed
+  // (http://trac.wxwidgets.org/ticket/15417)
+  notebook->Connect(ID.CLOSE, wx.wxEVT_UPDATE_UI, IfAtLeastOneTab);
+  notebook->Connect(ID.CLOSE, wx.wxEVT_COMMAND_MENU_SELECTED, function() {
+      ide->DoWhenIdle(function() { ClosePage(selection); });
+    });
+
+  notebook->Connect(ID.CLOSEALL, wx.wxEVT_UPDATE_UI, IfAtLeastOneTab);
+  notebook->Connect(ID.CLOSEALL, wx.wxEVT_COMMAND_MENU_SELECTED, function() {
+      ide->DoWhenIdle(function() { CloseAllPagesExcept(null); });
+    });
+
+  notebook->Connect(ID.CLOSEOTHER, wx.wxEVT_UPDATE_UI, function(event) {
+      event->Enable(notebook->GetPageCount() > 1);
+    });
+  notebook->Connect(ID.CLOSEOTHER, wx.wxEVT_COMMAND_MENU_SELECTED, function() {
+      ide->DoWhenIdle(function() { CloseAllPagesExcept(selection); });
+    });
+
+  notebook->Connect(ID.CLOSESEARCHRESULTS, wx.wxEVT_UPDATE_UI, function(event) {
+      var ispreview = false;
+      for( p = 0, notebook->GetPageCount()-1 ) {
+        ispreview = ispreview || isPreview(notebook->GetPage(p));
+      }
+      event->Enable(ispreview);
+    });
+  notebook->Connect(ID.CLOSESEARCHRESULTS, wx.wxEVT_COMMAND_MENU_SELECTED, function() {
+      ide->DoWhenIdle(function() {
+          for( p = notebook->GetPageCount()-1, 0, -1 ) {
+            if( isPreview(notebook->GetPage(p)) ) { ClosePage(p); }
+          }
+        });
+    });
+
+  notebook->Connect(ID.REFRESHSEARCHRESULTS, wx.wxEVT_UPDATE_UI, function(event) {
+      event->Enable(isPreview(notebook->GetPage(selection)));
+    });
+  notebook->Connect(ID.REFRESHSEARCHRESULTS, wx.wxEVT_COMMAND_MENU_SELECTED, function() {
+      ide.findReplace->RefreshResults(notebook->GetPage(selection));
+    });
+
+  notebook->Connect(ID.SHOWLOCATION, wx.wxEVT_COMMAND_MENU_SELECTED, function() {
+      ShowLocation(ide->GetDocument(ide->GetEditor(selection))->GetFilePath());
+    });
+  notebook->Connect(ID.SHOWLOCATION, wx.wxEVT_UPDATE_UI, IfAtLeastOneTab);
+
+  notebook->Connect(ID.COPYFULLPATH, wx.wxEVT_COMMAND_MENU_SELECTED, function() {
+      ide->CopyToClipboard(ide->GetDocument(ide->GetEditor(selection))->GetFilePath());
+    });
+
+  frame.notebook = notebook;
+  return notebook;
+}
+
+var function addDND(notebook) {
+  // this handler allows dragging tabs into this notebook
+  notebook->Connect(wxaui.wxEVT_COMMAND_AUINOTEBOOK_ALLOW_DND,
+    function (event) {
+      var notebookfrom = event->GetDragSource();
+      if( notebookfrom != ide.frame.notebook ) {
+        // disable cross-notebook movement of specific tabs
+        var idx = event->GetSelection();
+        if( idx == wx.wxNOT_FOUND ) { return; }
+        var win = notebookfrom->GetPage(idx);
+        if( ! win ) { return; }
+        var winid = win->GetId();
+        if( (ide->IsValidCtrl(ide->GetOutput()) && winid == ide->GetOutput()->GetId())
+        || (ide->IsValidCtrl(ide->GetConsole()) && winid == ide->GetConsole()->GetId())
+        || (ide->IsValidCtrl(ide->GetProjectTree()) && winid == ide->GetProjectTree()->GetId())
+        || isPreview(win) // search results preview
+        ) { return; }
+
+        var mgr = ide.frame.uimgr;
+        var pane = mgr->GetPane(notebookfrom);
+        if( ! pane->IsOk() ) { return; } // not a managed window
+        if( pane->IsFloating() ) {
+          notebookfrom->GetParent()->Hide();
+        } else {
+          pane->Hide();
+          mgr->Update();
+        }
+        mgr->DetachPane(notebookfrom);
+
+        // this is a workaround for wxwidgets bug (2.9.5+) that combines
+        // content from two windows when tab is dragged over an active tab.
+        var mouse = wx.wxGetMouseState();
+        var mouseatpoint = wx.wxPoint(mouse->GetX(), mouse->GetY());
+        var ok, tabs = pcall(function() { return wx.wxFindWindowAtPoint(mouseatpoint)->DynamicCast("wxAuiTabCtrl"); });
+        if( ok ) { tabs->SetNoneActive(); }
+
+        event->Allow();
+      }
+    });
+
+  // these handlers allow dragging tabs out of this notebook.
+  // I couldn't find a good way to stop dragging event as it's not known
+  // where the event is going to end when it's started, so we manipulate
+  // the flag that allows splits and disable it when needed.
+  // It is then enabled in BEGIN_DRAG event.
+  notebook->Connect(wxaui.wxEVT_COMMAND_AUINOTEBOOK_BEGIN_DRAG,
+    function (event) {
+      event->Skip();
+
+      // allow dragging if it was disabled earlier
+      var flags = notebook->GetWindowStyleFlag();
+      if( bit.band(flags, wxaui.wxAUI_NB_TAB_SPLIT) == 0 ) {
+        notebook->SetWindowStyleFlag(flags + wxaui.wxAUI_NB_TAB_SPLIT);
+      }
+    });
+
+  // there is currently no support in wxAuiNotebook for dragging tabs out.
+  // This is implemented as removing a tab that was dragged out and
+  // recreating it with the right control. This is complicated by the fact
+  // that tabs can be split, so if the destination is withing the area where
+  // splits happen, the tab is not removed.
+  notebook->Connect(wxaui.wxEVT_COMMAND_AUINOTEBOOK_END_DRAG,
+    function (event) {
+      event->Skip();
+
+      var mgr = ide.frame.uimgr;
+      var win = mgr->GetPane(notebook).window;
+      var x = win->GetScreenPosition()->GetX();
+      var y = win->GetScreenPosition()->GetY();
+      var w, h = win->GetSize()->GetWidth(), win->GetSize()->GetHeight();
+
+      var selection, tabctrl = getTabWindow(event, notebook);
+      if( selection == wx.wxNOT_FOUND ) { return; }
+
+      var mouse = wx.wxGetMouseState();
+      var mx, my = mouse->GetX(), mouse->GetY();
+      if( mx < x || mx > x + w || my < y || my > y + h ) {
+        // disallow split as the target is outside the notebook
+        var flags = notebook->GetWindowStyleFlag();
+        if( bit.band(flags, wxaui.wxAUI_NB_TAB_SPLIT) != 0 ) {
+          notebook->SetWindowStyleFlag(flags - wxaui.wxAUI_NB_TAB_SPLIT);
+        }
+
+        if( ide.wxver < "3.0" ) {
+          // don't allow dragging out single tabs from tab ctrl
+          // as wxwidgets doesn't like removing pages from split notebooks.
+          if( tabctrl->GetPageCount() == 1 ) { return; }
+        }
+
+        // don't allow last pages to be dragged out from Project and Output notebooks
+        if( (notebook == ide->GetProjectNotebook() || notebook == ide->GetOutputNotebook())
+        && notebook->GetPageCount() == 1 ) {
+          return;
+        }
+
+        var label = notebook->GetPageText(selection);
+        var pane = ide->RestorePanelByLabel(label);
+        if( pane ) {
+          pane->FloatingPosition(mx-10, my-10);
+          pane->Show();
+          notebook->RemovePage(selection);
+          mgr->Update();
+          return;
+        }
+      }
+
+      // set the selection on the dragged tab to reset its state
+      // workaround for wxwidgets issue http://trac.wxwidgets.org/ticket/15071
+      notebook->SetSelection(selection);
+      // set focus on the content of the selected tab
+      notebook->GetPage(selection)->SetFocus();
+    });
+}
+
+var function createBottomNotebook(frame) {
+  // bottomnotebook (errorlog,shellbox)
+  var bottomnotebook = wxaui.wxAuiNotebook(frame, wx.wxID_ANY,
+    wx.wxDefaultPosition, wx.wxDefaultSize,
+    wxaui.wxAUI_NB_DEFAULT_STYLE + wxaui.wxAUI_NB_TAB_EXTERNAL_MOVE
+    - wxaui.wxAUI_NB_CLOSE_ON_ACTIVE_TAB + wx.wxNO_BORDER);
+
+  addDND(bottomnotebook);
+
+  bottomnotebook->Connect(wxaui.wxEVT_COMMAND_AUINOTEBOOK_PAGE_CHANGED,
+    function (event) {
+      var nb = event->GetEventObject()->DynamicCast("wxAuiNotebook");
+      // set focus on the new page
+      var idx = event->GetSelection();
+      if( idx == wx.wxNOT_FOUND ) { return; }
+      nb->GetPage(idx)->SetFocus();
+
+      var preview = isPreview(nb->GetPage(nb->GetSelection()));
+      var flags = nb->GetWindowStyleFlag();
+      if( preview && bit.band(flags, wxaui.wxAUI_NB_CLOSE_ON_ACTIVE_TAB) == 0 ) {
+        nb->SetWindowStyleFlag(flags + wxaui.wxAUI_NB_CLOSE_ON_ACTIVE_TAB);
+      } else if( ! preview && bit.band(flags, wxaui.wxAUI_NB_CLOSE_ON_ACTIVE_TAB) != 0 ) {
+        nb->SetWindowStyleFlag(flags - wxaui.wxAUI_NB_CLOSE_ON_ACTIVE_TAB);
+      }
+    });
+
+  // disallow tabs closing
+  bottomnotebook->Connect(wxaui.wxEVT_COMMAND_AUINOTEBOOK_PAGE_CLOSE,
+    function (event) {
+      var nb = event->GetEventObject()->DynamicCast("wxAuiNotebook");
+      if( isPreview(nb->GetPage(nb->GetSelection())) ) {
+        event->Skip();
+      } else {
+        event->Veto();
+      }
+    });
+
+  var selection;
+  bottomnotebook->Connect(wxaui.wxEVT_COMMAND_AUINOTEBOOK_TAB_RIGHT_UP,
+    function (event) {
+      // event:GetSelection() returns the index *inside the current tab*;
+      // for split notebooks, this may not be the same as the index
+      // in the notebook we are interested in here
+      var idx = event->GetSelection();
+      if( idx == wx.wxNOT_FOUND ) { return; }
+      var tabctrl = event->GetEventObject()->DynamicCast("wxAuiTabCtrl");
+
+      // save tab index the event is for
+      selection = bottomnotebook->GetPageIndex(tabctrl->GetPage(idx).window);
+
+      var menu = ide->MakeMenu ({
+        { ID.CLOSE, TR("&Close Page") },
+        { ID.CLOSESEARCHRESULTS, TR("Close Search Results Pages") },
+        { },
+        { ID.REFRESHSEARCHRESULTS, TR("Refresh Search Results") },
+      });
+
+      PackageEventHandle("onMenuOutputTab", menu, bottomnotebook, event, selection);
+
+      // popup statuses are not refreshed on Linux, so do it manually
+      if( ide.osname == "Unix" ) { UpdateMenuUI(menu, bottomnotebook); }
+      bottomnotebook->PopupMenu(menu);
+    });
+
+  bottomnotebook->Connect(ID.CLOSE, wx.wxEVT_COMMAND_MENU_SELECTED, function() {
+      ide->DoWhenIdle(function() { bottomnotebook->DeletePage(selection); });
+    });
+  bottomnotebook->Connect(ID.CLOSE, wx.wxEVT_UPDATE_UI, function(event) {
+      event->Enable(isPreview(bottomnotebook->GetPage(selection)));
+    });
+
+  bottomnotebook->Connect(ID.CLOSESEARCHRESULTS, wx.wxEVT_COMMAND_MENU_SELECTED, function() {
+      ide->DoWhenIdle(function() {
+          for( p = bottomnotebook->GetPageCount()-1, 0, -1 ) {
+            if( isPreview(bottomnotebook->GetPage(p)) ) { bottomnotebook->DeletePage(p); }
+          }
+        });
+    });
+  bottomnotebook->Connect(ID.CLOSESEARCHRESULTS, wx.wxEVT_UPDATE_UI, function(event) {
+      var ispreview = false;
+      for( p = 0, bottomnotebook->GetPageCount()-1 ) {
+        ispreview = ispreview || isPreview(bottomnotebook->GetPage(p));
+      }
+      event->Enable(ispreview);
+    });
+
+  bottomnotebook->Connect(ID.REFRESHSEARCHRESULTS, wx.wxEVT_UPDATE_UI, function(event) {
+      event->Enable(isPreview(bottomnotebook->GetPage(selection)));
+    });
+  bottomnotebook->Connect(ID.REFRESHSEARCHRESULTS, wx.wxEVT_COMMAND_MENU_SELECTED, function() {
+      ide.findReplace->RefreshResults(bottomnotebook->GetPage(selection));
+    });
+
+  var errorlog = ide->CreateStyledTextCtrl(bottomnotebook, wx.wxID_ANY,
+    wx.wxDefaultPosition, wx.wxDefaultSize, wx.wxBORDER_NONE);
+
+  errorlog->Connect(wx.wxEVT_CONTEXT_MENU,
+    function (event) {
+      var menu = ide->MakeMenu ({
+          { ID.UNDO, TR("&Undo")..KSC(ID.UNDO) },
+          { ID.REDO, TR("&Redo")..KSC(ID.REDO) },
+          { },
+          { ID.CUT, TR("Cu&t")..KSC(ID.CUT) },
+          { ID.COPY, TR("&Copy")..KSC(ID.COPY) },
+          { ID.PASTE, TR("&Paste")..KSC(ID.PASTE) },
+          { ID.SELECTALL, TR("Select &All")..KSC(ID.SELECTALL) },
+          { },
+          { ID.CLEAROUTPUT, TR("C&lear Output Window")..KSC(ID.CLEAROUTPUT) },
+        });
+      PackageEventHandle("onMenuOutput", menu, errorlog, event);
+
+      // popup statuses are not refreshed on Linux, so do it manually
+      if( ide.osname == "Unix" ) { UpdateMenuUI(menu, errorlog); }
+      errorlog->PopupMenu(menu);
+    });
+
+  // connect to the main frame, so it can be called from anywhere
+  frame->Connect(ID.CLEAROUTPUT, wx.wxEVT_COMMAND_MENU_SELECTED,
+    function(event) { ide->GetOutput()->Erase(); });
+
+  var shellbox = ide->CreateStyledTextCtrl(bottomnotebook, wx.wxID_ANY,
+    wx.wxDefaultPosition, wx.wxDefaultSize, wx.wxBORDER_NONE);
+
+  var menupos;
+  shellbox->Connect(wx.wxEVT_CONTEXT_MENU,
+    function (event) {
+      var menu = ide->MakeMenu ({
+          { ID.UNDO, TR("&Undo")..KSC(ID.UNDO) },
+          { ID.REDO, TR("&Redo")..KSC(ID.REDO) },
+          { },
+          { ID.CUT, TR("Cu&t")..KSC(ID.CUT) },
+          { ID.COPY, TR("&Copy")..KSC(ID.COPY) },
+          { ID.PASTE, TR("&Paste")..KSC(ID.PASTE) },
+          { ID.SELECTALL, TR("Select &All")..KSC(ID.SELECTALL) },
+          { },
+          { ID.SELECTCONSOLECOMMAND, TR("&Select Command") },
+          { ID.CLEARCONSOLE, TR("C&lear Console Window")..KSC(ID.CLEARCONSOLE) },
+        });
+      menupos = event->GetPosition();
+      PackageEventHandle("onMenuConsole", menu, shellbox, event);
+
+      // popup statuses are not refreshed on Linux, so do it manually
+      if( ide.osname == "Unix" ) { UpdateMenuUI(menu, shellbox); }
+      shellbox->PopupMenu(menu);
+    });
+
+  shellbox->Connect(ID.SELECTCONSOLECOMMAND, wx.wxEVT_COMMAND_MENU_SELECTED,
+    function(event) { ConsoleSelectCommand(menupos); });
+
+  // connect to the main frame, so it can be called from anywhere
+  frame->Connect(ID.CLEARCONSOLE, wx.wxEVT_COMMAND_MENU_SELECTED,
+    function(event) { ide->GetConsole()->Erase(); });
+
+  bottomnotebook->AddPage(errorlog, TR("Output"), true);
+  bottomnotebook->AddPage(shellbox, TR("Local console"), false);
+
+  bottomnotebook.errorlog = errorlog;
+  bottomnotebook.shellbox = shellbox;
+
+  frame.bottomnotebook = bottomnotebook;
+  return bottomnotebook;
+}
+
+var function createProjNotebook(frame) {
+  var projnotebook = wxaui.wxAuiNotebook(frame, wx.wxID_ANY,
+    wx.wxDefaultPosition, wx.wxDefaultSize,
+    wxaui.wxAUI_NB_DEFAULT_STYLE + wxaui.wxAUI_NB_TAB_EXTERNAL_MOVE
+    - wxaui.wxAUI_NB_CLOSE_ON_ACTIVE_TAB + wx.wxNO_BORDER);
+
+  addDND(projnotebook);
+
+  // disallow tabs closing
+  projnotebook->Connect(wxaui.wxEVT_COMMAND_AUINOTEBOOK_PAGE_CLOSE,
+    function (event) { event->Veto(); });
+
+  frame.projnotebook = projnotebook;
+  return projnotebook;
+}
+
+// ----------------------------------------------------------------------------
+// Add the child windows to the frame
+
+var frame = createFrame();
+createToolBar(frame);
+createNotebook(frame);
+createProjNotebook(frame);
+createBottomNotebook(frame);
+
+{
+  var mgr = frame.uimgr;
+
+  mgr->AddPane(frame.toolBar, wxaui.wxAuiPaneInfo()->
+    Name("toolbar")->Caption("Toolbar")->
+    ToolbarPane()->Top()->CloseButton(false)->PaneBorder(false)->
+    LeftDockable(false)->RightDockable(false));
+  mgr->AddPane(frame.notebook, wxaui.wxAuiPaneInfo()->
+    Name("notebook")->
+    CenterPane()->PaneBorder(false));
+  mgr->AddPane(frame.projnotebook, wxaui.wxAuiPaneInfo()->
+    Name("projpanel")->CaptionVisible(false)->
+    MinSize(200,200)->FloatingSize(200,400)->
+    Left()->Layer(1)->Position(1)->PaneBorder(false)->
+    CloseButton(true)->MaximizeButton(false)->PinButton(true));
+  mgr->AddPane(frame.bottomnotebook, wxaui.wxAuiPaneInfo()->
+    Name("bottomnotebook")->CaptionVisible(false)->
+    MinSize(100,100)->BestSize(200,200)->FloatingSize(400,200)->
+    Bottom()->Layer(1)->Position(1)->PaneBorder(false)->
+    CloseButton(true)->MaximizeButton(false)->PinButton(true));
+
+  if( type(ide.config.bordersize) == 'number' ) {
+    for( _, uimgr in pairs ({mgr, frame.notebook->GetAuiManager(),
+      frame.bottomnotebook->GetAuiManager(), frame.projnotebook->GetAuiManager()}) ) {
+      uimgr->GetArtProvider()->SetMetric(wxaui.wxAUI_DOCKART_SASH_SIZE,
+        ide.config.bordersize);
+    }
+  }
+
+  for( _, nb in pairs ({frame.bottomnotebook, frame.projnotebook}) ) {
+    nb->Connect(wxaui.wxEVT_COMMAND_AUINOTEBOOK_BG_DCLICK,
+      function() { PaneFloatToggle(nb); });
+  }
+
+  mgr.defaultPerspective = mgr->SavePerspective();
+}

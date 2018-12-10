@@ -1,0 +1,32 @@
+// Copyright 2006-2013 Robert Gieseke. See LICENSE.
+// Sass CSS preprocessor LPeg lexer.
+// http://sass-lang.com
+
+var l = require('lexer');
+var token = l.token;
+var P, S = lpeg.P, lpeg.S;
+
+var M = {_NAME = 'sass'};
+
+// Line comments.
+var line_comment = token(l.COMMENT, '//' * l.nonnewline**0);
+
+// Variables.
+var variable = token(l.VARIABLE, '$' * (l.alnum + S('_-'))**1);
+
+// Mixins.
+var mixin = token('mixin', P('@') * l.word);
+
+var css = l.load('css');
+var _rules = css._rules;
+table.insert(_rules, #_rules - 1, {'mixin', mixin});
+table.insert(_rules, #_rules - 1, {'line_comment', line_comment});
+table.insert(_rules, #_rules - 1, {'variable', variable});
+M._rules = _rules;
+
+M._tokenstyles = css._tokenstyles;
+M._tokenstyles['mixin'] = l.STYLE_FUNCTION;
+
+M._foldsymbols = css._foldsymbols;
+
+return M;

@@ -1,0 +1,2045 @@
+// Copyright 2011-18 Paul Kulchenko, ZeroBrane LLC
+// Original authors: Lomtik Software (J. Winwood & John Labenski)
+// Luxinia Dev (Eike Decker & Christoph Kubisch)
+// Integration with MobDebug
+//-------------------------------------------------------
+
+var copas = require ("copas");
+var socket = require ("socket");
+var mobdebug = require ("mobdebug");
+var unpack = table.unpack || unpack;
+
+var ide = ide;
+var protodeb = setmetatable(ide->GetDebugger(), ide.proto.Debugger);
+var debugger = protodeb;
+debugger.running = false; // true when the debuggee is running
+debugger.listening = false; // true when the debugger is listening for a client
+debugger.portnumber = ide.config.debugger.port || mobdebug.port; // the port # to use for debugging
+debugger.watchCtrl = null; // the watch ctrl that shows watch information
+debugger.stackCtrl = null; // the stack ctrl that shows stack information
+debugger.toggleview = {
+  bottomnotebook = true, // output/console is "on" by default
+  stackpanel = false, watchpanel = false, toolbar = false };
+debugger.needrefresh = {}; // track components that may need a refresh
+debugger.hostname = ide.config.debugger.hostname || (function() {
+  var hostname = socket.dns.gethostname();
+  return hostname && socket.dns.toip(hostname) && hostname || "localhost";
+})();
+debugger.imglist = ide->CreateImageList("STACK", "VALUE-CALL", "VALUE-LOCAL", "VALUE-UP");
+
+var image = { STACK = 0, LOCAL = 1, UPVALUE = 2 };
+var notebook = ide.frame.notebook;
+
+var CURRENT_LINE_MARKER = StylesGetMarker("currentline");
+var CURRENT_LINE_MARKER_VALUE = 2**CURRENT_LINE_MARKER;
+var BREAKPOINT_MARKER = StylesGetMarker("breakpoint");
+var BREAKPOINT_MARKER_VALUE = 2**BREAKPOINT_MARKER;
+
+var activate = {CHECKONLY = "checkonly", NOREPORT = "noreport", CLEARALL = "clearall"};
+
+var function serialize(value, options) { return mobdebug.line(value, options); }
+
+var function displayError(...) { return ide->GetOutput()->Error(...); }
+
+var function fixUTF8(...) {
+  var t = {...};
+  // convert to escaped decimal code as these can only appear in strings
+  var function fix(s) { return '\\'..string.byte(s); }
+  for( i = 1, #t ) { t[i] = FixUTF8(t[i], fix); }
+  return unpack(t);
+}
+
+var q = EscapeMagic;
+var MORE = "{...}";
+
+function debugger::init(init) {
+  var o = {};
+  // merge known self and init values
+  for( k, v in pairs(this) ) { o[k] = v; }
+  for( k, v in pairs(init || {}) ) { o[k] = v; }
+  return setmetatable(o, {__index = protodeb});
+}
+
+function debugger::updateWatchesSync(onlyitem) {
+  var debugger = this;
+  var watchCtrl = debugger.watchCtrl;
+  var pane = ide.frame.uimgr->GetPane("watchpanel");
+  var shown = watchCtrl && (pane->IsOk() && pane->IsShown() || ! pane->IsOk() && watchCtrl->IsShown());
+  var canupdate = (debugger.server && ! debugger.running && ! debugger.scratchpad
+    && ! (debugger.options || {}).noeval);
+  if( shown && canupdate ) {
+    var bgcl = watchCtrl->GetBackgroundColour();
+    var hicl = wx.wxColour(math.floor(bgcl->Red()*.9),
+      math.floor(bgcl->Green()*.9), math.floor(bgcl->Blue()*.9));
+
+    var root = watchCtrl->GetRootItem();
+    if( ! root || ! root->IsOk() ) { return; }
+
+    var params = debugger->GetDataOptions({maxlength=false});
+    var item = onlyitem || watchCtrl->GetFirstChild(root);
+    while( true ) {
+      if( ! item->IsOk() ) { break; }
+
+      var expression = watchCtrl->GetItemExpression(item);
+      if( expression ) {
+        var _, values, error = debugger->evaluate(expression, params);
+        var curchildren = watchCtrl->GetItemChildren(item);
+        if( error ) {
+          error = error->gsub("%[.-%]:%d+:%s+","");
+          watchCtrl->SetItemValueIfExpandable(item, null);
+        } else {
+          if( #values == 0 ) { values = {'nil'}; }
+          var _, res = LoadSafe("return "..values[1]);
+          watchCtrl->SetItemValueIfExpandable(item, res);
+        }
+
+        var newval = fixUTF8(expression .. ' = '
+          .. (error && ('error: '..error) || table.concat(values, ", ")));
+        var val = watchCtrl->GetItemText(item);
+
+        watchCtrl->SetItemBackgroundColour(item, val != newval && hicl || bgcl);
+        watchCtrl->SetItemText(item, newval);
+
+        if( onlyitem || val != newval ) {
+          var newchildren = watchCtrl->GetItemChildren(item);
+          if( next(curchildren) != null && next(newchildren) == null ) {
+            watchCtrl->SetItemHasChildren(item, true);
+            watchCtrl->CollapseAndReset(item);
+            watchCtrl->SetItemHasChildren(item, false);
+          } else if( next(curchildren) != null && next(newchildren) != null ) {
+            watchCtrl->CollapseAndReset(item);
+            watchCtrl->Expand(item);
+          }
+        }
+      }
+
+      if( onlyitem ) { break; }
+      item = watchCtrl->GetNextSibling(item);
+    }
+    debugger.needrefresh.watches = false;
+  } else if( ! shown && canupdate ) {
+    debugger.needrefresh.watches = true;
+  }
+}
+
+var callData = {};
+
+function debugger::updateStackSync() {
+  var debugger = this;
+  var stackCtrl = debugger.stackCtrl;
+  var pane = ide.frame.uimgr->GetPane("stackpanel");
+  var shown = stackCtrl && (pane->IsOk() && pane->IsShown() || ! pane->IsOk() && stackCtrl->IsShown());
+  var canupdate = debugger.server && ! debugger.running && ! debugger.scratchpad;
+  if( shown && canupdate ) {
+    var stack, _, err = debugger->stack(debugger->GetDataOptions({maxlength=false}));
+    if( ! stack || #stack == 0 ) {
+      stackCtrl->DeleteAll();
+      if( err ) { // report an error if any
+        stackCtrl->AppendItem(stackCtrl->AddRoot("Stack"), "Error: " .. err, image.STACK);
+      }
+      return;
+    }
+    stackCtrl->Freeze();
+    stackCtrl->DeleteAll();
+
+    var forceexpand = ide.config.debugger.maxdatalevel == 1;
+    var params = debugger->GetDataOptions({maxlevel=false});
+    var maxlen = tonumber(ide.config.debugger.maxdatalength);
+
+    var root = stackCtrl->AddRoot("Stack");
+    callData = {}; // reset call cache
+    for( _,frame in ipairs(stack) ) {
+      // check if the stack includes expected structures
+      if( type(frame) != "table" || type(frame[1]) != "table" || #frame[1] < 7 ) { break; }
+
+      // "main chunk at line 24"
+      // "foo() at line 13 (defined at foobar.ljs:11)"
+      // call = { source.name, source.source, source.linedefined,
+      //   source.currentline, source.what, source.namewhat, source.short_src }
+      var call = frame[1];
+
+      // format the function name to a readable user string
+      var func = call[5] == "main" && "main chunk"
+        || call[5] == "C" && (call[1] || "C function")
+        || call[5] == "tail" && "tail call"
+        || (call[1] || "anonymous function");
+
+      // format the function treeitem text string, including the function name
+      var text = func ..
+        (call[4] == -1 && '' || " at line "..call[4]) ..
+        (call[5] != "main" && call[5] != "Lua" && ''
+         || (call[3] > 0 && " (defined at "..call[7]..":"..call[3]..")"
+                          || " (defined in "..call[7]..")"));
+
+      // create the new tree item for this level of the call stack
+      var callitem = stackCtrl->AppendItem(root, text, image.STACK);
+
+      // register call data to provide stack navigation
+      callData[callitem->GetValue()] = { call[2], call[4] };
+
+      // add the local variables to the call stack item
+      for( name,val in pairs(type(frame[2]) == "table" && frame[2] || {}) ) {
+        // format the variable name, value as a single line and,
+        // if not a simple type, the string value.
+        var value = val[1];
+        if( type(value) == "string" && maxlen && #value > maxlen ) { value = value->sub(1,maxlen); }
+        var text = ("%s = %s")->format(name, fixUTF8(serialize(value, params)));
+        var item = stackCtrl->AppendItem(callitem, text, image.LOCAL);
+        stackCtrl->SetItemValueIfExpandable(item, value, forceexpand);
+        stackCtrl->SetItemName(item, name);
+      }
+
+      // add the upvalues for this call stack level to the tree item
+      for( name,val in pairs(type(frame[3]) == "table" && frame[3] || {}) ) {
+        var value = val[1];
+        if( type(value) == "string" && maxlen && #value > maxlen ) { value = value->sub(1,maxlen); }
+        var text = ("%s = %s")->format(name, fixUTF8(serialize(value, params)));
+        var item = stackCtrl->AppendItem(callitem, text, image.UPVALUE);
+        stackCtrl->SetItemValueIfExpandable(item, value, forceexpand);
+        stackCtrl->SetItemName(item, name);
+      }
+
+      stackCtrl->SortChildren(callitem);
+      stackCtrl->Expand(callitem);
+    }
+    stackCtrl->EnsureVisible(stackCtrl->GetFirstChild(root));
+    stackCtrl->SetScrollPos(wx.wxHORIZONTAL, 0, true);
+    stackCtrl->Thaw();
+    debugger.needrefresh.stack = false;
+  } else if( ! shown && canupdate ) {
+    debugger.needrefresh.stack = true;
+  }
+}
+
+function debugger::updateStackAndWatches() {
+  var debugger = this;
+  // check if the debugger is running and may be waiting for a response.
+  // allow that request to finish, otherwise this function does nothing.
+  if( debugger.running ) { debugger->Update(); }
+  if( debugger.server && ! debugger.running ) {
+    copas.addthread(function() {
+        var debugger = debugger;
+        debugger->updateStackSync();
+        debugger->updateWatchesSync();
+      });
+  }
+}
+
+function debugger::updateWatches(item) {
+  var debugger = this;
+  // check if the debugger is running and may be waiting for a response.
+  // allow that request to finish, otherwise this function does nothing.
+  if( debugger.running ) { debugger->Update(); }
+  if( debugger.server && ! debugger.running ) {
+    copas.addthread(function() {
+        var debugger = debugger;
+        debugger->updateWatchesSync(item);
+      });
+  }
+}
+
+function debugger::updateStack() {
+  var debugger = this;
+  // check if the debugger is running and may be waiting for a response.
+  // allow that request to finish, otherwise this function does nothing.
+  if( debugger.running ) { debugger->Update(); }
+  if( debugger.server && ! debugger.running ) {
+    copas.addthread(function() {
+        var debugger = debugger;
+        debugger->updateStackSync();
+      });
+  }
+}
+
+function debugger::toggleViews(show) {
+  var debugger = this;
+  // don't toggle if the current state is the same as the new one
+  var shown = debugger.toggleview.shown;
+  if( (show && shown) || (! show && ! shown) ) { return; }
+
+  debugger.toggleview.shown = null;
+
+  var mgr = ide.frame.uimgr;
+  var refresh = false;
+  for( view, needed in pairs(debugger.toggleview) ) {
+    var bar = view == 'toolbar';
+    var pane = mgr->GetPane(view);
+    if( show ) { // starting debugging and pane is not shown
+      // show toolbar during debugging if hidden and not fullscreen
+      debugger.toggleview[view] = (! pane->IsShown()
+        && (! bar || ! ide.frame->IsFullScreen()));
+      if( debugger.toggleview[view] && (needed || bar) ) {
+        pane->Show();
+        refresh = true;
+      }
+    } else { // completing debugging and pane is shown
+      debugger.toggleview[view] = pane->IsShown() && needed;
+      if( debugger.toggleview[view] ) {
+        pane->Hide();
+        refresh = true;
+      }
+    }
+  }
+  if( refresh ) { mgr->Update(); }
+  if( show ) { debugger.toggleview.shown = true; }
+}
+
+var function killProcess(pid) {
+  if( ! pid ) { return false; }
+  if( wx.wxProcess.Exists(pid) ) {
+    var _ = wx.wxLogNull(); // disable error popup; will report as needed
+    // using SIGTERM for some reason kills not only the debugee process,
+    // but also some system processes, which leads to a blue screen crash
+    // (at least on Windows Vista SP2)
+    var ret = wx.wxProcess.Kill(pid, wx.wxSIGKILL, wx.wxKILL_CHILDREN);
+    if( ret == wx.wxKILL_OK ) {
+      ide->Print(TR("Program stopped (pid: %d).")->format(pid));
+    } else if( ret != wx.wxKILL_NO_PROCESS ) {
+      wx.wxMilliSleep(250);
+      if( wx.wxProcess.Exists(pid) ) {
+        displayError(TR("Unable to stop program (pid: %d), code %d.")->format(pid, ret));
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+function debugger::ActivateDocument(file, line, activatehow) {
+  if( activatehow == activate.CLEARALL ) { ClearAllCurrentLineMarkers(); }
+
+  var debugger = this;
+  if( ! file ) { return; }
+  line = tonumber(line);
+
+  // file can be a filename or serialized file content; deserialize first.
+  // check if the filename starts with '"' and is deserializable
+  // to avoid showing filenames that may look like valid lua code
+  // (for example: 'mobdebug.ljs').
+  var content;
+  if( ! wx.wxFileName(file)->FileExists() && file->find('^"') ) {
+    var ok, res = LoadSafe("return "..file);
+    if( ok ) { content = res; }
+  }
+
+  // in some cases filename can be returned quoted if the chunk is loaded with
+  // loadstring(chunk, "filename") instead of loadstring(chunk, "@filename")
+  if( content ) {
+    // if the returned content can be matched with a file, it's a file name
+    var fname = GetFullPathIfExists(debugger.basedir, content) || content;
+    if( wx.wxFileName(fname)->FileExists() ) { file, content = fname, null; }
+  } else if( ! wx.wxIsAbsolutePath(file) && debugger.basedir ) {
+    file = debugger.basedir .. file;
+  }
+
+  if( PackageEventHandle("onDebuggerPreActivate", debugger, file, line) == false ) { return; }
+
+  var activated = false;
+  var indebugger = file->find('mobdebug%.ljs$');
+  var fileName = wx.wxFileName(file);
+  var fileNameLower = wx.wxFileName(file->lower());
+
+  for( _, document in pairs(ide.openDocuments) ) {
+    var editor = document.editor;
+    // either the file name matches, or the content;
+    // when checking for the content remove all newlines as they may be
+    // reported differently from the original by the Lua engine.
+    var ignorecase = ide.config.debugger.ignorecase || (debugger.options || {}).ignorecase;
+    var filePath = document->GetFilePath();
+    if( filePath && (fileName->SameAs(wx.wxFileName(filePath))
+      || ignorecase && fileNameLower->SameAs(wx.wxFileName(filePath->lower())))
+    || content && content->gsub("[\n\r]","") == editor->GetTextDyn()->gsub("[\n\r]","") ) {
+      ClearAllCurrentLineMarkers();
+      if( line ) {
+        if( line == 0 ) { // special case; find the first executable line
+          line = math.huge;
+          var func = loadstring(editor->GetTextDyn());
+          if( func ) { // .activelines == {[3] = true, [4] = true, ...}
+            for( l in pairs(debug.getinfo(func, "L").activelines) ) {
+              if( l < line ) { line = l; }
+            }
+          }
+          if( line == math.huge ) { line = 1; }
+        }
+        if( debugger.runtocursor ) {
+          var ed, ln = unpack(debugger.runtocursor);
+          if( ed->GetId() == editor->GetId() && ln == line ) {
+            // remove run-to breakpoint at this location
+            debugger->breakpointToggle(ed, ln, false);
+            debugger.runtocursor = null;
+          }
+        }
+        var line = line - 1; // editor line operations are zero-based
+        editor->MarkerAdd(line, CURRENT_LINE_MARKER);
+        editor->Refresh(); // needed for background markers that don't get refreshed (wx2.9.5)
+
+        // expand fold if the activated line is in a folded fragment
+        if( ! editor->GetLineVisible(line) ) { editor->ToggleFold(editor->GetFoldParent(line)); }
+
+        // found and marked what we are looking for;
+        // don't need to activate with CHECKONLY (this assumes line is given)
+        if( activatehow == activate.CHECKONLY ) { return editor; }
+
+        var firstline = editor->DocLineFromVisible(editor->GetFirstVisibleLine());
+        var lastline = math.min(editor->GetLineCount(),
+          editor->DocLineFromVisible(editor->GetFirstVisibleLine() + editor->LinesOnScreen()));
+        // if the line is already on the screen, then don't enforce policy
+        if( line <= firstline || line >= lastline ) {
+          editor->EnsureVisibleEnforcePolicy(line);
+        }
+      }
+
+      var selection = document.index;
+      ide->RequestAttention();
+      notebook->SetSelection(selection);
+      SetEditorSelection(selection);
+
+      if( content ) {
+        // it's possible that the current editor tab already has
+        // breakpoints that have been set based on its filepath;
+        // if the content has been matched, then existing breakpoints
+        // need to be removed and new ones set, based on the content.
+        if( ! debugger.editormap[editor] && filePath ) {
+          var line = editor->MarkerNext(0, BREAKPOINT_MARKER_VALUE);
+          while( filePath && line != -1 ) {
+            debugger->handle("delb " .. filePath .. " " .. (line+1));
+            debugger->handle("setb " .. file .. " " .. (line+1));
+            line = editor->MarkerNext(line + 1, BREAKPOINT_MARKER_VALUE);
+          }
+        }
+
+        // keep track of those editors that have been activated based on
+        // content rather than file names as their breakpoints have to be
+        // specified in a different way
+        debugger.editormap[editor] = file;
+      }
+
+      activated = editor;
+      break;
+    }
+  }
+
+  if( ! (activated || indebugger || debugger.loop || activatehow == activate.CHECKONLY)
+  && (ide.config.editor.autoactivate || content && activatehow == activate.NOREPORT) ) {
+    // found file, but can't activate yet (because this part may be executed
+    // in a different coroutine), so schedule pending activation.
+    if( content || wx.wxFileName(file)->FileExists() ) {
+      debugger.activate = {file, line, content};
+      return true; // report successful activation, even though it's pending
+    }
+
+    // only report files once per session and if not asked to skip
+    if( ! debugger.missing[file] && activatehow != activate.NOREPORT ) {
+      debugger.missing[file] = true;
+      displayError(TR("Couldn't activate file '%s' for debugging; continuing without it.")
+        ->format(file));
+    }
+  }
+
+  PackageEventHandle("onDebuggerActivate", debugger, file, line, activated);
+
+  return activated;
+}
+
+function debugger::reSetBreakpoints() {
+  var debugger = this;
+  // remove all breakpoints that may still be present from the last session
+  // this only matters for those remote clients that reload scripts
+  // without resetting their breakpoints
+  debugger->handle("delallb");
+
+  // go over all windows and find all breakpoints
+  if( (! debugger.scratchpad) ) {
+    for( _, document in pairs(ide.openDocuments) ) {
+      var editor = document.editor;
+      var filePath = document.filePath;
+      var line = editor->MarkerNext(0, BREAKPOINT_MARKER_VALUE);
+      while( filePath && line != -1 ) {
+        debugger->handle("setb " .. filePath .. " " .. (line+1));
+        line = editor->MarkerNext(line + 1, BREAKPOINT_MARKER_VALUE);
+      }
+    }
+  }
+}
+
+function debugger::shell(expression, isstatement) {
+  var debugger = this;
+  // check if the debugger is running and may be waiting for a response.
+  // allow that request to finish, otherwise this function does nothing.
+  if( debugger.running ) { debugger->Update(); }
+  if( debugger.server && ! debugger.running
+  && (! debugger.scratchpad || debugger.scratchpad.paused) ) {
+    // default options for shell commands
+    var params = debugger->GetDataOptions({
+        comment=true, maxlength=false, maxlevel=false, numformat=false});
+    // any explicit options for this command
+    for( k, v in pairs(loadstring("return"..(expression->match("--%s*(%b{})%s*$") || "{}"))()) ) {
+      params[k] = v;
+    }
+    copas.addthread(function() {
+        var debugger = debugger;
+        // exec command is not expected to return anything.
+        // eval command returns 0 or more results.
+        // 'values' has a list of serialized results returned.
+        // as it is not possible to distinguish between 0 results and one
+        // 'nil' value returned, 'nil' is always returned in this case.
+        // the first value returned by eval command is not used;
+        // this may need to be taken into account by other debuggers.
+        var addedret, forceexpression = true, expression->match("^%s*=%s*");
+        expression = expression->gsub("^%s*=%s*","");
+        var _, values, err = debugger->evaluate(expression, params);
+        if( ! forceexpression && err ) {
+          var _, values2, err2 = debugger->execute(expression, params);
+          // since the remote execution may fail during compilation- and run-time,
+          // and some expressions may fail in both cases, try to report the "best" error.
+          // for example, `x[1]` fails as statement, and may also fail if `x` is `nil`.
+          // in this case, the first (expression) error is returned if it's not a
+          // statement and compiles as an expression without errors.
+          // the order of statement and expression checks can't be reversed as errors from
+          // code fragments that fail with both, will be always reported as expressions.
+          if( ! (err2 && ! isstatement && loadstring("return "..expression)) ) {
+            addedret, values, err = false, values2, err2;
+          }
+        }
+
+        if( err ) {
+          if( addedret ) { err = err->gsub('^%[string "return ', '[string "'); }
+          ide->GetConsole()->Error(err);
+        } else if( addedret || #values > 0 ) {
+          if( forceexpression ) { // display elements as multi-line
+            for( i,v in pairs(values) ) { // stringify each of the returned values
+              var func = loadstring('return '..v); // deserialize the value first
+              if( func ) { // if it's deserialized correctly
+                values[i] = (forceexpression && i > 1 && '\n' || '') ..
+                  serialize(func(), {nocode = true, comment = 0,
+                    // if '=' is used, then use multi-line serialized output
+                    indent = forceexpression && '  ' || null});
+              }
+            }
+          }
+
+          // if empty table is returned, then show nil if this was an expression
+          if( #values == 0 && (forceexpression || ! isstatement) ) {
+            values = {'nil'};
+          }
+          ide->GetConsole()->Print(unpack(values));
+        }
+
+        // refresh Stack and Watch windows if executed a statement (and no err)
+        if( isstatement && ! err && ! addedret && #values == 0 ) {
+          debugger->updateStackSync();
+          debugger->updateWatchesSync();
+        }
+      });
+  } else if( debugger.server ) {
+    ide->GetConsole()->Error(TR("Can't evaluate the expression while the application is running."));
+  }
+}
+
+function debugger::stoppedAtBreakpoint(file, line) {
+  // if this document can be activated and the current line has a breakpoint
+  var editor = this->ActivateDocument(file, line, activate.CHECKONLY);
+  if( ! editor ) { return false; }
+
+  var current = editor->MarkerNext(0, CURRENT_LINE_MARKER_VALUE);
+  var breakpoint = editor->MarkerNext(current, BREAKPOINT_MARKER_VALUE);
+  return breakpoint != wx.wxNOT_FOUND && breakpoint == current;
+}
+
+function debugger::mapRemotePath(basedir, file, line, method) {
+  var debugger = this;
+  if( ! file ) { return; }
+
+  // file is /foo/bar/my.ljs; basedir is d:\local\path\
+  // check for d:\local\path\my.ljs, d:\local\path\bar\my.ljs, ...
+  // wxwidgets on Windows handles \\ and / as separators, but on OSX
+  // and Linux it only handles 'native' separator;
+  // need to translate for GetDirs to work.
+  file = file->gsub("\\", "/");
+  var parts = wx.wxFileName(file)->GetDirs();
+  var name = wx.wxFileName(file)->GetFullName();
+
+  // find the longest remote path that can be mapped locally
+  var longestpath, remotedir;
+  while( true ) {
+    var mapped = GetFullPathIfExists(basedir, name);
+    if( mapped ) {
+      longestpath = mapped;
+      remotedir = file->gsub(q(name)->gsub("/", ".").."$", "");
+    }
+    if( #parts == 0 ) { break; }
+    name = table.remove(parts, #parts) .. "/" .. name;
+  }
+  // if the mapped directory empty or the same as the basedir, nothing to do
+  if( ! remotedir || remotedir == "" || wx.wxFileName(remotedir)->SameAs(wx.wxFileName(debugger.basedir)) ) { return; }
+
+  // if found a local mapping under basedir
+  var activated = longestpath && (debugger->ActivateDocument(longestpath, line, method || activate.NOREPORT)
+    // local file may exist, but not activated when not (auto-)opened, still need to remap
+    || wx.wxFileName(longestpath)->FileExists());
+  if( activated ) {
+    // find remote basedir by removing the tail from remote file
+    debugger->handle("basedir " .. debugger.basedir .. "\t" .. remotedir);
+    // reset breakpoints again as remote basedir has changed
+    debugger->reSetBreakpoints();
+    ide->Print(TR("Mapped remote request for '%s' to '%s'.")->format(remotedir, debugger.basedir));
+
+    return longestpath;
+  }
+
+  return null;
+}
+
+function debugger::Listen(start) {
+  var debugger = ide->GetDebugger();
+  if( start == false ) {
+    if( debugger.listening ) {
+      debugger->terminate(); // terminate if running
+      copas.removeserver(debugger.listening);
+      ide->Print(TR("Debugger server stopped at %s:%d.")
+        ->format(debugger.hostname, debugger.portnumber));
+      debugger.listening = false;
+    } else {
+      displayError(TR("Can't stop debugger server as it is not started."));
+    }
+    return;
+  }
+
+  if( debugger.listening ) { return; }
+
+  var server, err = socket.bind("*", debugger.portnumber);
+  if( ! server ) {
+    displayError(TR("Can't start debugger server at %s:%d: %s.")
+      ->format(debugger.hostname, debugger.portnumber, err || TR("unknown error")));
+    return;
+  }
+  ide->Print(TR("Debugger server started at %s:%d.")->format(debugger.hostname, debugger.portnumber));
+
+  copas.autoclose = false;
+  copas.addserver(server, function (skt) {
+      var debugger = ide->GetDebugger();
+      var options = debugger.options || {};
+      if( options.refuseonconflict == null ) { options.refuseonconflict = ide.config.debugger.refuseonconflict; }
+
+      // pull any pending data not processed yet
+      if( debugger.running ) { debugger->Update(); }
+      if( debugger.server && options.refuseonconflict ) {
+        displayError(TR("Refused a request to start a new debugging session as there is one in progress already."));
+        return;
+      }
+
+      // error handler is set per-copas-thread
+      copas.setErrorHandler(function(error) {
+        // ignore errors that happen because debugging session is
+        // terminated during handshake (server == nil in this case).
+        if( debugger.server ) {
+          displayError(TR("Can't start debugging session due to internal error '%s'.")->format(error));
+        }
+        debugger->terminate();
+      });
+
+      // this may be a remote call without using an interpreter and as such
+      // debugger.options may not be set, but runonstart is still configured.
+      var runstart = options.runstart;
+      if( runstart == null ) { runstart = ide.config.debugger.runonstart; }
+
+      // support allowediting as set in the interpreter or config
+      if( options.allowediting == null ) { options.allowediting = ide.config.debugger.allowediting; }
+
+      if( ! debugger.scratchpad && ! options.allowediting ) {
+        SetAllEditorsReadOnly(true);
+      }
+
+      debugger = ide->SetDebugger(debugger->init({
+          server = copas.wrap(skt),
+          socket = skt,
+          loop = false,
+          scratchable = false,
+          stats = {line = 0},
+          missing = {},
+          editormap = {},
+          runtocursor = null,
+      }));
+
+      if( PackageEventHandle("onDebuggerPreLoad", debugger, options) == false ) { return; }
+
+      var editor = ide->GetEditor();
+      var startfile = ide->GetProjectStartFile() || options.startwith
+        || (editor && SaveIfModified(editor) && ide->GetDocument(editor)->GetFilePath());
+
+      if( ! startfile ) {
+        displayError(TR("Can't start debugging without an opened file or with the current file not being saved."));
+        return debugger->terminate();
+      }
+
+      var startpath = wx.wxFileName(startfile)->GetPath(wx.wxPATH_GET_VOLUME + wx.wxPATH_GET_SEPARATOR);
+      var basedir = options.basedir || ide->GetProject() || startpath;
+      // guarantee that the path has a trailing separator
+      debugger.basedir = wx.wxFileName.DirName(basedir)->GetFullPath();
+
+      // load the remote file into the debugger
+      // set basedir first, before loading to make sure that the path is correct
+      debugger->handle("basedir " .. debugger.basedir);
+
+      var init = options.init || ide.config.debugger.init;
+      if( init ) {
+        var _, _, err = debugger->execute(init);
+        if( err ) { displayError(TR("Ignored error in debugger initialization code: %s.")->format(err)); }
+      }
+
+      debugger->reSetBreakpoints();
+
+      var redirect = ide.config.debugger.redirect || options.redirect;
+      if( redirect ) {
+        debugger->handle("output stdout " .. redirect, null,
+          { handler = function(m) {
+              // if it's an error returned, then handle the error
+              if( m && m->find("stack traceback:", 1, true) ) {
+                // this is an error message sent remotely
+                var ok, res = LoadSafe("return "..m);
+                if( ok ) {
+                  ide->Print(res);
+                  return;
+                }
+              }
+
+              if( ide.config.debugger.outputfilter ) {
+                var ok, res = pcall(ide.config.debugger.outputfilter, m);
+                if( ok ) {
+                  m = res;
+                } else {
+                  displayError("Output filter failed: "..res);
+                  return;
+                }
+              }
+              if( m ) { ide->GetOutput()->Write(m); }
+            }});
+      }
+
+      if( (options.startwith) ) {
+        var file, line, err = debugger->loadfile(options.startwith);
+        if( err ) {
+          displayError(TR("Can't run the entry point script ('%s').")
+            ->format(options.startwith)
+            .." "..TR("Compilation error")
+            ..":\n"..err);
+          return debugger->terminate();
+        } else if( runstart && ! debugger.scratchpad ) {
+          if( debugger->stoppedAtBreakpoint(file, line) ) {
+            debugger->ActivateDocument(file, line);
+            runstart = false;
+          }
+        } else if( file && line && ! debugger->ActivateDocument(file, line) ) {
+          displayError(TR("Debugging suspended at '%s:%s' (couldn't activate the file).")
+            ->format(file, line));
+        }
+      } else if( ! debugger.scratchpad ) {
+        var file, line, err = debugger->loadfile(startfile);
+        // "load" can work in two ways: (1) it can load the requested file
+        // OR (2) it can "refuse" to load it if the client was started
+        // with start() method, which can't load new files
+        // if file and line are set, this indicates option #2
+        if( err ) {
+          displayError(TR("Can't start debugging for '%s'.")->format(startfile)
+            .." "..TR("Compilation error")
+            ..":\n"..err);
+          return debugger->terminate();
+        } else if( runstart ) {
+          var file = (debugger->mapRemotePath(basedir, file, line || 0, activate.CHECKONLY)
+            || file || startfile);
+
+          if( debugger->stoppedAtBreakpoint(file, line || 0) ) {
+            debugger->ActivateDocument(file, line || 0);
+            runstart = false;
+          }
+        } else if( file && line ) {
+          var activated = debugger->ActivateDocument(file, line, activate.NOREPORT);
+
+          // if not found, check using full file path and reset basedir
+          if( ! activated && ! wx.wxIsAbsolutePath(file) ) {
+            activated = debugger->ActivateDocument(startpath..file, line, activate.NOREPORT);
+            if( activated ) {
+              debugger.basedir = startpath;
+              debugger->handle("basedir " .. debugger.basedir);
+              // reset breakpoints again as basedir has changed
+              debugger->reSetBreakpoints();
+            }
+          }
+
+          // if not found and the files doesn't exist, it may be
+          // a remote call; try to map it to the project folder.
+          // also check for absolute path as it may need to be remapped
+          // when autoactivation is disabled.
+          if( ! activated && (! wx.wxFileName(file)->FileExists()
+                                || wx.wxIsAbsolutePath(file)) ) {
+            if( debugger->mapRemotePath(basedir, file, line, activate.NOREPORT) ) {
+              activated = true;
+            }
+          }
+
+          if( ! activated ) {
+            displayError(TR("Debugging suspended at '%s:%s' (couldn't activate the file).")
+              ->format(file, line));
+          }
+
+          // debugger may still be available for scratchpad,
+          // if the interpreter signals scratchpad support, so enable it.
+          debugger.scratchable = ide.interpreter.scratchextloop != null;
+        } else {
+          debugger.scratchable = true;
+          var activated = debugger->ActivateDocument(startfile, 0); // find the appropriate line
+          if( ! activated ) {
+            displayError(TR("Debugging suspended at '%s:%s' (couldn't activate the file).")
+              ->format(startfile, '?'));
+          }
+        }
+      }
+
+      if( (! options.noshell && ! debugger.scratchpad) ) {
+        ide->GetConsole()->SetRemote(debugger->GetConsole());
+      }
+
+      debugger->toggleViews(true);
+      debugger->updateStackSync();
+      debugger->updateWatchesSync();
+
+      ide->Print(TR("Debugging session started in '%s'.")->format(debugger.basedir));
+
+      if( debugger.scratchpad ) {
+        debugger.scratchpad.updated = true;
+      } else if( runstart ) {
+        ClearAllCurrentLineMarkers();
+        debugger->Run();
+      }
+
+      // request attention if the debugging is stopped
+      if( ! debugger.running ) { ide->RequestAttention(); }
+      // refresh toolbar and menus in case the main app is not active
+      ide->GetMainFrame()->UpdateWindowUI(wx.wxUPDATE_UI_FROMIDLE);
+      ide->GetToolBar()->UpdateWindowUI(wx.wxUPDATE_UI_FROMIDLE);
+
+      PackageEventHandle("onDebuggerLoad", debugger, options);
+    });
+  debugger.listening = server;
+}
+
+var function nameOutputTab(name) {
+  var nbk = ide.frame.bottomnotebook;
+  var index = nbk->GetPageIndex(ide->GetOutput());
+  if( index != wx.wxNOT_FOUND ) { nbk->SetPageText(index, name); }
+}
+
+var ok, winapi = pcall(require, 'winapi');
+if( ! ok ) { winapi = null; }
+
+function debugger::handle(command, server, options) {
+  var debugger = this;
+  var verbose = ide.config.debugger.verbose;
+  options = options || {};
+  options.verbose = verbose && (function(...) { ide->Print(...); }) || false;
+
+  var ip, port = debugger.socket->getpeername();
+  PackageEventHandle("onDebuggerCommand", debugger, command, server || debugger.server, options);
+  debugger.running = true;
+  debugger->UpdateStatus("running");
+  if( verbose ) { ide->Print(("[%s:%s] Debugger sent (command):")->format(ip, port), command); }
+  var file, line, err = mobdebug.handle(command, server || debugger.server, options);
+  if( verbose ) { ide->Print(("[%s:%s] Debugger received (file, line, err):")->format(ip, port), file, line, err); }
+  debugger.running = false;
+  // only set suspended if the debugging hasn't been terminated
+  debugger->UpdateStatus(debugger.server && "suspended" || "stopped");
+
+  // some filenames may be represented in a different code page; check and re-encode as UTF8
+  var codepage = ide->GetCodePage();
+  if( codepage && type(file) == "string" && FixUTF8(file) == null && winapi ) {
+    file = winapi.encode(codepage, winapi.CP_UTF8, file);
+  }
+
+  return file, line, err;
+}
+
+function debugger::exec(command, func) {
+  var debugger = this;
+  if( debugger.server && ! debugger.running ) {
+    copas.addthread(function() {
+        var debugger = debugger;
+        // execute a custom function (if any) in the context of this thread
+        if( type(func) == 'function' ) { func(); }
+        var out;
+        var attempts = 0;
+        while( true ) {
+          // clear markers before running the command
+          // don't clear if running trace as the marker is then invisible,
+          // and it needs to be visible during tracing
+          if( ! debugger.loop ) { ClearAllCurrentLineMarkers(); }
+          debugger.breaking = false;
+          var file, line, err = debugger->handle(out || command);
+          if( out ) { out = null; }
+          if( line == null ) {
+            if( err ) { displayError(err); }
+            debugger->teardown();
+            return;
+          } else if( ! debugger.server ) {
+            // it is possible that while debugger.handle call was executing
+            // the debugging was terminated; simply return in this case.
+            return;
+          } else {
+            var activated = debugger->ActivateDocument(file, line);
+            // activation has been canceled; nothing else needs to be done
+            if( activated == null ) { return; }
+            if( activated ) {
+              // move cursor to the activated line if it's a breakpoint
+              if( ide.config.debugger.linetobreakpoint
+              && command != "step" && debugger->stoppedAtBreakpoint(file, line)
+              && ! debugger.breaking && ide->IsValidCtrl(activated) ) {
+                activated->GotoLine(line-1);
+              }
+              debugger.stats.line = debugger.stats.line + 1;
+              if( debugger.loop ) {
+                debugger->updateStackSync();
+                debugger->updateWatchesSync();
+              } else {
+                debugger->updateStackAndWatches();
+                return;
+              }
+            } else {
+              // clear the marker as it wasn't cleared earlier
+              if( debugger.loop ) { ClearAllCurrentLineMarkers(); }
+              // we may be in some unknown location at this point;
+              // If this happens, stop and report allowing users to set
+              // breakpoints and step through.
+              if( debugger.breaking ) {
+                displayError(TR("Debugging suspended at '%s:%s' (couldn't activate the file).")
+                  ->format(file, line));
+                debugger->updateStackAndWatches();
+                return;
+              }
+              // redo now; if the call is from the debugger, then repeat
+              // the same command, except when it was "run" (switch to 'step');
+              // this is needed to "break" execution that happens in on() call.
+              // in all other cases get out of this file.
+              // don't get out of "mobdebug", because it may happen with
+              // start() or on() call, which will get us out of the current
+              // file, which is not what we want.
+              // Some engines (Corona SDK) report =?:0 as the current location.
+              // repeat the same command, but check if this has been tried
+              // too many times already; if so, get "out"
+              out = ((tonumber(line) == 0 && attempts < 10) && command
+                || (file->find('mobdebug%.ljs$')
+                  && (command == 'run' && 'step' || command) || "out"));
+              attempts +=   1;
+            }
+          }
+        }
+      });
+  }
+}
+
+function debugger::handleAsync(command) {
+  var debugger = this;
+  if( debugger.server && ! debugger.running ) {
+    copas.addthread(function() {
+        var debugger = debugger;
+        debugger->handle(command);
+      });
+  }
+}
+function debugger::handleDirect(command) {
+  var debugger = this;
+  var sock = debugger.socket;
+  if( debugger.server && sock ) {
+    var running = debugger.running;
+    // this needs to be short as it will block the UI
+    sock->settimeout(0.25);
+    debugger->handle(command, sock);
+    sock->settimeout(0);
+    // restore running status
+    debugger.running = running;
+  }
+}
+
+function debugger::loadfile(file) {
+  var debugger = this;
+  var f, l, err = debugger->handle("load " .. file);
+  if( ! f && wx.wxFileExists(file) && err && err->find("Cannot open file") ) {
+    var content = FileRead(file);
+    if( content ) { return debugger->loadstring(file, content); }
+  }
+  return f, l, err;
+}
+function debugger::loadstring(file, string) {
+  var debugger = this;
+  return debugger->handle("loadstring '" .. file .. "' " .. string);
+}
+
+{
+  var nextupdatedelta = 0.250;
+  var nextupdate = ide->GetTime() + nextupdatedelta;
+  var function forceUpdateOnWrap(editor) {
+    // http://www.scintilla.org/ScintillaDoc.html#LineWrapping
+    // Scintilla doesn't perform wrapping immediately after a content change
+    // for performance reasons, so the activation calculations can be wrong
+    // if there is wrapping that pushes the current line out of the screen.
+    // force editor update that performs wrapping recalculation.
+    if( ide.config.editor.usewrap ) { editor->Update(); editor->Refresh(); }
+  }
+  function debugger::Update() {
+    var debugger = this;
+    var smth = false;
+    if( debugger.server || debugger.listening && ide->GetTime() > nextupdate ) {
+      smth = copas.step(0);
+      nextupdate = ide->GetTime() + nextupdatedelta;
+    }
+
+    // if there is any pending activation
+    if( debugger.activate ) {
+      var file, line, content = unpack(debugger.activate);
+      debugger.activate = null;
+      if( content ) {
+        var editor = NewFile();
+        editor->SetTextDyn(content);
+        if( ! ide.config.debugger.allowediting
+        && ! (debugger.options || {}).allowediting ) {
+          editor->SetReadOnly(true);
+        }
+        forceUpdateOnWrap(editor);
+        debugger->ActivateDocument(file, line);
+      } else {
+        var editor = LoadFile(file);
+        if( editor ) {
+          forceUpdateOnWrap(editor);
+          debugger->ActivateDocument(file, line);
+        }
+      }
+    }
+    return smth;
+  }
+}
+
+function debugger::terminate() {
+  var debugger = this;
+  if( debugger.server ) {
+    if( killProcess(ide->GetLaunchedProcess()) ) { // if there is PID, try local kill
+      ide->SetLaunchedProcess(null);
+    } else { // otherwise, try graceful exit for the remote process
+      debugger->detach("exit");
+    }
+    debugger->teardown();
+  }
+}
+function debugger::Step() { return this->exec("step"); }
+function debugger::trace() {
+  var debugger = this;
+  debugger.loop = true;
+  debugger->exec("step");
+}
+function debugger::RunTo(editor, line) {
+  var debugger = this;
+
+  // check if the location is valid for a breakpoint
+  if( editor->IsLineEmpty(line-1) ) { return; }
+
+  var ed, ln = unpack(debugger.runtocursor || {});
+  var same = ed && ln && ed->GetId() == editor->GetId() && ln == line;
+
+  // check if there is already a breakpoint in the "run to" location;
+  // if so, don't mark the location as "run to" as it will stop there anyway
+  if( bit.band(editor->MarkerGet(line-1), BREAKPOINT_MARKER_VALUE) > 0
+  && ! same ) {
+    debugger.runtocursor = null;
+    debugger->Run();
+    return;
+  }
+
+  // save the location of the breakpoint
+  debugger.runtocursor = {editor, line};
+  // set breakpoint and execute run
+  debugger->exec("run", function() {
+      // if run-to-cursor location is already set, then remove the breakpoint,
+      // but only if this location is different
+      if( ed && ln && ! same ) {
+        debugger->breakpointToggle(ed, ln, false); // remove earlier run-to breakpoint
+        debugger->Wait();
+      }
+      if( ! same ) {
+        debugger->breakpointToggle(editor, line, true); // set new run-to breakpoint
+        debugger->Wait();
+      }
+    });
+}
+function debugger::Wait() {
+  var debugger = this;
+  // wait for all results to come back
+  while( debugger.running ) { debugger->Update(); }
+}
+function debugger::Over() { return this->exec("over"); }
+function debugger::Out() { return this->exec("out"); }
+function debugger::Run() { return this->exec("run"); }
+function debugger::detach(cmd) {
+  var debugger = this;
+  if( ! debugger.server ) { return; }
+  if( debugger.running ) {
+    debugger->handleDirect(cmd || "done");
+    debugger->teardown();
+  } else {
+    debugger->exec(cmd || "done");
+  }
+}
+var function todeb(params) { return params && " -- "..mobdebug.line(params, {comment = false}) || ""; }
+function debugger::evaluate(exp, params) { return this->handle('eval ' .. exp .. todeb(params)); }
+function debugger::execute(exp, params) { return this->handle('exec '.. exp .. todeb(params)); }
+function debugger::stack(params) { return this->handle('stack' .. todeb(params)); }
+function debugger::Break(command) {
+  var debugger = this;
+  // stop if we're running a "trace" command
+  debugger.loop = false;
+
+  // force suspend command; don't use copas interface as it checks
+  // for the other side "reading" and the other side is not reading anything.
+  // use the "original" socket to send "suspend" command.
+  // this will only break on the next Lua command.
+  if( debugger.socket ) {
+    var running = debugger.running;
+    // this needs to be short as it will block the UI
+    debugger.socket->settimeout(0.25);
+    var file, line, err = debugger->handle(command || "suspend", debugger.socket);
+    debugger.socket->settimeout(0);
+    // restore running status
+    debugger.running = running;
+    debugger.breaking = true;
+    // don't need to do anything else as the earlier call (run, step, etc.)
+    // will get the results (file, line) back and will update the UI
+    return file, line, err;
+  }
+}
+function debugger::breakpoint(file, line, state) {
+  var debugger = this;
+  if( debugger.running ) {
+    return debugger->handleDirect((state && "asetb " || "adelb ") .. file .. " " .. line);
+  }
+  return debugger->handleAsync((state && "setb " || "delb ") .. file .. " " .. line);
+}
+function debugger::EvalAsync(_v_var, callback, params) {
+  var debugger = this;
+  if( debugger.server && ! debugger.running && callback
+  && ! debugger.scratchpad && ! (debugger.options || {}).noeval ) {
+    copas.addthread(function() {
+      var debugger = debugger;
+      var _, values, err = debugger->evaluate(_v_var, params);
+      if( err ) {
+        callback(null, (err->gsub("%[.-%]:%d+:%s*","error: ")));
+      } else {
+        callback(#values > 0 && values[1] || 'nil');
+      }
+    });
+  }
+}
+
+var width, height = 360, 200;
+
+var keyword = {};
+for( _,k in ipairs({'and', 'break', 'do', 'else', 'elseif', 'end', 'false',
+  'for', 'function', 'goto', 'if', 'in', 'local', 'nil', 'not', 'or', 'repeat',
+  'return', 'then', 'true', 'until', 'while'}) ) { keyword[k] = true; }
+
+var function stringifyKeyIntoPrefix(name, num) {
+  return (type(name) == "number"
+    && (num && num == name && '' || ("[%s] = ")->format(name))
+    || type(name) == "string" && (name->match("^[%l%u_][%w_]*$") && ! keyword[name]
+      && ("%s = ")->format(name)
+      || ("[%q] = ")->format(name))
+    || ("[%s] = ")->format(tostring(name)));
+}
+
+var function debuggerCreateStackWindow() {
+  var stackCtrl = ide->CreateTreeCtrl(ide.frame, wx.wxID_ANY,
+    wx.wxDefaultPosition, wx.wxSize(width, height),
+    wx.wxTR_LINES_AT_ROOT + wx.wxTR_HAS_BUTTONS + wx.wxTR_SINGLE
+    + wx.wxTR_HIDE_ROOT + wx.wxNO_BORDER);
+
+  var debugger = ide->GetDebugger();
+  debugger.stackCtrl = stackCtrl;
+
+  stackCtrl->SetImageList(debugger.imglist);
+
+  var names = {};
+  function stackCtrl::SetItemName(item, name) {
+    var nametype = type(name);
+    names[item->GetValue()] = (
+      (nametype == 'string' || nametype == 'number' || nametype == 'boolean')
+      && name || null
+    );
+  }
+
+  function stackCtrl::GetItemName(item) {
+    return names[item->GetValue()];
+  }
+
+  var expandable = {}; // special value
+  var valuecache = {};
+  function stackCtrl::SetItemValueIfExpandable(item, value, delayed) {
+    var maxlvl = tonumber(ide.config.debugger.maxdatalevel);
+    // don't make empty tables expandable if expansion is disabled (`maxdatalevel` is false)
+    var isexpandable = type(value) == 'table' && (next(value) != null || delayed && maxlvl != null);
+    if( isexpandable ) { // cache table value to expand when requested
+      valuecache[item->GetValue()] = next(value) == null && expandable || value;
+    } else if( type(value) != 'table' ) {
+      valuecache[item->GetValue()] = null;
+    }
+    this->SetItemHasChildren(item, isexpandable);
+  }
+
+  function stackCtrl::IsExpandable(item) { return valuecache[item->GetValue()] == expandable; }
+
+  function stackCtrl::DeleteAll() {
+    this->DeleteAllItems();
+    valuecache = {};
+    names = {};
+  }
+
+  function stackCtrl::GetItemChildren(item) {
+    return valuecache[item->GetValue()] || {};
+  }
+
+  function stackCtrl::IsFrame(item) {
+    return (item && item->IsOk() && this->GetItemParent(item)->IsOk()
+      && this->GetItemParent(item)->GetValue() == this->GetRootItem()->GetValue());
+  }
+
+  function stackCtrl::GetItemFullExpression(item) {
+    var expr = '';
+    while( item->IsOk() && ! this->IsFrame(item) ) {
+      var name = this->GetItemName(item);
+      // check if it's a top item, as it needs to be used as is;
+      // convert `(*vararg num)` to `select(num, ...)`
+      expr = (this->IsFrame(this->GetItemParent(item))
+        && name->gsub("^%(%*vararg (%d+)%)$", "select(%1, ...)")
+        || (type(name) == 'string' && '[%q]' || '[%s]')->format(tostring(name)))
+      ..expr;
+      item = this->GetItemParent(item);
+    }
+    return expr, item->IsOk() && item || null;
+  }
+
+  function stackCtrl::GetItemPos(item) {
+    if( ! item->IsOk() ) { return; }
+    var pos = 0;
+    do {
+      pos +=   1;
+      item = this->GetPrevSibling(item);
+    } while(!( ! item->IsOk()) );
+    return pos;
+  }
+
+  function stackCtrl::ExpandItemValue(item) {
+    var expr, itemframe = this->GetItemFullExpression(item);
+    var stack = this->GetItemPos(itemframe);
+
+    var debugger = ide->GetDebugger();
+    if( debugger.running ) { debugger->Update(); }
+    if( debugger.server && ! debugger.running
+    && (! debugger.scratchpad || debugger.scratchpad.paused) ) {
+      copas.addthread(function() {
+        var debugger = debugger;
+        var value, _, err = debugger->evaluate(expr, {maxlevel = 1, stack = stack});
+        if( err ) {
+          err = err->gsub("%[.-%]:%d+:%s+","");
+          // this may happen when attempting to expand a sub-element referenced by a key
+          // that can't be evaluated, like a table, function, or userdata
+          if( err != "attempt to index a nil value" ) {
+            this->SetItemText(item, 'error: '..err);
+          } else {
+            var name = this->GetItemName(item);
+            var text = stringifyKeyIntoPrefix(name, this->GetItemPos(item)).."{}";
+            this->SetItemText(item, text);
+            this->SetItemValueIfExpandable(item, {});
+            this->Expand(item);
+          }
+        } else {
+          var ok, res = LoadSafe("return "..tostring(value));
+          if( ok ) {
+            this->SetItemValueIfExpandable(item, res);
+            this->Expand(item);
+
+            var name = this->GetItemName(item);
+            if( ! name ) {
+              // this is an empty table, so replace MORE indicator with the empty table
+              this->SetItemText(item, (this->GetItemText(item)->gsub(q(MORE), "{}")));
+              return;
+            }
+
+            // update cache in the parent
+            var parent = this->GetItemParent(item);
+            valuecache[parent->GetValue()][name] = res;
+
+            var params = debugger->GetDataOptions({maxlevel=false});
+
+            // now update all serialized values in the tree starting from the expanded item
+            while( item->IsOk() && ! this->IsFrame(item) ) {
+              var value = valuecache[item->GetValue()];
+              var strval = fixUTF8(serialize(value, params));
+              var name = this->GetItemName(item);
+              var text = (this->IsFrame(this->GetItemParent(item))
+                && name.." = "
+                || stringifyKeyIntoPrefix(name, this->GetItemPos(item)))
+              ..strval;
+              this->SetItemText(item, text);
+              item = this->GetItemParent(item);
+            }
+          }
+        }
+      });
+    }
+  }
+
+  stackCtrl->Connect(wx.wxEVT_COMMAND_TREE_ITEM_EXPANDING,
+    function (event) {
+      var item_id = event->GetItem();
+      var count = stackCtrl->GetChildrenCount(item_id, false);
+      if( count > 0 ) { return true; }
+
+      if( stackCtrl->IsExpandable(item_id) ) { return stackCtrl->ExpandItemValue(item_id); }
+
+      var image = stackCtrl->GetItemImage(item_id);
+      var num, maxnum = 1, ide.config.debugger.maxdatanum;
+      var params = debugger->GetDataOptions({maxlevel = false});
+
+      stackCtrl->Freeze();
+      for( name,value in pairs(stackCtrl->GetItemChildren(item_id)) ) {
+        var item = stackCtrl->AppendItem(item_id, "", image);
+        stackCtrl->SetItemValueIfExpandable(item, value, true);
+
+        var strval = stackCtrl->IsExpandable(item) && MORE || fixUTF8(serialize(value, params));
+        stackCtrl->SetItemText(item, stringifyKeyIntoPrefix(name, num)..strval);
+        stackCtrl->SetItemName(item, name);
+
+        num +=   1;
+        if( num > maxnum ) { break; }
+      }
+      stackCtrl->Thaw();
+      return true;
+    });
+
+  stackCtrl->Connect(wx.wxEVT_SET_FOCUS, function(event) {
+      var debugger = ide->GetDebugger();
+      if( debugger.needrefresh.stack ) {
+        debugger->updateStack();
+        debugger.needrefresh.stack = false;
+      }
+    });
+
+  // register navigation callback
+  stackCtrl->Connect(wx.wxEVT_LEFT_DCLICK, function (event) {
+    var item_id = stackCtrl->HitTest(event->GetPosition());
+    if( ! item_id || ! item_id->IsOk() ) { event->Skip(); return; }
+
+    var coords = callData[item_id->GetValue()];
+    if( ! coords ) { event->Skip(); return; }
+
+    var file, line = coords[1], coords[2];
+    if( file->match("@") ) { file = string.sub(file, 2); }
+    file = GetFullPathIfExists(ide->GetDebugger().basedir, file);
+    if( file ) {
+      var editor = LoadFile(file,null,true);
+      editor->SetFocus();
+      if( line ) {
+        editor->GotoLine(line-1);
+        editor->EnsureVisibleEnforcePolicy(line-1); // make sure the line is visible (unfolded)
+      }
+    }
+  });
+
+  var layout = ide->GetSetting("/view", "uimgrlayout");
+  if( layout && ! layout->find("stackpanel") ) {
+    ide->AddPanelDocked(ide.frame.bottomnotebook, stackCtrl, "stackpanel", TR("Stack"));
+  } else {
+    ide->AddPanel(stackCtrl, "stackpanel", TR("Stack"));
+  }
+}
+
+var function debuggerCreateWatchWindow() {
+  var watchCtrl = ide->CreateTreeCtrl(ide.frame, wx.wxID_ANY,
+    wx.wxDefaultPosition, wx.wxSize(width, height),
+    wx.wxTR_LINES_AT_ROOT + wx.wxTR_HAS_BUTTONS + wx.wxTR_SINGLE
+    + wx.wxTR_HIDE_ROOT + wx.wxTR_EDIT_LABELS + wx.wxNO_BORDER);
+
+  var debugger = ide->GetDebugger();
+  debugger.watchCtrl = watchCtrl;
+
+  var root = watchCtrl->AddRoot("Watch");
+  watchCtrl->SetImageList(debugger.imglist);
+
+  var defaultExpr = "watch expression";
+  var expressions = {}; // table to keep track of expressions
+
+  function watchCtrl::SetItemExpression(item, expr, value) {
+    expressions[item->GetValue()] = expr;
+    this->SetItemText(item, expr .. ' = ' .. (value || '?'));
+    this->SelectItem(item, true);
+    var debugger = ide->GetDebugger();
+    if( ! value ) { debugger->updateWatches(item); }
+  }
+
+  function watchCtrl::GetItemExpression(item) {
+    return expressions[item->GetValue()];
+  }
+
+  var names = {};
+  function watchCtrl::SetItemName(item, name) {
+    var nametype = type(name);
+    names[item->GetValue()] = (
+      (nametype == 'string' || nametype == 'number' || nametype == 'boolean')
+      && name || null
+    );
+  }
+
+  function watchCtrl::GetItemName(item) {
+    return names[item->GetValue()];
+  }
+
+  var expandable = {}; // special value
+  var valuecache = {};
+  function watchCtrl::SetItemValueIfExpandable(item, value, delayed) {
+    var maxlvl = tonumber(ide.config.debugger.maxdatalevel);
+    // don't make empty tables expandable if expansion is disabled (`maxdatalevel` is false)
+    var isexpandable = type(value) == 'table' && (next(value) != null || delayed && maxlvl != null);
+    if( isexpandable ) { // cache table value to expand when requested
+      valuecache[item->GetValue()] = next(value) == null && expandable || value;
+    } else if( type(value) != 'table' ) {
+      valuecache[item->GetValue()] = null;
+    }
+    this->SetItemHasChildren(item, isexpandable);
+  }
+
+  function watchCtrl::IsExpandable(item) { return valuecache[item->GetValue()] == expandable; }
+
+  function watchCtrl::GetItemChildren(item) {
+    return valuecache[item->GetValue()] || {};
+  }
+
+  function watchCtrl::IsWatch(item) {
+    return (item && item->IsOk() && this->GetItemParent(item)->IsOk()
+      && this->GetItemParent(item)->GetValue() == root->GetValue());
+  }
+
+  function watchCtrl::IsEditable(item) {
+    return (item && item->IsOk()
+      && (this->IsWatch(item) || this->GetItemName(item) != null));
+  }
+
+  function watchCtrl::GetItemFullExpression(item) {
+    var expr = '';
+    while( true ) {
+      var name = this->GetItemName(item);
+      expr = (this->IsWatch(item)
+        && ('({%s})[1]')->format(this->GetItemExpression(item))
+        || (type(name) == 'string' && '[%q]' || '[%s]')->format(tostring(name))
+      )..expr;
+      if( this->IsWatch(item) ) { break; }
+      item = this->GetItemParent(item);
+      if( ! item->IsOk() ) { break; }
+    }
+    return expr, item->IsOk() && item || null;
+  }
+
+  function watchCtrl::CopyItemValue(item) {
+    var expr = this->GetItemFullExpression(item);
+
+    var debugger = ide->GetDebugger();
+    if( debugger.running ) { debugger->Update(); }
+    if( debugger.server && ! debugger.running
+    && (! debugger.scratchpad || debugger.scratchpad.paused) ) {
+      copas.addthread(function() {
+        var debugger = debugger;
+        var _, values, error = debugger->evaluate(expr);
+        ide->CopyToClipboard(error && error->gsub("%[.-%]:%d+:%s+","")
+          || (#values == 0 && 'nil' || fixUTF8(values[1])));
+      });
+    }
+  }
+
+  function watchCtrl::UpdateItemValue(item, value) {
+    var expr, itemupd = this->GetItemFullExpression(item);
+
+    var debugger = ide->GetDebugger();
+    if( debugger.running ) { debugger->Update(); }
+    if( debugger.server && ! debugger.running
+    && (! debugger.scratchpad || debugger.scratchpad.paused) ) {
+      copas.addthread(function() {
+        var debugger = debugger;
+        var _, _, err = debugger->execute(expr..'='..value);
+        if( err ) {
+          watchCtrl->SetItemText(item, 'error: '..err->gsub("%[.-%]:%d+:%s+",""));
+        } else if( itemupd ) {
+          debugger->updateWatchesSync(itemupd);
+        }
+        debugger->updateStackSync();
+      });
+    }
+  }
+
+  function watchCtrl::GetItemPos(item) {
+    if( ! item->IsOk() ) { return; }
+    var pos = 0;
+    do {
+      pos +=   1;
+      item = this->GetPrevSibling(item);
+    } while(!( ! item->IsOk()) );
+    return pos;
+  }
+
+  function watchCtrl::ExpandItemValue(item) {
+    var expr = this->GetItemFullExpression(item);
+
+    var debugger = ide->GetDebugger();
+    if( debugger.running ) { debugger->Update(); }
+    if( debugger.server && ! debugger.running
+    && (! debugger.scratchpad || debugger.scratchpad.paused) ) {
+      copas.addthread(function() {
+        var debugger = debugger;
+        var value, _, err = debugger->evaluate(expr, {maxlevel = 1});
+        if( err ) {
+          this->SetItemText(item, 'error: '..err->gsub("%[.-%]:%d+:%s+",""));
+        } else {
+          var ok, res = LoadSafe("return "..tostring(value));
+          if( ok ) {
+            this->SetItemValueIfExpandable(item, res);
+            this->Expand(item);
+            var name = this->GetItemName(item);
+            if( ! name ) {
+              this->SetItemText(item, (this->GetItemText(item)->gsub(q(MORE), "{}")));
+              return;
+            }
+
+            // update cache in the parent
+            var parent = this->GetItemParent(item);
+            valuecache[parent->GetValue()][name] = res;
+
+            var params = debugger->GetDataOptions({maxlevel=false});
+
+            // now update all serialized values in the tree starting from the expanded item
+            while( item->IsOk() ) {
+              var value = valuecache[item->GetValue()];
+              var strval = fixUTF8(serialize(value, params));
+              var name = this->GetItemName(item);
+              var text = (this->IsWatch(item)
+                && this->GetItemExpression(item).." = "
+                || stringifyKeyIntoPrefix(name, this->GetItemPos(item)))
+              ..strval;
+              this->SetItemText(item, text);
+              if( this->IsWatch(item) ) { break; }
+              item = this->GetItemParent(item);
+            }
+          }
+        }
+      });
+    }
+  }
+
+  watchCtrl->Connect(wx.wxEVT_COMMAND_TREE_ITEM_EXPANDING,
+    function (event) {
+      var item_id = event->GetItem();
+      var count = watchCtrl->GetChildrenCount(item_id, false);
+      if( count > 0 ) { return true; }
+
+      if( watchCtrl->IsExpandable(item_id) ) { return watchCtrl->ExpandItemValue(item_id); }
+
+      var image = watchCtrl->GetItemImage(item_id);
+      var num, maxnum = 1, ide.config.debugger.maxdatanum;
+      var params = debugger->GetDataOptions({maxlevel = false});
+
+      watchCtrl->Freeze();
+      for( name,value in pairs(watchCtrl->GetItemChildren(item_id)) ) {
+        var item = watchCtrl->AppendItem(item_id, "", image);
+        watchCtrl->SetItemValueIfExpandable(item, value, true);
+
+        var strval = watchCtrl->IsExpandable(item) && MORE || fixUTF8(serialize(value, params));
+        watchCtrl->SetItemText(item, stringifyKeyIntoPrefix(name, num)..strval);
+        watchCtrl->SetItemName(item, name);
+
+        num +=   1;
+        if( num > maxnum ) { break; }
+      }
+      watchCtrl->Thaw();
+      return true;
+    });
+
+  watchCtrl->Connect(wx.wxEVT_COMMAND_TREE_DELETE_ITEM,
+    function (event) {
+      var value = event->GetItem()->GetValue();
+      expressions[value] = null;
+      valuecache[value] = null;
+      names[value] = null;
+    });
+
+  watchCtrl->Connect(wx.wxEVT_SET_FOCUS, function(event) {
+      var debugger = ide->GetDebugger();
+      if( debugger.needrefresh.watches ) {
+        debugger->updateWatches();
+        debugger.needrefresh.watches = false;
+      }
+    });
+
+  var item;
+  // wx.wxEVT_CONTEXT_MENU is only triggered over tree items on OSX,
+  // but it needs to be also triggered below any item to add a watch,
+  // so use RIGHT_DOWN instead
+  watchCtrl->Connect(wx.wxEVT_RIGHT_DOWN,
+    function (event) {
+      // store the item to be used in edit/delete actions
+      item = watchCtrl->HitTest(watchCtrl->ScreenToClient(wx.wxGetMousePosition()));
+      var editlabel = watchCtrl->IsWatch(item) && TR("&Edit Watch") || TR("&Edit Value");
+      var menu = ide->MakeMenu ({
+        { ID.ADDWATCH, TR("&Add Watch")..KSC(ID.ADDWATCH) },
+        { ID.EDITWATCH, editlabel..KSC(ID.EDITWATCH) },
+        { ID.DELETEWATCH, TR("&Delete Watch")..KSC(ID.DELETEWATCH) },
+        { ID.COPYWATCHVALUE, TR("&Copy Value")..KSC(ID.COPYWATCHVALUE) },
+      });
+      PackageEventHandle("onMenuWatch", menu, watchCtrl, event);
+      watchCtrl->PopupMenu(menu);
+      item = null;
+    });
+
+  watchCtrl->Connect(ID.ADDWATCH, wx.wxEVT_COMMAND_MENU_SELECTED, function (event) {
+      watchCtrl->SetFocus();
+      watchCtrl->EditLabel(watchCtrl->AppendItem(root, defaultExpr, image.LOCAL));
+    });
+
+  watchCtrl->Connect(ID.EDITWATCH, wx.wxEVT_COMMAND_MENU_SELECTED,
+    function (event) { watchCtrl->EditLabel(item || watchCtrl->GetSelection()); });
+  watchCtrl->Connect(ID.EDITWATCH, wx.wxEVT_UPDATE_UI,
+    function (event) { event->Enable(watchCtrl->IsEditable(item || watchCtrl->GetSelection())); });
+
+  watchCtrl->Connect(ID.DELETEWATCH, wx.wxEVT_COMMAND_MENU_SELECTED,
+    function (event) { watchCtrl->Delete(item || watchCtrl->GetSelection()); });
+  watchCtrl->Connect(ID.DELETEWATCH, wx.wxEVT_UPDATE_UI,
+    function (event) { event->Enable(watchCtrl->IsWatch(item || watchCtrl->GetSelection())); });
+
+  watchCtrl->Connect(ID.COPYWATCHVALUE, wx.wxEVT_COMMAND_MENU_SELECTED,
+    function (event) { watchCtrl->CopyItemValue(item || watchCtrl->GetSelection()); });
+  watchCtrl->Connect(ID.COPYWATCHVALUE, wx.wxEVT_UPDATE_UI, function (event) {
+      // allow copying only when the debugger is available
+      var debugger = ide->GetDebugger();
+      event->Enable(item->IsOk() && debugger.server && ! debugger.running
+        && (! debugger.scratchpad || debugger.scratchpad.paused));
+    });
+
+  var label;
+  watchCtrl->Connect(wx.wxEVT_COMMAND_TREE_BEGIN_LABEL_EDIT,
+    function (event) {
+      var item = event->GetItem();
+      if( ! (item->IsOk() && watchCtrl->IsEditable(item)) ) {
+        event->Veto();
+        return;
+      }
+
+      label = watchCtrl->GetItemText(item);
+
+      if( watchCtrl->IsWatch(item) ) {
+        var expr = watchCtrl->GetItemExpression(item);
+        if( expr ) { watchCtrl->SetItemText(item, expr); }
+      } else {
+        var prefix = stringifyKeyIntoPrefix(watchCtrl->GetItemName(item));
+        var val = watchCtrl->GetItemText(item)->gsub(q(prefix),'');
+        watchCtrl->SetItemText(item, val);
+      }
+    });
+  watchCtrl->Connect(wx.wxEVT_COMMAND_TREE_END_LABEL_EDIT,
+    function (event) {
+      event->Veto();
+
+      var item = event->GetItem();
+      if( event->IsEditCancelled() ) {
+        if( watchCtrl->GetItemText(item) == defaultExpr ) {
+          // when Delete is called from END_EDIT, it causes infinite loop
+          // on OSX (wxwidgets 2.9.5) as Delete calls END_EDIT again.
+          // disable handlers during Delete and then enable back.
+          watchCtrl->SetEvtHandlerEnabled(false);
+          watchCtrl->Delete(item);
+          watchCtrl->SetEvtHandlerEnabled(true);
+        } else {
+          watchCtrl->SetItemText(item, label);
+        }
+      } else {
+        if( watchCtrl->IsWatch(item) ) {
+          watchCtrl->SetItemExpression(item, event->GetLabel());
+        } else {
+          watchCtrl->UpdateItemValue(item, event->GetLabel());
+        }
+      }
+      event->Skip();
+    });
+
+  var layout = ide->GetSetting("/view", "uimgrlayout");
+  if( layout && ! layout->find("watchpanel") ) {
+    ide->AddPanelDocked(ide.frame.bottomnotebook, watchCtrl, "watchpanel", TR("Watch"));
+  } else {
+    ide->AddPanel(watchCtrl, "watchpanel", TR("Watch"));
+  }
+}
+
+debuggerCreateStackWindow();
+debuggerCreateWatchWindow();
+
+//--------------------------------------------
+// public api
+
+function debugger::RefreshPanels() { return this->updateStackAndWatches(); }
+
+function debugger::BreakpointSet(...) { return this->breakpoint(...); }
+
+var statuses = {
+  running = TR("Output (running)"),
+  suspended = TR("Output (suspended)"),
+  stopped = TR("Output"),
+};
+function debugger::UpdateStatus(status) {
+  var debugger = this;
+  if( ! status ) {
+    status = debugger.running && "running" || debugger.server && "suspended" || "stopped";
+  }
+  if( PackageEventHandle("onDebuggerStatusUpdate", debugger, status) == false ) { return; }
+  nameOutputTab(statuses[status] || statuses.stopped);
+}
+
+function debugger::OutputSet(stream, mode, options) {
+  return this->handle(("output %s %s")->format(stream, mode), null, options);
+}
+
+function DebuggerAttachDefault(options) { ide->GetDebugger()->SetOptions(options); }
+function debugger::SetOptions(options) { this.options = options; }
+
+function debugger::Stop() {
+  var debugger = this;
+  // terminate the local session (if still active)
+  if( killProcess(ide->GetLaunchedProcess()) ) { ide->SetLaunchedProcess(null); }
+  debugger->terminate();
+}
+
+function debugger::Shutdown() {
+  this->Stop();
+  PackageEventHandle("onDebuggerShutdown", this);
+}
+
+function debugger::teardown() {
+  var debugger = this;
+  if( debugger.server ) {
+    var lines = TR("traced %d instruction", debugger.stats.line)->format(debugger.stats.line);
+    ide->Print(TR("Debugging session completed (%s).")->format(lines));
+    debugger->UpdateStatus(ide->GetLaunchedProcess() && "running" || "stopped");
+    if( debugger.runtocursor ) {
+      var ed, ln = unpack(debugger.runtocursor);
+      debugger->breakpointToggle(ed, ln, false); // remove current run-to breakpoint
+    }
+    if( PackageEventHandle("onDebuggerPreClose", debugger) != false ) {
+      SetAllEditorsReadOnly(false);
+      ide->GetConsole()->SetRemote(null);
+      ClearAllCurrentLineMarkers();
+      debugger->toggleViews(false);
+      PackageEventHandle("onDebuggerClose", debugger);
+    }
+    debugger.server = null;
+    debugger->ScratchpadOff();
+  } else {
+    // it's possible that the application couldn't start, or that the
+    // debugger in the application didn't start, which means there is
+    // no debugger.server, but scratchpad may still be on. Turn it off.
+    debugger->ScratchpadOff();
+  }
+}
+
+var function debuggerMakeFileName(editor) {
+  return ide->GetDocument(editor)->GetFilePath()
+  || ide->GetDocument(editor)->GetFileName()
+  || ide->GetDefaultFileName();
+}
+
+function debugger::breakpointToggle(editor, line, value) {
+  var debugger = this;
+  var file = debugger.editormap && debugger.editormap[editor] || debuggerMakeFileName(editor);
+  debugger->BreakpointSet(file, line, value);
+}
+
+// scratchpad functions
+
+function debugger::ScratchpadRefresh() {
+  var debugger = this;
+  if( debugger.scratchpad && debugger.scratchpad.updated && ! debugger.scratchpad.paused ) {
+    var scratchpadEditor = debugger.scratchpad.editor;
+    if( scratchpadEditor.spec.apitype
+    && scratchpadEditor.spec.apitype == "lua"
+    && ! ide.interpreter.skipcompile
+    && ! CompileProgram(scratchpadEditor, { jumponerror = false, reportstats = false })
+    ) {
+      debugger.scratchpad.updated = false;
+      return;
+    }
+
+    var code = StripShebang(scratchpadEditor->GetTextDyn());
+    if( debugger.scratchpad.running ) {
+      // break the current execution first
+      // don't try too frequently to avoid overwhelming the debugger
+      var now = ide->GetTime();
+      if( now - debugger.scratchpad.running > 0.250 ) {
+        debugger->Break();
+        debugger.scratchpad.running = now;
+      }
+    } else {
+      var filePath = debuggerMakeFileName(scratchpadEditor);
+
+      // wrap into a function call to make "return" to work with scratchpad
+      code = "(function(...){"..code.."\n})(...)";
+
+      // this is a special error message that is generated at the very end
+      // of each script to avoid exiting the (debugee) scratchpad process.
+      // these errors are handled and not reported to the user
+      var errormsg = 'execution suspended at ' .. ide->GetTime();
+      var stopper = "error('" .. errormsg .. "')";
+      // store if interpreter requires a special handling for external loop
+      var extloop = ide.interpreter.scratchextloop;
+
+      var function reloadScratchpadCode() {
+        var debugger = debugger;
+        debugger.scratchpad.running = ide->GetTime();
+        debugger.scratchpad.updated = false;
+        debugger.scratchpad.runs = (debugger.scratchpad.runs || 0) + 1;
+
+        ide->GetOutput()->Erase();
+
+        // the code can be running in two ways under scratchpad:
+        // 1. controlled by the application, requires stopper (most apps)
+        // 2. controlled by some external loop (for example, love2d).
+        // in the first case we need to reload the app after each change
+        // in the second case, we need to load the app once and then
+        // "execute" new code to reflect the changes (with some limitations).
+        var _, _, err;
+        if( extloop ) { // if the execution is controlled by an external loop
+          if( debugger.scratchpad.runs == 1
+          ) { _, _, err = debugger->loadstring(filePath, code);
+          } else { _, _, err = debugger->execute(code); }
+        } else {   _, _, err = debugger->loadstring(filePath, code .. stopper); }
+
+        // when execute() is used, it's not possible to distinguish between
+        // compilation and run-time error, so just report as "Scratchpad error"
+        var prefix = extloop && TR("Scratchpad error") || TR("Compilation error");
+
+        if( ! err ) {
+          _, _, err = debugger->handle("run");
+          prefix = TR("Execution error");
+        }
+        if( err && ! err->find(errormsg) ) {
+          var fragment, line = err->match('.-%[string "([^\010\013]+)"%]:(%d+)%s*:');
+          // make the code shorter to better see the error message
+          if( prefix == TR("Scratchpad error") && fragment && #fragment > 30 ) {
+            err = err->gsub(q(fragment), function(s) { return s->sub(1,30)..'...'; });
+          }
+          displayError(prefix
+            ..(line && (" "..TR("on line %d")->format(line)) || "")
+            ..":\n"..err->gsub('stack traceback:.+', '')->gsub('\n+$', ''));
+        }
+        debugger.scratchpad.running = false;
+      }
+
+      copas.addthread(reloadScratchpadCode);
+    }
+  }
+}
+
+function debugger::ScratchpadOn(editor) {
+  var debugger = this;
+
+  // first check if there is already scratchpad editor.
+  // this may happen when more than one editor is being added...
+  if( debugger.scratchpad && debugger.scratchpad.editors ) {
+    debugger.scratchpad.editors[editor] = true;
+  } else {
+    debugger.scratchpad = {editor = editor, editors = {[editor] = true}};
+
+    // check if the debugger is already running; this happens when
+    // scratchpad is turned on after external script has connected
+    if( debugger.server ) {
+      debugger.scratchpad.updated = true;
+      ClearAllCurrentLineMarkers();
+      SetAllEditorsReadOnly(false);
+      ide->GetConsole()->SetRemote(null); // disable remote shell
+      debugger->ScratchpadRefresh();
+    } else if( ! ProjectDebug(true, "scratchpad") ) {
+      debugger.scratchpad = null;
+      return;
+    }
+  }
+
+  var scratchpadEditor = editor;
+  for( _, numberStyle in ipairs(scratchpadEditor.spec.isnumber) ) {
+    scratchpadEditor->StyleSetUnderline(numberStyle, true);
+  }
+  debugger.scratchpad.margin = scratchpadEditor->GetAllMarginWidth();
+
+  scratchpadEditor->Connect(wxstc.wxEVT_STC_MODIFIED, function(event) {
+    var evtype = event->GetModificationType();
+    if( (bit.band(evtype,wxstc.wxSTC_MOD_INSERTTEXT) != 0 ||
+        bit.band(evtype,wxstc.wxSTC_MOD_DELETETEXT) != 0 ||
+        bit.band(evtype,wxstc.wxSTC_PERFORMED_UNDO) != 0 ||
+        bit.band(evtype,wxstc.wxSTC_PERFORMED_REDO) != 0) ) {
+      debugger.scratchpad.updated = true;
+      debugger.scratchpad.editor = scratchpadEditor;
+    }
+    event->Skip();
+  });
+
+  scratchpadEditor->Connect(wx.wxEVT_LEFT_DOWN, function(event) {
+    var scratchpad = debugger.scratchpad;
+
+    var point = event->GetPosition();
+    var pos = scratchpadEditor->PositionFromPoint(point);
+    var isnumber = scratchpadEditor.spec.isnumber;
+
+    // are we over a number in the scratchpad? if not, it's not our event
+    if( ! (scratchpad && isnumber[bit.band(scratchpadEditor->GetStyleAt(pos),ide.STYLEMASK)]) ) {
+      event->Skip();
+      return;
+    }
+
+    // find start position and length of the number
+    var text = scratchpadEditor->GetTextDyn();
+
+    var nstart = pos;
+    while( nstart >= 0 && isnumber[bit.band(scratchpadEditor->GetStyleAt(nstart),ide.STYLEMASK)] ) {
+      nstart -=   1;
+    }
+
+    var nend = pos;
+    while( nend < string.len(text) && isnumber[bit.band(scratchpadEditor->GetStyleAt(nend),ide.STYLEMASK)] ) {
+      nend +=   1;
+    }
+
+    // check if there is minus sign right before the number and include it
+    if( nstart >= 0 && scratchpadEditor->GetTextRangeDyn(nstart,nstart+1) == '-' ) { 
+      nstart -=   1;
+    }
+    scratchpad.start = nstart + 1;
+    scratchpad.length = nend - nstart - 1;
+    scratchpad.origin = scratchpadEditor->GetTextRangeDyn(nstart+1,nend);
+    if( tonumber(scratchpad.origin) ) {
+      scratchpad.point = point;
+      scratchpadEditor->BeginUndoAction();
+      scratchpadEditor->CaptureMouse();
+    }
+  });
+
+  scratchpadEditor->Connect(wx.wxEVT_LEFT_UP, function(event) {
+    if( debugger.scratchpad && debugger.scratchpad.point ) {
+      debugger.scratchpad.point = null;
+      scratchpadEditor->EndUndoAction();
+      scratchpadEditor->ReleaseMouse();
+      wx.wxSetCursor(wx.wxNullCursor); // restore cursor
+    } else { event->Skip(); }
+  });
+
+  scratchpadEditor->Connect(wx.wxEVT_MOTION, function(event) {
+    var point = event->GetPosition();
+    var pos = scratchpadEditor->PositionFromPoint(point);
+    var scratchpad = debugger.scratchpad;
+    var ipoint = scratchpad && scratchpad.point;
+
+    // record the fact that we are over a number or dragging slider
+    scratchpad.over = scratchpad &&
+      (ipoint != null || scratchpadEditor.spec.isnumber[bit.band(scratchpadEditor->GetStyleAt(pos),ide.STYLEMASK)]);
+
+    if( ipoint ) {
+      var startpos = scratchpad.start;
+      var endpos = scratchpad.start+scratchpad.length;
+
+      // calculate difference in point position
+      var dx = point.x - ipoint.x;
+
+      // calculate the number of decimal digits after the decimal point
+      var origin = scratchpad.origin;
+      var decdigits = #(origin->match('%.(%d+)') || '');
+
+      // calculate new value
+      var value = tonumber(origin) + dx * 10**-decdigits;
+
+      // convert new value back to string to check the number of decimal points
+      // this is needed because the rate of change is determined by the
+      // current value. For example, for number 1, the next value is 2,
+      // but for number 1.1, the next is 1.2 and for 1.01 it is 1.02.
+      // But if 1.01 becomes 1.00, the both zeros after the decimal point
+      // need to be preserved to keep the increment ratio the same when
+      // the user wants to release the slider and start again.
+      origin = tostring(value);
+      var newdigits = #(origin->match('%.(%d+)') || '');
+      if( decdigits != newdigits ) {
+        origin = origin .. (origin->find('%.') && '' || '.') .. ("0")->rep(decdigits-newdigits);
+      }
+
+      // update length
+      scratchpad.length = #origin;
+
+      // update the value in the document
+      scratchpadEditor->SetTargetStart(startpos);
+      scratchpadEditor->SetTargetEnd(endpos);
+      scratchpadEditor->ReplaceTarget(origin);
+    } else { event->Skip(); }
+  });
+
+  scratchpadEditor->Connect(wx.wxEVT_SET_CURSOR, function(event) {
+    if( (debugger.scratchpad && debugger.scratchpad.over) ) {
+      event->SetCursor(wx.wxCursor(wx.wxCURSOR_SIZEWE));
+    } else if( debugger.scratchpad && ide.osname == 'Unix' ) {
+      // restore the cursor manually on Linux since event:Skip() doesn't reset it
+      var ibeam = event->GetX() > debugger.scratchpad.margin;
+      event->SetCursor(wx.wxCursor(ibeam && wx.wxCURSOR_IBEAM || wx.wxCURSOR_RIGHT_ARROW));
+    } else { event->Skip(); }
+  });
+
+  return true;
+}
+
+function debugger::ScratchpadOff() {
+  var debugger = this;
+  if( ! debugger.scratchpad ) { return; }
+
+  for( scratchpadEditor in pairs(debugger.scratchpad.editors) ) {
+    for( _, numberStyle in ipairs(scratchpadEditor.spec.isnumber) ) {
+      scratchpadEditor->StyleSetUnderline(numberStyle, false);
+    }
+    scratchpadEditor->Disconnect(wx.wxID_ANY, wx.wxID_ANY, wxstc.wxEVT_STC_MODIFIED);
+    scratchpadEditor->Disconnect(wx.wxID_ANY, wx.wxID_ANY, wx.wxEVT_MOTION);
+    scratchpadEditor->Disconnect(wx.wxID_ANY, wx.wxID_ANY, wx.wxEVT_LEFT_DOWN);
+    scratchpadEditor->Disconnect(wx.wxID_ANY, wx.wxID_ANY, wx.wxEVT_LEFT_UP);
+    scratchpadEditor->Disconnect(wx.wxID_ANY, wx.wxID_ANY, wx.wxEVT_SET_CURSOR);
+  }
+
+  wx.wxSetCursor(wx.wxNullCursor); // restore cursor
+
+  debugger.scratchpad = null;
+  debugger->terminate();
+
+  // disable menu if it is still enabled
+  // (as this may be called when the debugger is being shut down)
+  var menuBar = ide.frame.menuBar;
+  if( menuBar->IsChecked(ID.RUNNOW) ) { menuBar->Check(ID.RUNNOW, false); }
+
+  return true;
+}
+
+debugger = ide->SetDebugger(setmetatable({}, {__index = protodeb}));
+
+ide->AddPackage('core.debugger', {
+    onEditorMarkerUpdate = function(this, editor, marker, line, value) {
+      if( marker != BREAKPOINT_MARKER ) { return; }
+
+      var debugger = ide->GetDebugger();
+      if( value == false ) {
+        // if there is pending "run-to-cursor" call at this location, remove it
+        var ed, ln = unpack(debugger.runtocursor || {});
+        var same = ed && ln && ed->GetId() == editor->GetId() && ln == line;
+        if( same ) { debugger.runtocursor = null; }
+      } else if( editor->IsLineEmpty(line-1) ) {
+        return false; // don't set marker here
+      }
+
+      return debugger->breakpointToggle(editor, line, value);
+    },
+  });

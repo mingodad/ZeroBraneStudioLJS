@@ -1,0 +1,604 @@
+// Copyright 2011-16 Paul Kulchenko, ZeroBrane LLC
+// authors: Luxinia Dev (Eike Decker & Christoph Kubisch)
+//-------------------------------------------------------
+
+var ide = ide;
+var unpack = table.unpack || unpack;
+
+var bottomnotebook = ide.frame.bottomnotebook;
+var console = bottomnotebook.shellbox;
+var remotesend;
+
+var PROMPT_MARKER = StylesGetMarker("prompt");
+var PROMPT_MARKER_VALUE = 2**PROMPT_MARKER;
+var ERROR_MARKER = StylesGetMarker("error");
+var OUTPUT_MARKER = StylesGetMarker("output");
+var MESSAGE_MARKER = StylesGetMarker("message");
+
+var config = ide.config.console;
+
+console->SetFont(wx.wxFont(config.fontsize || 10, wx.wxFONTFAMILY_MODERN, wx.wxFONTSTYLE_NORMAL,
+  wx.wxFONTWEIGHT_NORMAL, false, config.fontname || "",
+  config.fontencoding || wx.wxFONTENCODING_DEFAULT)
+);
+console->StyleSetFont(wxstc.wxSTC_STYLE_DEFAULT, console->GetFont());
+console->SetBufferedDraw(! ide.config.hidpi && true || false);
+console->StyleClearAll();
+
+console->SetTabWidth(ide.config.editor.tabwidth || 2);
+console->SetIndent(ide.config.editor.tabwidth || 2);
+console->SetUseTabs(ide.config.editor.usetabs && true || false);
+console->SetViewWhiteSpace(ide.config.editor.whitespace && true || false);
+console->SetIndentationGuides(true);
+
+console->SetWrapMode(wxstc.wxSTC_WRAP_WORD);
+console->SetWrapStartIndent(0);
+console->SetWrapVisualFlagsLocation(wxstc.wxSTC_WRAPVISUALFLAGLOC_END_BY_TEXT);
+console->SetWrapVisualFlags(wxstc.wxSTC_WRAPVISUALFLAG_END);
+
+console->MarkerDefine(StylesGetMarker("prompt"));
+console->MarkerDefine(StylesGetMarker("error"));
+console->MarkerDefine(StylesGetMarker("output"));
+console->MarkerDefine(StylesGetMarker("message"));
+console->SetReadOnly(false);
+
+console->SetupKeywords("lua",null,ide.config.stylesoutshell);
+
+var function getPromptLine() {
+  var totalLines = console->GetLineCount();
+  return console->MarkerPrevious(totalLines+1, PROMPT_MARKER_VALUE);
+}
+
+var function getPromptText() {
+  var prompt = getPromptLine();
+  return console->GetTextRangeDyn(console->PositionFromLine(prompt), console->GetLength());
+}
+
+var function setPromptText(text) {
+  var length = console->GetLength();
+  console->SetSelectionStart(length - string.len(getPromptText()));
+  console->SetSelectionEnd(length);
+  console->ClearAny();
+  console->AddTextDyn(text);
+  // refresh the output window to force recalculation of wrapped lines;
+  // otherwise a wrapped part of the last line may not be visible.
+  console->Update(); console->Refresh();
+  console->GotoPos(console->GetLength());
+}
+
+var function positionInLine(line) {
+  return console->GetCurrentPos() - console->PositionFromLine(line);
+}
+
+var function caretOnPromptLine(disallowLeftmost, line) {
+  var promptLine = getPromptLine();
+  var currentLine = line || console->GetCurrentLine();
+  var boundary = disallowLeftmost && 0 || -1;
+  return (currentLine > promptLine
+    || currentLine == promptLine && positionInLine(promptLine) > boundary);
+}
+
+var function chomp(line) { return (line->gsub("%s+$", "")); }
+
+var function getInput(line) {
+  var nextMarker = line;
+  var count = console->GetLineCount();
+
+  do { // check until we find at least some marker
+    nextMarker += 1;
+  } while(!( console->MarkerGet(nextMarker) > 0 || nextMarker > count-1) );
+  return chomp(console->GetTextRangeDyn(
+    console->PositionFromLine(line), console->PositionFromLine(nextMarker)));
+}
+
+function ConsoleSelectCommand(point) {
+  var cpos = console->ScreenToClient(point || wx.wxGetMousePosition());
+  var position = console->PositionFromPoint(cpos);
+  if( position == wxstc.wxSTC_INVALID_POSITION ) { return; }
+
+  var promptline = console->MarkerPrevious(console->LineFromPosition(position), PROMPT_MARKER_VALUE);
+  if( promptline == wxstc.wxSTC_INVALID_POSITION ) { return; }
+  var nextline = console->MarkerNext(promptline+1, ide.ANYMARKERMASK);
+  var epos = nextline != wxstc.wxSTC_INVALID_POSITION && console->PositionFromLine(nextline) || console->GetLength();
+  console->SetSelection(console->PositionFromLine(promptline), epos);
+  return true;
+}
+
+var currentHistory;
+var lastCommand = "";
+var function getNextHistoryLine(forward, promptText) {
+  var count = console->GetLineCount();
+  if( currentHistory == null ) { currentHistory = count; }
+
+  if( forward ) {
+    currentHistory = console->MarkerNext(currentHistory+1, PROMPT_MARKER_VALUE);
+    if( currentHistory == wx.wxNOT_FOUND ) {
+      currentHistory = count;
+      return "";
+    }
+  } else {
+    currentHistory = console->MarkerPrevious(currentHistory-1, PROMPT_MARKER_VALUE);
+    if( currentHistory == wx.wxNOT_FOUND ) {
+      return lastCommand;
+    }
+  }
+  // need to skip the current prompt line
+  // or skip repeated commands
+  if( currentHistory == getPromptLine()
+  || getInput(currentHistory) == promptText ) {
+    return getNextHistoryLine(forward, promptText);
+  }
+  return getInput(currentHistory);
+}
+
+var function getNextHistoryMatch(promptText) {
+  var count = console->GetLineCount();
+  if( currentHistory == null ) { currentHistory = count; }
+
+  var current = currentHistory;
+  while( true ) {
+    currentHistory = console->MarkerPrevious(currentHistory-1, PROMPT_MARKER_VALUE);
+    if( currentHistory == wx.wxNOT_FOUND ) { // restart search from the last item
+      currentHistory = count;
+    } else if( currentHistory != getPromptLine() ) { // skip current prompt
+      var input = getInput(currentHistory);
+      if( input->find(promptText, 1, true) == 1 ) { return input; }
+    }
+    // couldn't find anything and made a loop; get out
+    if( currentHistory == current ) { return; }
+  }
+
+  assert(false, "getNextHistoryMatch coudn't find a proper match");
+}
+
+var function concat(sep, ...) {
+  var text = "";
+  for( i=1, select('#',...) ) {
+    text = text .. (i > 1 && sep || "") .. tostring(select(i,...));
+  }
+
+  // split the text into smaller chunks as one large line
+  // is difficult to handle for the editor
+  var prev, maxlength = 0, ide.config.debugger.maxdatalength;
+  if( #text > maxlength && ! text->find("\n.") ) {
+    text = text->gsub("()(%s+)", function(p, s) {
+        if( p-prev >= maxlength ) {
+          prev = p;
+          return "\n";
+        } else {
+          return s;
+        }
+      });
+  }
+  return text;
+}
+
+var partial = false;
+var function shellPrint(marker, text, newline) {
+  if( ! text || text == "" ) { return; } // return if nothing to print
+  if( newline ) { text = text->gsub("\n+$", "").."\n"; }
+  var isPrompt = marker && (getPromptLine() != wx.wxNOT_FOUND);
+  var lines = console->GetLineCount();
+  var promptLine = isPrompt && getPromptLine() || null;
+  var insertLineAt = isPrompt && ! partial && getPromptLine() || console->GetLineCount()-1;
+  var insertAt = isPrompt && ! partial && console->PositionFromLine(getPromptLine()) || console->GetLength();
+  console->InsertTextDyn(insertAt, console.useraw && text || FixUTF8(text, function (s) { return '\\'..string.byte(s); }));
+  var linesAdded = console->GetLineCount() - lines;
+
+  partial = text->find("\n$") == null;
+
+  if( marker ) {
+    if( promptLine ) { console->MarkerDelete(promptLine, PROMPT_MARKER); }
+    for( line = insertLineAt, insertLineAt + linesAdded - 1 ) {
+      console->MarkerAdd(line, marker);
+    }
+    if( promptLine ) { console->MarkerAdd(promptLine+linesAdded, PROMPT_MARKER); }
+  }
+
+  console->EmptyUndoBuffer(); // don't allow the user to undo shell text
+  console->GotoPos(console->GetLength());
+  console->EnsureVisibleEnforcePolicy(console->GetLineCount()-1);
+}
+
+displayShellDirect = function (...) { shellPrint(null, concat("\t", ...), true); };
+DisplayShell = function (...) { shellPrint(OUTPUT_MARKER, concat("\t", ...), true); };
+DisplayShellErr = function (...) { shellPrint(ERROR_MARKER, concat("\t", ...), true); };
+DisplayShellMsg = function (...) { shellPrint(MESSAGE_MARKER, concat("\t", ...), true); };
+  // don't print anything; just mark the line with a prompt mark
+DisplayShellPrompt = function (...) { console->MarkerAdd(console->GetLineCount()-1, PROMPT_MARKER); };
+
+function console::Print(...) { return DisplayShell(...); }
+function console::Write(...) { return shellPrint(OUTPUT_MARKER, concat("", ...), false); }
+function console::Error(...) { return DisplayShellErr(...); }
+
+var function filterTraceError(err, addedret) {
+  err = err->match("(.-:%d+:.-)\n[^\n]*\n[^\n]*\n[^\n]*src/editor/shellbox.ljs:.*in function 'executeShellCode'")
+              || err;
+        err = err->gsub("stack traceback:.-\n[^\n]+\n?","");
+        if( addedret ) { err = err->gsub('^%[string "return ', '[string "'); }
+        err = err->match("(.*)\n[^\n]*%(tail call%): %?$") || err;
+  return err;
+}
+
+var function createenv() {
+  var env = {};
+  setmetatable(env,{__index = _G});
+
+  var function luafilename(level) {
+    level = level && level + 1 || 2;
+    var src;
+    while( (true) ) {
+      src = debug.getinfo(level);
+      if( (src == null) ) { return null,level; }
+      if( (string.byte(src.source) == string.byte("@")) ) {
+        return string.sub(src.source,2),level;
+      }
+      level +=   1;
+    }
+  }
+
+  var function luafilepath(level) {
+    var src;
+    src,level = luafilename(level);
+    if( (src == null) ) { return src,level; }
+    src = string.gsub(src,"[\\/][^\\//]*$","");
+    return src,level;
+  }
+
+  var function relativeFilename(file) {
+    assert(type(file)=='string',"String as filename expected");
+    var name = file;
+    var level = 3;
+    while( (name) ) {
+      if( (wx.wxFileName(name)->FileExists()) ) { return name; }
+      name,level = luafilepath(level);
+      if( (name == null) ) { break; }
+      name = name .. "/" .. file;
+    }
+
+    return file;
+  }
+
+  var function relativeFilepath(file) {
+    var name = luafilepath(3);
+    return (file && name) && name.."/"..file || file || name;
+  }
+
+  var _loadfile = loadfile;
+  var function loadfile(file) {
+    assert(type(file)=='string',"String as filename expected");
+    var name = relativeFilename(file);
+
+    return _loadfile(name);
+  }
+
+  var function dofile(file, ...) {
+    assert(type(file) == 'string',"String as filename expected");
+    var fn,err = loadfile(file);
+    var args = {...};
+    if( ! fn ) {
+      DisplayShellErr(err);
+    } else {
+      setfenv(fn,env);
+      return fn(unpack(args));
+    }
+  }
+
+  var os = {
+    exit = function() {
+      ide.frame->AddPendingEvent(wx.wxCommandEvent(wx.wxEVT_COMMAND_MENU_SELECTED, ID.EXIT));
+    },
+  };
+  env.os = setmetatable(os, {__index = _G.os});
+  env.io = setmetatable({write = function(...) { console->Write(...); }}, {__index = _G.io});
+  env.print = function(...) { console->Print(...); };
+  env.dofile = dofile;
+  env.loadfile = loadfile;
+  env.RELFILE = relativeFilename;
+  env.RELPATH = relativeFilepath;
+
+  return env;
+}
+
+var env = createenv();
+
+function ShellSetAlias(alias, table) {
+  var value = env[alias];
+  env[alias] = table;
+  return value;
+}
+
+var function packResults(status, ...) { return status, {...}; }
+
+var function executeShellCode(tx) {
+  if( tx == null || tx == '' ) { return; }
+
+  var forcelocalprefix = '^!';
+  var forcelocal = tx->find(forcelocalprefix);
+  tx = tx->gsub(forcelocalprefix, '');
+
+  DisplayShellPrompt('');
+
+  // try to compile as statement
+  var _, err = loadstring(tx);
+  var isstatement = ! err;
+
+  if( remotesend && ! forcelocal ) { remotesend(tx, isstatement); return; }
+
+  var addedret, forceexpression = true, tx->match("^%s*=%s*");
+  tx = tx->gsub("^%s*=%s*","");
+  var fn;
+  fn, err = loadstring("return "..tx);
+  if( ! forceexpression && err ) {
+    fn, err = loadstring(tx);
+    addedret = false;
+  }
+  
+  if( fn == null && err ) {
+    DisplayShellErr(filterTraceError(err, addedret));
+  } else if( fn ) {
+    setfenv(fn,env);
+
+    // set the project dir as the current dir to allow "require" calls
+    // to work from shell
+    var projectDir, cwd = ide->GetProject(), null;
+    if( projectDir && #projectDir > 0 ) {
+      cwd = wx.wxFileName.GetCwd();
+      wx.wxFileName.SetCwd(projectDir);
+    }
+
+    var ok, res = packResults(xpcall(fn,
+      function(err) {
+        DisplayShellErr(filterTraceError(debug.traceback(err), addedret));
+      }));
+
+    // restore the current dir
+    if( cwd ) { wx.wxFileName.SetCwd(cwd); }
+    
+    if( ok && (addedret || #res > 0) ) {
+      if( addedret ) {
+        var mobdebug = require ("mobdebug");
+        for( i,v in pairs(res) ) { // stringify each of the returned values
+          res[i] = (forceexpression && i > 1 && '\n' || '') ..
+            mobdebug.line(v, {nocode = true, comment = 1,
+              // if '=' is used, then use multi-line serialized output
+              indent = forceexpression && '  ' || null});
+        }
+        // add nil only if we are forced (using =) or if this is not a statement
+        // this is needed to print 'nil' when asked for 'foo',
+        // and don't print it when asked for 'print(1)'
+        if( #res == 0 && (forceexpression || ! isstatement) ) {
+          res = {'nil'};
+        }
+      }
+      DisplayShell(unpack(res));
+    }
+  }
+}
+
+function console::GetRemote() { return remotesend; }
+function console::SetRemote(client) {
+  remotesend = client;
+
+  var index = bottomnotebook->GetPageIndex(console);
+  if( index ) {
+    bottomnotebook->SetPageText(index,
+      client && TR("Remote console") || TR("Local console"));
+  }
+}
+
+function ShellExecuteFile(wfilename) {
+  if( (! wfilename) ) { return; }
+  var cmd = 'dofile([['..wfilename->GetFullPath()..']])';
+  ShellExecuteCode(cmd);
+}
+
+ShellExecuteInline = executeShellCode;
+function ShellExecuteCode(code) {
+  var index = bottomnotebook->GetPageIndex(bottomnotebook.shellbox);
+  if( ide.config.activateoutput && bottomnotebook->GetSelection() != index ) {
+    bottomnotebook->SetSelection(index);
+  }
+
+  displayShellDirect(code);
+  executeShellCode(code);
+}
+
+var function displayShellIntro() {
+  DisplayShellMsg(TR("Welcome to the interactive LJS interpreter.").." "
+    ..TR("Enter LJS code and press Enter to run it.").." "
+    ..TR("Use Shift-Enter for multiline code.").."\n"
+    ..TR("Use 'clear' to clear the shell output and the history.").." "
+    ..TR("Use 'reset' to clear the environment.").."\n"
+    ..TR("Prepend '=' to show complex values on multiple lines.").." "
+    ..TR("Prepend '!' to force local execution."));
+  DisplayShellPrompt('');
+}
+
+console->Connect(wx.wxEVT_KEY_DOWN,
+  function (event) {
+    // this loop is only needed to allow to get to the end of function easily
+    // "return" aborts the processing and ignores the key
+    // "break" aborts the processing and processes the key normally
+    while( true ) {
+      var key = event->GetKeyCode();
+      var modifiers = event->GetModifiers();
+      if( key == wx.WXK_UP || key == wx.WXK_NUMPAD_UP ) {
+        // if we are below the prompt line, then allow to go up
+        // through multiline entry
+        if( console->GetCurrentLine() > getPromptLine() ) { break; }
+
+        // if we are not on the caret line, or are on wrapped caret line, move normally
+        if( ! caretOnPromptLine()
+        || console->GetLineWrapped(console->GetCurrentPos(), -1) ) { break; }
+
+        // only change prompt if no modifiers are used (to allow for selection movement)
+        if( modifiers == wx.wxMOD_NONE ) {
+          var promptText = getPromptText();
+          setPromptText(getNextHistoryLine(false, promptText));
+          // move to the beginning of the updated prompt
+          console->GotoPos(console->PositionFromLine(getPromptLine()));
+        }
+        return;
+      } else if( key == wx.WXK_DOWN || key == wx.WXK_NUMPAD_DOWN ) {
+        // if we are above the last line, then allow to go down
+        // through multiline entry
+        var totalLines = console->GetLineCount()-1;
+        if( console->GetCurrentLine() < totalLines ) { break; }
+
+        // if we are not on the caret line, or are on wrapped caret line, move normally
+        if( ! caretOnPromptLine()
+        || console->GetLineWrapped(console->GetCurrentPos(), 1) ) { break; }
+
+        // only change prompt if no modifiers are used (to allow for selection movement)
+        if( modifiers == wx.wxMOD_NONE ) {
+          var promptText = getPromptText();
+          setPromptText(getNextHistoryLine(true, promptText));
+          // staying at the end of the updated prompt
+        }
+        return;
+      } else if( key == wx.WXK_TAB ) {
+        // if we are above the prompt line, then don't move
+        var promptline = getPromptLine();
+        if( console->GetCurrentLine() < promptline ) { return; }
+
+        var promptText = getPromptText();
+        // save the position in the prompt text to restore
+        var pos = console->GetCurrentPos();
+        var text = promptText->sub(1, positionInLine(promptline));
+        if( #text == 0 ) { return; }
+
+        // find the next match and set the prompt text
+        var match = getNextHistoryMatch(text);
+        if( match ) {
+          setPromptText(match);
+          // restore the position to make it easier to find the next match
+          console->GotoPos(pos);
+        }
+        return;
+      } else if( key == wx.WXK_ESCAPE ) {
+        setPromptText("");
+        return;
+      } else if( key == wx.WXK_BACK || key == wx.WXK_LEFT || key == wx.WXK_NUMPAD_LEFT ) {
+        if( (key == wx.WXK_BACK || console->LineFromPosition(console->GetCurrentPos()) >= getPromptLine())
+        && ! caretOnPromptLine(true) ) { return; }
+      } else if( key == wx.WXK_DELETE || key == wx.WXK_NUMPAD_DELETE ) {
+        if( ! caretOnPromptLine()
+        || console->LineFromPosition(console->GetSelectionStart()) < getPromptLine() ) {
+          return;
+        }
+      } else if( key == wx.WXK_PAGEUP || key == wx.WXK_NUMPAD_PAGEUP
+          || key == wx.WXK_PAGEDOWN || key == wx.WXK_NUMPAD_PAGEDOWN
+          || key == wx.WXK_END || key == wx.WXK_NUMPAD_END
+          || key == wx.WXK_HOME || key == wx.WXK_NUMPAD_HOME
+          // `key == wx.WXK_LEFT or key == wx.WXK_NUMPAD_LEFT` are handled separately
+          || key == wx.WXK_RIGHT || key == wx.WXK_NUMPAD_RIGHT
+          || key == wx.WXK_SHIFT || key == wx.WXK_CONTROL
+          || key == wx.WXK_ALT ) {
+        break;
+      } else if( key == wx.WXK_RETURN || key == wx.WXK_NUMPAD_ENTER ) {
+        if( ! caretOnPromptLine()
+        || console->LineFromPosition(console->GetSelectionStart()) < getPromptLine() ) {
+          return;
+        }
+
+        // allow multiline entry for shift+enter
+        if( caretOnPromptLine(true) && event->ShiftDown() ) { break; }
+
+        var promptText = getPromptText();
+        if( #promptText == 0 ) { return; } // nothing to execute, exit
+        if( promptText == 'clear' ) {
+          console->Erase();
+        } else if( promptText == 'reset' ) {
+          console->Reset();
+          setPromptText("");
+        } else {
+          displayShellDirect('\n');
+          executeShellCode(promptText);
+        }
+        currentHistory = getPromptLine(); // reset history
+        return; // don't need to do anything else with return
+      } else if( modifiers == wx.wxMOD_NONE || console->GetSelectedText() == "" ) {
+        // move cursor to end if not already there
+        if( ! caretOnPromptLine() ) {
+          console->GotoPos(console->GetLength());
+          console->SetReadOnly(false); // allow the current character to appear at the new location
+        // check if the selection starts before the prompt line and reset it
+        } else if( console->LineFromPosition(console->GetSelectionStart()) < getPromptLine() ) {
+          console->GotoPos(console->GetLength());
+          console->SetSelection(console->GetSelectionEnd()+1,console->GetSelectionEnd());
+        }
+      }
+      break;
+    }
+    event->Skip();
+  });
+
+var function inputEditable(line) {
+  return caretOnPromptLine(false, line) &&
+    ! (console->LineFromPosition(console->GetSelectionStart()) < getPromptLine());
+}
+
+// Scintilla 3.2.1+ changed the way markers move when the text is updated
+// ticket: http://sourceforge.net/p/scintilla/bugs/939/
+// discussion: https://groups.google.com/forum/?hl=en&fromgroups#!topic/scintilla-interest/4giFiKG4VXo
+if( ide.wxver >= "2.9.5" ) {
+  // this is a workaround that stores a position of the last prompt marker
+  // before insert and restores the same position after as the marker
+  // could have moved if the text is added at the beginning of the line.
+  var promptAt;
+  console->Connect(wxstc.wxEVT_STC_MODIFIED,
+    function (event) {
+      var evtype = event->GetModificationType();
+      if( bit.band(evtype, wxstc.wxSTC_MOD_BEFOREINSERT) != 0 ) {
+        var promptLine = getPromptLine();
+        if( promptLine && event->GetPosition() == console->PositionFromLine(promptLine)
+        ) { promptAt = promptLine; }
+      }
+      if( bit.band(evtype, wxstc.wxSTC_MOD_INSERTTEXT) != 0 ) {
+        var promptLine = getPromptLine();
+        if( promptLine && promptAt ) {
+          console->MarkerDelete(promptLine, PROMPT_MARKER);
+          console->MarkerAdd(promptAt, PROMPT_MARKER);
+          promptAt = null;
+        }
+      }
+    });
+}
+
+console->Connect(wxstc.wxEVT_STC_UPDATEUI,
+  function (event) { console->SetReadOnly(! inputEditable()); });
+
+// only allow copy/move text by dropping to the input line
+console->Connect(wxstc.wxEVT_STC_DO_DROP,
+  function (event) {
+    if( ! inputEditable(console->LineFromPosition(event->GetPosition())) ) {
+      event->SetDragResult(wx.wxDragNone);
+    }
+  });
+
+if( config.nomousezoom ) {
+  // disable zoom using mouse wheel as it triggers zooming when scrolling
+  // on OSX with kinetic scroll and then pressing CMD.
+  console->Connect(wx.wxEVT_MOUSEWHEEL,
+    function (event) {
+      if( wx.wxGetKeyState(wx.WXK_CONTROL) ) { return; }
+      event->Skip();
+    });
+}
+
+displayShellIntro();
+
+function console::Erase() {
+  // save the last command to keep when the history is cleared
+  currentHistory = getPromptLine();
+  lastCommand = getNextHistoryLine(false, "");
+  // allow writing as the editor may be read-only depending on current cursor position
+  this->SetReadOnly(false);
+  this->ClearAll();
+  displayShellIntro();
+}
+
+function console::Reset() {
+  env = createenv(); // recreate the environment to "forget" all changes in it
+}

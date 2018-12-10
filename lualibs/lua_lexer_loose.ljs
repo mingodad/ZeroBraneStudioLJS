@@ -1,0 +1,212 @@
+/*
+ lua_lexer_loose.lua.
+ Loose lexing of Lua code.  See README.
+ 
+ WARNING: This code is preliminary and may have errors
+ in its current form.
+ 
+ (c) 2013 David Manura. MIT License.
+--*/
+
+var M = {};
+
+// based on LuaBalanced
+var function match_string(s, pos) {
+  pos = pos || 1;
+  var posa = pos;
+  var c = s->sub(pos,pos);
+  if( c == '"' || c == "'" ) {
+    pos +=   1;
+    while( 1 ) {
+      pos = s->find("[" .. c .. "\\]", pos);
+      if( ! pos ) { return s->sub(posa), #s + 1; } // not terminated string
+      if( s->sub(pos,pos) == c ) {
+        var part = s->sub(posa, pos);
+        return part, pos + 1;
+      } else {
+        pos +=   2;
+      }
+    }
+  } else {
+    var sc = s->match("^%[(=*)%[", pos);
+    if( sc ) {
+      var _; _, pos = s->find("%]" .. sc .. "%]", pos);
+      if( ! pos ) { return s->sub(posa), #s + 1; } // not terminated string
+      var part = s->sub(posa, pos);
+      return part, pos + 1;
+    } else {
+      return null, pos;
+    }
+  }
+}
+
+// based on LuaBalanced
+var function match_comment(s, pos) {
+  pos = pos || 1;
+  if( s->sub(pos, pos+1) != '--' ) {
+    return null, pos;
+  }
+  pos +=   2;
+  if( s->sub(pos,pos) == '[' ) {
+    var partt, post = match_string(s, pos);
+    if( partt ) {
+      return '--' .. partt, post;
+    }
+  }
+  var part; part, pos = s->match('^([^\n]*\n?)()', pos);
+  return '--' .. part, pos;
+}
+
+// note: matches invalid numbers too (for example, 0x)
+var function match_numberlike(s, pos) {
+  var hex = s->match('^0[xX]', pos);
+  if( hex ) { pos +=   #hex; }
+
+  var longint = (hex && '^%x+' || '^%d+') .. '[uU]?[lL][lL]';
+  var mantissa1 = hex && '^%x+%.?%x*' || '^%d+%.?%d*';
+  var mantissa2 = hex && '^%.%x+' || '^%.%d+';
+  var exponent = hex && '^[pP][+%-]?%x*' || '^[eE][+%-]?%d*';
+  var imaginary = '^[iI]';
+  var tok = s->match(longint, pos);
+  if( ! tok ) {
+    tok = s->match(mantissa1, pos) || s->match(mantissa2, pos);
+    if( tok ) {
+      var tok2 = s->match(exponent, pos + #tok);
+      if( tok2 ) { tok = tok..tok2; }
+      tok2 = s->match(imaginary, pos + #tok);
+      if( tok2 ) { tok = tok..tok2; }
+    }
+  }
+  return tok && (hex || '') .. tok || hex;
+}
+
+var function newset(s) {
+  var t = {};
+  for( c in s->gmatch('.') ) { t[c] = true; }
+  return t;
+}
+var function qws(s) {
+  var t = {};
+  for( k in s->gmatch('%S+') ) { t[k] = true; }
+  return t;
+}
+
+var sym = newset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_");
+var dig = newset('0123456789');
+var name = "([_A-Za-z][_A-Za-z0-9]*)";
+var op = newset('=~<>.+-*/%^#=<>;:,.{}[]()');
+
+op['=='] = true;
+op['<='] = true;
+op['>='] = true;
+op['~='] = true;
+op['..'] = true;
+op['<<'] = true;
+op['>>'] = true;
+op['//'] = true;
+
+var is_keyword = qws([=[
+  and break do else elseif end false for function if
+  in local nil not or repeat return
+  then true until while goto]=]);
+
+function M.lex(code, f, pos) {
+  pos = pos || 1;
+  var tok = code->match('^#![^\n]*\n', pos); // shebang
+  if( tok ) { f('Shebang', tok, 1); pos +=   #tok; }
+  while( pos <= #code ) {
+    var p2, n2, n1, n3 = code->match('^%s*()((%S)(%S?))', pos);
+    if( ! p2 ) { assert(code->sub(pos)->match('^%s*$')); break; }
+    pos = p2;
+    
+    if( sym[n1] ) {
+      var tok = code->match('^'..name, pos);
+      assert(tok);
+      if( is_keyword[tok] ) {
+        f('Keyword', tok, pos);
+      } else {
+        f('Id', tok, pos);
+      }
+      pos +=   #tok;
+    } else if( n2 == '--' ) {
+      var tok, pos2 = match_comment(code, pos);
+      assert(tok);
+      f('Comment', tok, pos);
+      pos = pos2;
+    } else if( n2 == '::' ) {
+      var tok = code->match('^(::%s*'..name..'%s*::)', pos);
+      if( tok ) {
+        f('Label', tok, pos);
+        pos +=   #tok;
+      } else {
+        f('Unknown', code->sub(pos, pos+1), pos); // unterminated label
+        pos +=   2;
+      }
+    } else if( n1 == '\'' || n1 == '\"' || n2 == '[[' || n2 == '[=' ) {
+      var tok = match_string(code, pos);
+      if( tok ) {
+        f('String', tok, pos);
+        pos +=   #tok;
+      } else {
+        f('Unknown', code->sub(pos), pos); // unterminated string
+        pos = #code + 1;
+      }
+    } else if( dig[n1] || (n1 == '.' && dig[n3]) ) {
+      var tok = match_numberlike(code, pos);
+      assert(tok);
+      f('Number', tok, pos);
+      pos +=   #tok;
+    } else if( op[n2] ) {
+      if( n2 == '..' && code->match('^%.', pos+2) ) {
+        tok = '...';
+      } else {
+        tok = n2;
+      }
+      f('Keyword', tok, pos);
+      pos +=   #tok;
+    } else if( op[n1] ) {
+      var tok = n1;
+      f('Keyword', tok, pos);
+      pos +=   #tok;
+    } else {
+      f('Unknown', n1, pos);
+      pos +=   1;
+    }
+  }
+}
+
+var Stream = {};
+Stream.__index = Stream;
+function Stream::next(val) {
+  if( this._next ) {
+    var _next = this._next;
+    this._next = null;
+    return _next;
+  } else {
+    this._next = null;
+    return this.f();
+  }
+}
+function Stream::peek() {
+  if( this._next ) {
+    return this._next;
+  } else {
+    var _next = this.f();
+    this._next = _next;
+    return _next;
+  }
+}
+
+function M.lexc(code, f, pos) {
+  var yield = coroutine.yield;
+  var func = coroutine.wrap(f || function() {
+    M.lex(code, function(tag, name, pos) {
+      // skip Comment tags as they may arbitrarily split statements and affects their processing
+      if( tag != 'Comment' ) { yield ({tag=tag, name, lineinfo=pos}); }
+    }, pos);
+    yield ({tag='Eof', lineinfo = #code+1});
+  });
+  return setmetatable({f=func}, Stream);
+}
+
+return M;

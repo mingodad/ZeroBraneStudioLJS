@@ -1,0 +1,678 @@
+//-----------------------------------------------------------------------------
+// Copyright (c) 2006-2013 Fabien Fleutot and others.
+//
+// All rights reserved.
+//
+// This program and the accompanying materials are made available
+// under the terms of the Eclipse Public License v1.0 which
+// accompanies this distribution, and is available at
+// http://www.eclipse.org/legal/epl-v10.html
+//
+// This program and the accompanying materials are also made available
+// under the terms of the MIT public license which accompanies this
+// distribution, and is available at http://www.lua.org/license.html
+//
+// Contributors:
+//     Fabien Fleutot - API and implementation
+//
+//-----------------------------------------------------------------------------
+
+require ('checks');
+
+var M = { };
+
+var lexer = { alpha={ }, sym={ } };
+lexer.__index=lexer;
+lexer.__type='lexer.stream';
+
+M.lexer = lexer;
+
+
+var debugf = function() { };
+// local debugf=printf
+
+//--------------------------------------------------------------------
+// Some locale settings produce bad results, e.g. French locale
+// expect float numbers to use commas instead of periods.
+// TODO: change number parser into something loclae-independent,
+// locales are nasty.
+//--------------------------------------------------------------------
+os.setlocale('C');
+
+var MT = { };
+
+M.metatables=MT;
+
+//--------------------------------------------------------------------
+// Create a new metatable, for a new class of objects.
+//--------------------------------------------------------------------
+var function new_metatable(name) {
+    var mt = { __type = 'lexer.'..name };
+    mt.__index = mt;
+    MT[name] = mt;
+}
+
+
+//--------------------------------------------------------------------
+// Position: represent a point in a source file.
+//--------------------------------------------------------------------
+new_metatable ('position');
+
+var position_idx=1;
+
+function M.new_position(line, column, offset, source) {
+    checks('number', 'number', 'number', 'string');
+    var id = position_idx; position_idx += 1;
+    return setmetatable({line=line, column=column, offset=offset,
+                         source=source, id=id}, MT.position);
+}
+
+function MT.position ::__tostring() {
+    return string.format("<%s%s|L%d|C%d|K%d>",
+        this.comments && "C|" || "",
+        this.source, this.line, this.column, this.offset);
+}
+
+
+
+//--------------------------------------------------------------------
+// Position factory: convert offsets into line/column/offset positions.
+//--------------------------------------------------------------------
+new_metatable ('position_factory');
+
+function M.new_position_factory(src, src_name) {
+    // assert(type(src)=='string')
+    // assert(type(src_name)=='string')
+    var lines = { 1 };
+    for( offset in src ->gmatch ('\n()') ) { table.insert(lines, offset); }
+    var max = #src+1;
+    table.insert(lines, max+1); // +1 includes Eof
+    return setmetatable({ src_name=src_name, line2offset=lines, max=max },
+        MT.position_factory);
+}
+
+function MT.position_factory ::get_position (offset) {
+    // assert(type(offset)=='number')
+    assert(offset<=this.max);
+    var line2offset = this.line2offset;
+    var left  = this.last_left || 1;
+    if( offset<line2offset[left] ) { left=1; }
+    var right = left+1;
+    if( line2offset[right]<=offset ) { right += 1; }
+    if( line2offset[right]<=offset ) { right = #line2offset; }
+    while( true ) {
+        // print ("  trying lines "..left.."/"..right..", offsets "..line2offset[left]..
+        //        "/"..line2offset[right].." for offset "..offset)
+        // assert(line2offset[left]<=offset)
+        // assert(offset<line2offset[right])
+        // assert(left<right)
+        if( left+1==right ) { break; }
+        var middle = math.floor((left+right)/2);
+        if( line2offset[middle]<=offset ) { left=middle; } else { right=middle; }
+    }
+    // assert(left+1==right)
+    // printf("found that offset %d is between %d and %d, hence on line %d",
+    //    offset, line2offset[left], line2offset[right], left)
+    var line = left;
+    var column = offset - line2offset[line] + 1;
+    this.last_left = left;
+    return M.new_position(line, column, offset, this.src_name);
+}
+
+
+
+//--------------------------------------------------------------------
+// Lineinfo: represent a node's range in a source file;
+// embed information about prefix and suffix comments.
+//--------------------------------------------------------------------
+new_metatable ('lineinfo');
+
+function M.new_lineinfo(first, last) {
+    checks('lexer.position', 'lexer.position');
+    return setmetatable({first=first, last=last}, MT.lineinfo);
+}
+
+function MT.lineinfo ::__tostring() {
+    var fli, lli = this.first, this.last;
+    var line   = fli.line;   if( line!=lli.line     ) { line  =line  ..'-'..lli.line;   }
+    var column = fli.column; if( column!=lli.column ) { column=column..'-'..lli.column; }
+    var offset = fli.offset; if( offset!=lli.offset ) { offset=offset..'-'..lli.offset; }
+    return string.format("<%s%s|L%s|C%s|K%s%s>",
+                         fli.comments && "C|" || "",
+                         fli.source, line, column, offset,
+                         lli.comments && "|C" || "");
+}
+
+//--------------------------------------------------------------------
+// Token: atomic Lua language element, with a category, a content,
+// and some lineinfo relating it to its original source.
+//--------------------------------------------------------------------
+new_metatable ('token');
+
+function M.new_token(tag, content, lineinfo) {
+    //printf("TOKEN `%s{ %q, lineinfo = %s} boundaries %d, %d",
+    //       tag, content, tostring(lineinfo), lineinfo.first.id, lineinfo.last.id)
+    return setmetatable({tag=tag, lineinfo=lineinfo, content}, MT.token);
+}
+
+function MT.token ::__tostring() {
+    //return string.format("`%s{ %q, %s }", self.tag, self[1], tostring(self.lineinfo))
+    return string.format("`%s %q", this.tag, this[1]);
+}
+
+
+//--------------------------------------------------------------------
+// Comment: series of comment blocks with associated lineinfo.
+// To be attached to the tokens just before and just after them.
+//--------------------------------------------------------------------
+new_metatable ('comment');
+
+function M.new_comment(lines) {
+    var first = lines[1].lineinfo.first;
+    var last  = lines[#lines].lineinfo.last;
+    var lineinfo = M.new_lineinfo(first, last);
+    return setmetatable({lineinfo=lineinfo, unpack(lines)}, MT.comment);
+}
+
+function MT.comment ::text() {
+    var last_line = this[1].lineinfo.last.line;
+    var acc = { };
+    for( i, line in ipairs(this) ) {
+        var nreturns = line.lineinfo.first.line - last_line;
+        table.insert(acc, ("\n")->rep(nreturns));
+        table.insert(acc, line[1]);
+    }
+    return table.concat(acc);
+}
+
+function M.new_comment_line(text, lineinfo, nequals) {
+    checks('string', 'lexer.lineinfo', '?number');
+    return { lineinfo = lineinfo, text, nequals };
+}
+
+
+
+//--------------------------------------------------------------------
+// Patterns used by [lexer :extract] to decompose the raw string into
+// correctly tagged tokens.
+//--------------------------------------------------------------------
+lexer.patterns = {
+   spaces              = "^[ \r\n\t]*()",
+   short_comment       = "^%-%-([^\n]*)\n?()",
+   //final_short_comment = "^%-%-([^\n]*)()$",
+   long_comment        = "^%-%-%[(=*)%[\n?(.-)%]%1%]()",
+   long_string         = "^%[(=*)%[\n?(.-)%]%1%]()",
+   number_longint      = "^%d+[uU]?[lL][lL]()",
+   number_longint_hex  = "^%x+[uU]?[lL][lL]()",
+   number_mantissa     = { "^%d+%.?%d*()", "^%d*%.%d+()" },
+   number_mantissa_hex = { "^%x+%.?%x*()", "^%x*%.%x+()" }, //Lua5.1 and Lua5.2
+   number_exponent     = "^[eE][%+%-]?%d+()",
+   number_exponent_hex = "^[pP][%+%-]?%d+()", //Lua5.2
+   number_hex          = "^0[xX]()",
+   number_imaginary    = "^[iI]()",
+   word                = "^([%a_][%w_]*)()",
+};
+
+//--------------------------------------------------------------------
+// unescape a whole string, applying [unesc_digits] and
+// [unesc_letter] as many times as required.
+//--------------------------------------------------------------------
+var function unescape_string (s) {
+
+   // Turn the digits of an escape sequence into the corresponding
+   // character, e.g. [unesc_digits("123") == string.char(123)].
+   var function unesc_digits (backslashes, digits) {
+      if( #backslashes%2==0 ) {
+         // Even number of backslashes, they escape each other, not the digits.
+         // Return them so that unesc_letter() can treat them
+         return backslashes..digits;
+      } else {
+         // Remove the odd backslash, which escapes the number sequence.
+         // The rest will be returned and parsed by unesc_letter()
+         backslashes = backslashes ->sub (1,-2);
+      }
+      var k, j, i = digits ->reverse() ->byte(1, 3);
+      var z = string.byte ("0");
+      var code = (k || z) + 10*(j || z) + 100*(i || z) - 111*z;
+      if( code > 255 ) {
+         error ("Illegal escape sequence '\\"..digits..
+                "' in string: ASCII codes must be in [0..255]");
+      }
+      var c = string.char (code);
+      if( c == '\\' ) { c = '\\\\'; } // parsed by unesc_letter (test: "\092b" --> "\\b")
+      return backslashes..c;
+   }
+
+   // Turn hex digits of escape sequence into char.
+   var function unesc_hex(backslashes, digits) {
+     if( #backslashes%2==0 ) {
+       return backslashes..'x'..digits;
+     } else {
+       backslashes = backslashes ->sub (1,-2);
+     }
+     var c = string.char(tonumber(digits,16));
+     if( c == '\\' ) { c = '\\\\'; } // parsed by unesc_letter (test: "\x5cb" --> "\\b")
+     return backslashes..c;
+   }
+
+   // Handle Lua 5.2 \z sequences
+   var function unesc_z(backslashes, more) {
+     if( #backslashes%2==0 ) {
+       return backslashes..more;
+     } else {
+       return backslashes ->sub (1,-2);
+     }
+   }
+
+   // Take a letter [x], and returns the character represented by the
+   // sequence ['\\'..x], e.g. [unesc_letter "n" == "\n"].
+   var function unesc_letter(x) {
+      var t = {
+         a = "\a", b = "\b", f = "\f",
+         n = "\n", r = "\r", t = "\t", v = "\v",
+         ["\\"] = "\\", ["'"] = "'", ['"'] = '"', ["\n"] = "\n" };
+      return t[x] || x;
+   }
+
+   s = s-> gsub ("(\\+)(z%s*)", unesc_z);  // Lua 5.2
+   s = s-> gsub ("(\\+)([0-9][0-9]?[0-9]?)", unesc_digits);
+   s = s-> gsub ("(\\+)x([0-9a-fA-F][0-9a-fA-F])", unesc_hex); // Lua 5.2
+   s = s-> gsub ("\\(%D)",unesc_letter);
+   return s;
+}
+
+lexer.extractors = {
+   "extract_long_comment", "extract_short_comment",
+   "extract_short_string", "extract_word", "extract_number",
+   "extract_long_string", "extract_symbol" };
+
+
+
+//--------------------------------------------------------------------
+// Really extract next token from the raw string
+// (and update the index).
+// loc: offset of the position just after spaces and comments
+// previous_i: offset in src before extraction began
+//--------------------------------------------------------------------
+function lexer ::extract () {
+   var attached_comments = { };
+   var function gen_token(...) {
+      var token = M.new_token(...);
+      if( #attached_comments>0 ) { // attach previous comments to token
+         var comments = M.new_comment(attached_comments);
+         token.lineinfo.first.comments = comments;
+         if( this.lineinfo_last_extracted ) {
+            this.lineinfo_last_extracted.comments = comments;
+         }
+         attached_comments = { };
+      }
+      token.lineinfo.first.facing = this.lineinfo_last_extracted;
+      this.lineinfo_last_extracted.facing = assert(token.lineinfo.first);
+      this.lineinfo_last_extracted = assert(token.lineinfo.last);
+      return token;
+   }
+   while( true ) { // loop until a non-comment token is found
+
+       // skip whitespaces
+       this.i = this.src->match (this.patterns.spaces, this.i);
+       if( this.i>#this.src ) {
+         var fli = this.posfact ->get_position (#this.src+1);
+         var lli = this.posfact ->get_position (#this.src+1); // ok?
+         var tok = gen_token("Eof", "eof", M.new_lineinfo(fli, lli));
+         tok.lineinfo.last.facing = lli;
+         return tok;
+       }
+       var i_first = this.i; // loc = position after whitespaces
+
+       // try every extractor until a token is found
+       for( _, extractor in ipairs(this.extractors) ) {
+           var tag, content, xtra = this [extractor] (this);
+           if( tag ) {
+               var fli = this.posfact ->get_position (i_first);
+               var lli = this.posfact ->get_position (this.i-1);
+               var lineinfo = M.new_lineinfo(fli, lli);
+               if( tag=='Comment' ) {
+                   var prev_comment = attached_comments[#attached_comments];
+                   if( ! xtra // new comment is short
+                   && prev_comment && ! prev_comment[2] // prev comment is short
+                   && prev_comment.lineinfo.last.line+1==fli.line ) { // adjascent lines
+                       // concat with previous comment
+                       prev_comment[1] = prev_comment[1].."\n"..content; // TODO quadratic, BAD!
+                       prev_comment.lineinfo.last = lli;
+                   } else { // accumulate comment
+                       var comment = M.new_comment_line(content, lineinfo, xtra);
+                       table.insert(attached_comments, comment);
+                   }
+                   break; // back to skipping spaces
+               } else { // not a comment: real token, then
+                   return gen_token(tag, content, lineinfo);
+               } // if token is a comment
+           } // if token found
+       } // for each extractor
+   } // while token is a comment
+} // :extract()
+
+
+
+
+//--------------------------------------------------------------------
+// Extract a short comment.
+//--------------------------------------------------------------------
+function lexer ::extract_short_comment() {
+    // TODO: handle final_short_comment
+    var content, j = this.src ->match (this.patterns.short_comment, this.i);
+    if( content ) { this.i=j; return 'Comment', content, null; }
+}
+
+//--------------------------------------------------------------------
+// Extract a long comment.
+//--------------------------------------------------------------------
+function lexer ::extract_long_comment() {
+    var equals, content, j = this.src->match (this.patterns.long_comment, this.i);
+    if( j ) { this.i = j; return "Comment", content, #equals; }
+}
+
+//--------------------------------------------------------------------
+// Extract a '...' or "..." short string.
+//--------------------------------------------------------------------
+function lexer ::extract_short_string() {
+   var k = this.src ->sub (this.i,this.i);   // first char
+   if( k!=[=[']=] && k!=[=["]=] ) { return; }  // no match'
+   var i = this.i + 1;
+   var j = i;
+   while( true ) {
+      var x,y; x, j, y = this.src ->match ("([\\\r\n"..k.."])()(.?)", j);  // next interesting char
+      if( x == '\\' ) {
+        if( y == 'z' ) { // Lua 5.2 \z
+          j = this.src ->match ("^%s*()", j+1);
+        } else {
+          j+=1;  // escaped char
+        }
+      } else if( x == k ) { break; // end of string
+      } else {
+         assert (! x || x=='\r' || x=='\n');
+         return null, 'Unterminated string';
+      }
+   }
+   this.i = j;
+
+   return 'String', unescape_string (this.src ->sub (i,j-2));
+}
+
+//--------------------------------------------------------------------
+// Extract Id or Keyword.
+//--------------------------------------------------------------------
+function lexer ::extract_word() {
+   var word, j = this.src->match (this.patterns.word, this.i);
+   if( word ) {
+      this.i = j;
+      return (this.alpha [word] && 'Keyword' || 'Id'), word;
+   }
+}
+
+//--------------------------------------------------------------------
+// Extract Number.
+//--------------------------------------------------------------------
+function lexer ::extract_number() {
+   var patt = this.patterns;
+   var s = this.src;
+   var j = s->match(patt.number_hex, this.i);
+   var hex = j != null;
+   var longint = hex && patt.number_longint_hex || patt.number_longint;
+   var mantissa1 = hex && patt.number_mantissa_hex[1] || patt.number_mantissa[1];
+   var mantissa2 = hex && patt.number_mantissa_hex[2] || patt.number_mantissa[2];
+   var exponent = hex && patt.number_exponent_hex || patt.number_exponent;
+   if( ! hex ) { j = this.i; }
+
+   var t = s->match(longint, j);
+   if( t ) {
+     j = t;
+   } else {
+     j = s->match(mantissa1, j) || s->match(mantissa2, j);
+     if( ! j ) { return; }
+     j = s->match(exponent, j) || j;
+     j = s->match(patt.number_imaginary, j) || j;
+   }
+
+   var str = this.src->sub (this.i, j-1);
+   this.i = j;
+   // Number found, interpret with tonumber() and return it
+   // return str as the fallback when processing formats not supported by the current interpreter
+   return 'Number', (tonumber (str) || str);
+}
+
+//--------------------------------------------------------------------
+// Extract long string.
+//--------------------------------------------------------------------
+function lexer ::extract_long_string() {
+   var _, content, j = this.src ->match (this.patterns.long_string, this.i);
+   if( j ) { this.i = j; return 'String', content; }
+}
+
+//--------------------------------------------------------------------
+// Extract symbol.
+//--------------------------------------------------------------------
+function lexer ::extract_symbol() {
+   var k = this.src->sub (this.i,this.i);
+   var symk = this.sym [k];  // symbols starting with `k`
+   if( ! symk ) {
+      this.i = this.i + 1;
+      return 'Keyword', k;
+   }
+   for( _, sym in pairs (symk) ) {
+      if( sym == this.src->sub (this.i, this.i + #sym - 1) ) {
+         this.i = this.i + #sym;
+         return 'Keyword', sym;
+      }
+   }
+   this.i = this.i+1;
+   return 'Keyword', k;
+}
+
+//--------------------------------------------------------------------
+// Add a keyword to the list of keywords recognized by the lexer.
+//--------------------------------------------------------------------
+function lexer ::add (w, ...) {
+   assert(! ..., "lexer :add() takes only one arg, although possibly a table");
+   if( type (w) == "table" ) {
+      for( _, x in ipairs (w) ) { this ->add (x); }
+   } else {
+      if( w->match (this.patterns.word .. "$") ) { this.alpha [w] = true;
+      } else if( w->match ("^%p%p+$") ) {
+         var k = w->sub(1,1);
+         var list = this.sym [k];
+         if( ! list ) { list = { }; this.sym [k] = list; }
+         table.insert (list, w);
+      } else if( w->match ("^%p$") ) { return;
+      } else { error ("Invalid keyword"); }
+   }
+}
+
+//--------------------------------------------------------------------
+// Return the [n]th next token, without consuming it.
+// [n] defaults to 1. If it goes pass the end of the stream, an EOF
+// token is returned.
+//--------------------------------------------------------------------
+function lexer ::peek (n) {
+    if( ! n ) { n=1; }
+    if( n > #this.peeked ) {
+        for( i = #this.peeked+1, n ) {
+            this.peeked [i] = this ->extract();
+        }
+    }
+    return this.peeked [n];
+}
+
+//--------------------------------------------------------------------
+// Return the [n]th next token, removing it as well as the 0..n-1
+// previous tokens. [n] defaults to 1. If it goes pass the end of the
+// stream, an EOF token is returned.
+//--------------------------------------------------------------------
+function lexer ::next (n) {
+   n = n || 1;
+   this ->peek (n);
+   var a;
+   for( i=1,n ) {
+      a = table.remove (this.peeked, 1);
+      // TODO: is this used anywhere? I think not.  a.lineinfo.last may be nil.
+      //self.lastline = a.lineinfo.last.line
+   }
+   this.lineinfo_last_consumed = a.lineinfo.last;
+   return a;
+}
+
+//--------------------------------------------------------------------
+// Returns an object which saves the stream's current state.
+//--------------------------------------------------------------------
+// FIXME there are more fields than that to save
+function lexer ::save () { return { this.i; {unpack(this.peeked) } }; }
+
+//--------------------------------------------------------------------
+// Restore the stream's state, as saved by method [save].
+//--------------------------------------------------------------------
+// FIXME there are more fields than that to restore
+function lexer ::restore (s) { this.i=s[1]; this.peeked=s[2]; }
+
+//--------------------------------------------------------------------
+// Resynchronize: cancel any token in self.peeked, by emptying the
+// list and resetting the indexes
+//--------------------------------------------------------------------
+function lexer ::sync() {
+   var p1 = this.peeked[1];
+   if( p1 ) {
+      var li_first = p1.lineinfo.first;
+      if( li_first.comments ) { li_first=li_first.comments.lineinfo.first; }
+      this.i = li_first.offset;
+      this.column_offset = this.i - li_first.column;
+      this.peeked = { };
+      this.attached_comments = p1.lineinfo.first.comments || { };
+   }
+}
+
+//--------------------------------------------------------------------
+// Take the source and offset of an old lexer.
+//--------------------------------------------------------------------
+function lexer ::takeover(old) {
+   this ->sync(); old ->sync();
+   for( _, field in ipairs({ 'i', 'src', 'attached_comments', 'posfact' }) ) {
+       this[field] = old[field];
+   }
+   return this;
+}
+
+//--------------------------------------------------------------------
+// Return the current position in the sources. This position is between
+// two tokens, and can be within a space / comment area, and therefore
+// have a non-null width. :lineinfo_left() returns the beginning of the
+// separation area, :lineinfo_right() returns the end of that area.
+//
+//    ____ last consummed token    ____ first unconsummed token
+//   /                            /
+// XXXXX  <spaces and comments> YYYYY
+//      \____                    \____
+//           :lineinfo_left()         :lineinfo_right()
+//--------------------------------------------------------------------
+function lexer ::lineinfo_right() {
+   return this ->peek(1).lineinfo.first;
+}
+
+function lexer ::lineinfo_left() {
+   return this.lineinfo_last_consumed;
+}
+
+//--------------------------------------------------------------------
+// Create a new lexstream.
+//--------------------------------------------------------------------
+function lexer ::newstream (src_or_stream, name) {
+   name = name || "?";
+   if( type(src_or_stream)=='table' ) { // it's a stream
+      return setmetatable ({ }, this) ->takeover (src_or_stream);
+   } else if( type(src_or_stream)=='string' ) { // it's a source string
+      var src = src_or_stream;
+      var pos1 = M.new_position(1, 1, 1, name);
+      var stream = {
+         src_name      = name;   // Name of the file
+         src           = src;    // The source, as a single string
+         peeked        = { };    // Already peeked, but not discarded yet, tokens
+         i             = 1;      // Character offset in src
+         attached_comments = { },// comments accumulator
+         lineinfo_last_extracted = pos1,
+         lineinfo_last_consumed  = pos1,
+         posfact       = M.new_position_factory (src_or_stream, name)
+      };
+      setmetatable (stream, this);
+
+      // Skip initial sharp-bang for Unix scripts
+      // FIXME: redundant with mlp.chunk()
+      if( src && src ->match ("^#!") ) {
+         var endofline = src ->find ("\n");
+         stream.i = endofline && (endofline + 1) || #src;
+      }
+      return stream;
+   } else {
+      assert(false, ":newstream() takes a source string or a stream, not a "..
+          type(src_or_stream));
+   }
+}
+
+//--------------------------------------------------------------------
+// If there's no ... args, return the token a (whose truth value is
+// true) if it's a `Keyword{ }, or nil.  If there are ... args, they
+// have to be strings. if the token a is a keyword, and it's content
+// is one of the ... args, then returns it (it's truth value is
+// true). If no a keyword or not in ..., return nil.
+//--------------------------------------------------------------------
+function lexer ::is_keyword (a, ...) {
+   if( ! a || a.tag != "Keyword" ) { return false; }
+   var words = {...};
+   if( #words == 0 ) { return a[1]; }
+   for( _, w in ipairs (words) ) {
+      if( w == a[1] ) { return w; }
+   }
+   return false;
+}
+
+//--------------------------------------------------------------------
+// Cause an error if the next token isn't a keyword whose content
+// is listed among ... args (which have to be strings).
+//--------------------------------------------------------------------
+function lexer ::check (...) {
+   var words = {...};
+   var a = this ->next();
+   var function err () {
+      error ("Got " .. tostring (a) ..
+             ", expected one of these keywords : '" ..
+             table.concat (words,"', '") .. "'"); }
+   if( ! a || a.tag != "Keyword" ) { err (); }
+   if( #words == 0 ) { return a[1]; }
+   for( _, w in ipairs (words) ) {
+       if( w == a[1] ) { return w; }
+   }
+   err ();
+}
+
+//--------------------------------------------------------------------
+//
+//--------------------------------------------------------------------
+function lexer ::clone() {
+    var alpha_clone, sym_clone = { }, { };
+   for( word in pairs(this.alpha) ) { alpha_clone[word]=true; }
+   for( letter, list in pairs(this.sym) ) { sym_clone[letter] = { unpack(list) }; }
+   var clone = { alpha=alpha_clone, sym=sym_clone };
+   setmetatable(clone, this);
+   clone.__index = clone;
+   return clone;
+}
+
+//--------------------------------------------------------------------
+// Cancel everything left in a lexer, all subsequent attempts at
+// `:peek()` or `:next()` will return `Eof`.
+//--------------------------------------------------------------------
+function lexer ::kill() {
+    this.i = #this.src+1;
+    this.peeked = { };
+    this.attached_comments = { };
+    this.lineinfo_last = this.posfact ->get_position (#this.src+1);
+}
+
+return M;

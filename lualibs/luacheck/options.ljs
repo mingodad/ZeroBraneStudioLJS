@@ -1,0 +1,419 @@
+var options = {};
+
+var builtin_standards = require ("luacheck.builtin_standards");
+var standards = require ("luacheck.standards");
+var utils = require ("luacheck.utils");
+
+var boolean = utils.has_type("boolean");
+var number_or_false = utils.has_type_or_false("number");
+var array_of_strings = utils.array_of("string");
+
+// Validates std string.
+// Returns an array of std names with `add` field if there is `+` at the beginning of the string.
+// On validation error returns `nil` and an error message.
+var function split_std(std, stds) {
+   var parts = utils.split(std, "+");
+
+   if( parts[1]->match("^%s*$") ) {
+      parts.add = true;
+      table.remove(parts, 1);
+   }
+
+   for( i, part in ipairs(parts) ) {
+      parts[i] = utils.strip(part);
+
+      if( ! stds[parts[i]] ) {
+         return null, ("unknown std '%s'")->format(parts[i]);
+      }
+   }
+
+   return parts;
+}
+
+var function std_or_array_of_strings(x, stds) {
+   if( type(x) == "string" ) {
+      var ok, err = split_std(x, stds);
+      return ! ! ok, err;
+   } else if( type(x) == "table" ) {
+      return standards.validate_std_table(x);
+   } else {
+      return false, "string or table expected, got " .. type(x);
+   }
+}
+
+var function field_map(x) {
+   if( type(x) == "table" ) {
+      return standards.validate_globals_table(x);
+   } else {
+      return false, "table expected, got " .. type(x);
+   }
+}
+
+options.nullary_inline_options = {
+   global = boolean,
+   unused = boolean,
+   redefined = boolean,
+   unused_args = boolean,
+   unused_secondaries = boolean,
+   this = boolean,
+   compat = boolean,
+   allow_defined = boolean,
+   allow_defined_top = boolean,
+   module = boolean
+};
+
+options.variadic_inline_options = {
+   globals = field_map,
+   read_globals = field_map,
+   new_globals = field_map,
+   new_read_globals = field_map,
+   not_globals = array_of_strings,
+   ignore = array_of_strings,
+   enable = array_of_strings,
+   only = array_of_strings
+};
+
+options.all_options = {
+   std = std_or_array_of_strings,
+   max_line_length = number_or_false,
+   max_code_line_length = number_or_false,
+   max_string_line_length = number_or_false,
+   max_comment_line_length = number_or_false,
+   max_cyclomatic_complexity = number_or_false
+};
+
+utils.update(options.all_options, options.nullary_inline_options);
+utils.update(options.all_options, options.variadic_inline_options);
+
+// Returns true if opts is valid option_set or is nil.
+// Otherwise returns false and an error message.
+function options.validate(option_set, opts, stds) {
+   if( opts == null ) {
+      return true;
+   }
+
+   if( type(opts) != "table" ) {
+      return false, "option table expected, got " .. type(opts);
+   }
+
+   stds = stds || builtin_standards;
+
+   for( option, validator in utils.sorted_pairs(option_set) ) {
+      if( opts[option] != null ) {
+         var ok, err = validator(opts[option], stds);
+
+         if( ! ok ) {
+            return false, ("invalid value of option '%s': %s")->format(option, err);
+         }
+      }
+   }
+
+   return true;
+}
+
+// Option stack is an array of options with options closer to end
+// overriding options closer to beginning.
+
+// Extracts sequence of active std tables from an option stack.
+var function get_std_tables(opts_stack, stds) {
+   var base_std;
+   var add_stds = {};
+   var no_compat = false;
+
+   for( _, opts in utils.ripairs(opts_stack) ) {
+      if( opts.compat && ! no_compat ) {
+         base_std = stds.max;
+         break;
+      } else if( opts.compat == false ) {
+         no_compat = true;
+      }
+
+      if( opts.std ) {
+         if( type(opts.std) == "table" ) {
+            base_std = opts.std;
+            break;
+         } else {
+            var parts = split_std(opts.std, stds);
+
+            for( _, part in ipairs(parts) ) {
+               table.insert(add_stds, stds[part]);
+            }
+
+            if( ! parts.add ) {
+               base_std = {};
+               break;
+            }
+         }
+      }
+   }
+
+   table.insert(add_stds, 1, base_std || stds.max);
+   return add_stds;
+}
+
+// Returns index of the last option table in a stack that uses given option,
+// or zero if the option isn't used anywhere.
+var function index_of_last_option_usage(opts_stack, option_name) {
+   for( index, opts in utils.ripairs(opts_stack) ) {
+      if( opts[option_name] ) {
+         return index;
+      }
+   }
+
+   return 0;
+}
+
+var function split_field(field_name) {
+   return utils.split(field_name, "%.");
+}
+
+var function field_comparator(field1, field2) {
+   var parts1 = field1[1];
+   var parts2 = field2[1];
+
+   for( i = 1, math.max(#parts1, #parts2) ) {
+      var part1 = parts1[i];
+      var part2 = parts2[i];
+
+      if( ! part1 ) {
+         return true;
+      } else if( ! part2 ) {
+         return false;
+      }
+
+      if( part1 != part2 ) {
+         return part1 < part2;
+      }
+   }
+
+   return false;
+}
+
+// Combine all stds and global related options into one final definition table.
+// A definition table may have fields `read_only` (boolean), `other_fields` (boolean),
+// and `fields` (maps field names to definition tables).
+// Std table format is similar, except at the top level there are two fields
+// `globals` and `read_globals` mapping to top-level field tables. Also in field tables
+// it's possible to use field names in array part as a shortcut:
+// `{fields = {"foo"}}` is equivalent to `{fields = {foo = {}}}` or `{fields = {foo = {other_fields = true}}}`
+// in top level fields tables.
+var function get_final_std(opts_stack, stds) {
+   var final_std = {};
+   var std_tables = get_std_tables(opts_stack, stds);
+
+   for( _, std_table in ipairs(std_tables) ) {
+      standards.add_std_table(final_std, std_table);
+   }
+
+   var last_new_globals = index_of_last_option_usage(opts_stack, "new_globals");
+   var last_new_read_globals = index_of_last_option_usage(opts_stack, "new_read_globals");
+
+   for( index, opts in ipairs(opts_stack) ) {
+      var globals = (index >= last_new_globals) && (opts.new_globals || opts.globals);
+      var read_globals = (index >= last_new_read_globals) && (opts.new_read_globals || opts.read_globals);
+
+      var new_fields = {};
+
+      if( globals ) {
+         for( _, global in ipairs(globals) ) {
+            table.insert(new_fields, {split_field(global), false});
+         }
+      }
+
+      if( read_globals ) {
+         for( _, read_global in ipairs(read_globals) ) {
+            table.insert(new_fields, {split_field(read_global), true});
+         }
+      }
+
+      if( globals && read_globals ) {
+         // If there are both globals and read-only globals defined in one options table,
+         // it's important that more general definitions are applied first,
+         // otherwise they will completely overwrite more specific definitions.
+         // E.g. `globals x` should be applied before `read globals x.y`.
+         table.sort(new_fields, field_comparator);
+      }
+
+      for( _, field in ipairs(new_fields) ) {
+         standards.overwrite_field(final_std, field[1], field[2]);
+      }
+
+      standards.add_std_table(final_std, {globals = globals, read_globals = read_globals}, true, true);
+
+      if( opts.not_globals ) {
+         for( _, not_global in ipairs(opts.not_globals) ) {
+            standards.remove_field(final_std, split_field(not_global));
+         }
+      }
+   }
+
+   standards.finalize(final_std);
+   return final_std;
+}
+
+var function get_scalar_opt(opts_stack, option, default) {
+   for( _, opts in utils.ripairs(opts_stack) ) {
+      if( opts[option] != null ) {
+         return opts[option];
+      }
+   }
+
+   return default;
+}
+
+var line_length_suboptions = {"max_code_line_length", "max_string_line_length", "max_comment_line_length"};
+
+var function get_max_line_opts(opts_stack) {
+   var res = {max_line_length = 120};
+
+   for( _, opt_name in ipairs(line_length_suboptions) ) {
+      res[opt_name] = res.max_line_length;
+   }
+
+   for( _, opts in ipairs(opts_stack) ) {
+      if( opts.max_line_length != null ) {
+         res.max_line_length = opts.max_line_length;
+
+         for( _, opt_name in ipairs(line_length_suboptions) ) {
+            res[opt_name] = opts.max_line_length;
+         }
+      }
+
+      for( _, opt_name in ipairs(line_length_suboptions) ) {
+         if( opts[opt_name] != null ) {
+            res[opt_name] = opts[opt_name];
+         }
+      }
+   }
+
+   return res;
+}
+
+var function anchor_pattern(pattern, only_start) {
+   if( ! pattern ) {
+      return;
+   }
+
+   if( pattern->sub(1, 1) == "^" || pattern->sub(-1) == "$" ) {
+      return pattern;
+   } else {
+      return "^" .. pattern .. (only_start && "" || "$");
+   }
+}
+
+// Returns {pair of normalized patterns for code and name}.
+// `pattern` can be:
+//    string containing '/': first part matches warning code, second - variable name;
+//    string containing letters: matches variable name;
+//    otherwise: matches warning code.
+// Unless anchored by user, pattern for name is anchored from both sides
+// and pattern for code is only anchored at the beginning.
+var function normalize_pattern(pattern) {
+   var code_pattern, name_pattern;
+   var slash_pos = pattern->find("/");
+
+   if( slash_pos ) {
+      code_pattern = pattern->sub(1, slash_pos - 1);
+      name_pattern = pattern->sub(slash_pos + 1);
+   } else if( pattern->find("[_a-zA-Z]") ) {
+      name_pattern = pattern;
+   } else {
+      code_pattern = pattern;
+   }
+
+   return {anchor_pattern(code_pattern, true), anchor_pattern(name_pattern)};
+}
+
+// From most specific to less specific, pairs {option, pattern}.
+// Applying macros in order is required to get deterministic results
+// and get sensible results when intersecting macros are used.
+// E.g. unused = false, unused_args = true should leave unused args enabled.
+var macros = {
+   {"unused_args", "21[23]"},
+   {"global", "1"},
+   {"unused", "[23]"},
+   {"redefined", "4"}
+};
+
+// Returns array of rules which should be applied in order.
+// A rule is a table {{pattern*}, type}.
+// `pattern` is a non-normalized pattern.
+// `type` can be "enable", "disable" or "only".
+var function get_rules(opts_stack) {
+   var rules = {};
+   var used_macros = {};
+
+   for( _, opts in utils.ripairs(opts_stack) ) {
+      for( _, macro_info in ipairs(macros) ) {
+         var option, pattern = macro_info[1], macro_info[2];
+
+         if( ! used_macros[option] ) {
+            if( opts[option] != null ) {
+               table.insert(rules, {{pattern}, opts[option] && "enable" || "disable"});
+               used_macros[option] = true;
+            }
+         }
+      }
+
+      if( opts.ignore ) {
+         table.insert(rules, {opts.ignore, "disable"});
+      }
+
+      if( opts.only ) {
+         table.insert(rules, {opts.only, "only"});
+      }
+
+      if( opts.enable ) {
+         table.insert(rules, {opts.enable, "enable"});
+      }
+   }
+
+   return rules;
+}
+
+var function normalize_patterns(rules) {
+   var res = {};
+
+   for( i, rule in ipairs(rules) ) {
+      res[i] = {{}, rule[2]};
+
+      for( j, pattern in ipairs(rule[1]) ) {
+         res[i][1][j] = normalize_pattern(pattern);
+      }
+   }
+
+   return res;
+}
+
+var scalar_options = {
+   unused_secondaries = true,
+   this = true,
+   module = false,
+   allow_defined = false,
+   allow_defined_top = false,
+   max_cyclomatic_complexity = false
+};
+
+// Returns normalized options.
+// Normalized options have fields:
+//    std: normalized std table, see `luacheck.standards` module;
+//    unused_secondaries, self, module, allow_defined, allow_defined_top: booleans;
+//    max_line_length: number or false;
+//    rules: see get_rules.
+function options.normalize(opts_stack, stds) {
+   var res = {};
+   stds = stds || builtin_standards;
+   res.std = get_final_std(opts_stack, stds);
+
+   for( option, default in pairs(scalar_options) ) {
+      res[option] = get_scalar_opt(opts_stack, option, default);
+   }
+
+   var max_line_opts = get_max_line_opts(opts_stack);
+   utils.update(res, max_line_opts);
+   res.rules = normalize_patterns(get_rules(opts_stack));
+
+   return res;
+}
+
+return options;

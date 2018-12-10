@@ -1,0 +1,283 @@
+//----------------------------------------------------------------------------
+// Copyright (c) 2006-2013 Fabien Fleutot and others.
+//
+// All rights reserved.
+//
+// This program and the accompanying materials are made available
+// under the terms of the Eclipse Public License v1.0 which
+// accompanies this distribution, and is available at
+// http://www.eclipse.org/legal/epl-v10.html
+//
+// This program and the accompanying materials are also made available
+// under the terms of the MIT public license which accompanies this
+// distribution, and is available at http://www.lua.org/license.html
+//
+// Contributors:
+//     Fabien Fleutot - API and implementation
+//
+//-----------------------------------------------------------------------------
+
+//-----------------------------------------------------------------------------
+//
+// Summary: metalua parser, statement/block parser. This is part of the
+// definition of module [mlp].
+//
+//-----------------------------------------------------------------------------
+
+//-----------------------------------------------------------------------------
+//
+// Exports API:
+// * [mlp.stat()]
+// * [mlp.block()]
+// * [mlp.for_header()]
+//
+//-----------------------------------------------------------------------------
+
+var lexer    = require ('metalua.grammar.lexer');
+var gg       = require ('metalua.grammar.generator');
+
+var annot = require ('metalua.compiler.parser.annot.generator');
+
+//------------------------------------------------------------------------------
+// List of all keywords that indicate the end of a statement block. Users are
+// likely to extend this list when designing extensions.
+//------------------------------------------------------------------------------
+
+
+return function(M) {
+    var _M = gg.future(M);
+
+    M.block_terminators = { "else", "elseif", "end", "until", ")", "}", "]" };
+
+    // FIXME: this must be handled from within GG!!!
+    // FIXME: there's no :add method in the list anyway. Added by gg.list?!
+    function M.block_terminators ::add(x) {
+        if( type (x) == "table" ) { for( _, y in ipairs(x) ) { this ->add (y); }
+        } else { table.insert (this, x); }
+    }
+
+    //--------------------------------------------------------------------------
+    // list of statements, possibly followed by semicolons
+    //--------------------------------------------------------------------------
+    M.block = gg.list ({
+        name        = "statements block",
+        terminators = M.block_terminators,
+        primary     = function (lx) {
+            // FIXME use gg.optkeyword()
+            var x = M.stat (lx);
+            if( lx->is_keyword (lx->peek(), ";") ) { lx->next(); }
+            return x;
+        } });
+
+    //--------------------------------------------------------------------------
+    // Helper function for "return <expr_list>" parsing.
+    // Called when parsing return statements.
+    // The specific test for initial ";" is because it's not a block terminator,
+    // so without it gg.list would choke on "return ;" statements.
+    // We don't make a modified copy of block_terminators because this list
+    // is sometimes modified at runtime, and the return parser would get out of
+    // sync if it was relying on a copy.
+    //--------------------------------------------------------------------------
+    var return_expr_list_parser = gg.multisequence({
+        { ";" , builder = function() { return { }; } },
+        default = gg.list ({
+            _M.expr, separators = ",", terminators = M.block_terminators }) });
+
+
+    var for_vars_list = gg.list({
+        name        = "for variables list",
+        primary     = _M.id,
+        separators  = ",",
+        terminators = "in" });
+
+    //--------------------------------------------------------------------------
+    // for header, between [for] and [do] (exclusive).
+    // Return the `Forxxx{...} AST, without the body element (the last one).
+    //--------------------------------------------------------------------------
+    function M.for_header (lx) {
+        var vars = M.id_list(lx);
+        if( lx ->is_keyword (lx->peek(), "=") ) {
+            if( #vars != 1 ) {
+                gg.parse_error (lx, "numeric for only accepts one variable");
+            }
+            lx->next(); // skip "="
+            var exprs = M.expr_list (lx);
+            if( #exprs < 2 || #exprs > 3 ) {
+                gg.parse_error (lx, "numeric for requires 2 or 3 boundaries");
+            }
+            return { tag="Fornum", vars[1], unpack (exprs) };
+        } else {
+            if( ! lx ->is_keyword (lx ->next(), "in") ) {
+                gg.parse_error (lx, '"=" or "in" expected in for loop');
+            }
+            var exprs = M.expr_list (lx);
+            return { tag="Forin", vars, exprs };
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // Function def parser helper: id ( . id ) *
+    //--------------------------------------------------------------------------
+    var function fn_builder (list) {
+        var acc = list[1];
+        var first = acc.lineinfo.first;
+        for( i = 2, #list ) {
+            var index = M.id2string(list[i]);
+            var li = lexer.new_lineinfo(first, index.lineinfo.last);
+            acc = { tag="Index", acc, index, lineinfo=li };
+        }
+        return acc;
+    }
+    var func_name = gg.list({ _M.id, separators = ".", builder = fn_builder });
+
+    //--------------------------------------------------------------------------
+    // Function def parser helper: ( : id )?
+    //--------------------------------------------------------------------------
+    var method_name = gg.onkeyword({ name = "method invocation", ":", _M.id,
+        transformers = { function(x) { return x && x.tag=='Id' && M.id2string(x); } } });
+
+    //--------------------------------------------------------------------------
+    // Function def builder
+    //--------------------------------------------------------------------------
+    var function funcdef_builder(x) {
+        var name, method, func = unpack(x);
+        if( method ) {
+            name = { tag="Index", name, method,
+                     lineinfo = {
+                         first = name.lineinfo.first,
+                         last  = method.lineinfo.last } };
+            table.insert (func[1], 1, {tag="Id", "self"});
+        }
+        var r = { tag="Set", {name}, {func} };
+        r[1].lineinfo = name.lineinfo;
+        r[2].lineinfo = func.lineinfo;
+        return r;
+    }
+
+
+    //--------------------------------------------------------------------------
+    // if statement builder
+    //--------------------------------------------------------------------------
+    var function if_builder (x) {
+        var cond_block_pairs, else_block, r = x[1], x[2], {tag="If"};
+        var n_pairs = #cond_block_pairs;
+        for( i = 1, n_pairs ) {
+            var cond, block = unpack(cond_block_pairs[i]);
+            r[2*i-1], r[2*i] = cond, block;
+        }
+        if( else_block ) { table.insert(r, #r+1, else_block); }
+        return r;
+    }
+
+    //------------------------------------------------------------------------------
+    // produce a list of (expr,block) pairs
+    //------------------------------------------------------------------------------
+    var elseifs_parser = gg.list ({
+        gg.sequence ({ _M.expr, "then", _M.block , name='elseif parser' }),
+        separators  = "elseif",
+        terminators = { "else", "end" }
+    });
+
+    var annot_expr = gg.sequence ({
+        _M.expr,
+        gg.onkeyword({ "#", gg.future(M, 'annot').tf }),
+        builder = function(x) {
+            var e, a = unpack(x);
+            if( a ) { return { tag='Annot', e, a };
+            } else { return e; }
+        } });
+
+    var annot_expr_list = gg.list ({
+        primary = annot.opt(M, _M.expr, 'tf'), separators = ',' });
+
+    //----------------------------------------------------------------------
+    // assignments and calls: statements that don't start with a keyword
+    //----------------------------------------------------------------------
+    var function assign_or_call_stat_parser (lx) {
+        var e = annot_expr_list (lx);
+        var a = lx->is_keyword(lx->peek());
+        var op = a && M.assignments[a];
+        // TODO: refactor annotations
+        if( op ) {
+            //FIXME: check that [e] is a LHS
+            lx ->next();
+            var annots;
+            e, annots = annot.split(e);
+            var v = M.expr_list (lx);
+            if( type(op)=="string" ) { return { tag=op, e, v, annots };
+            } else { return op (e, v); }
+        } else {
+            assert (#e > 0);
+            if( #e > 1 ) {
+                gg.parse_error (lx,
+                    "comma is not a valid statement separator; statement can be "..
+                    "separated by semicolons, or not separated at all");
+            } else if( e[1].tag != "Call" && e[1].tag != "Invoke" ) {
+                var typename;
+                if( e[1].tag == 'Id' ) {
+                    typename = '("'..e[1][1]..'") is an identifier';
+                } else if( e[1].tag == 'Op' ) {
+                    typename = "is an arithmetic operation";
+                } else { typename = "is of type '"..(e[1].tag || "<list>").."'"; }
+                gg.parse_error (lx,
+                     "This expression %s; "..
+                     "a statement was expected, and only function and method call "..
+                     "expressions can be used as statements", typename);
+            }
+            return e[1];
+        }
+    }
+
+    M.local_stat_parser = gg.multisequence({
+        // local function <name> <func_val>
+        { "function", _M.id, _M.func_val, builder =
+          function(x) {
+              var vars = { x[1], lineinfo = x[1].lineinfo };
+              var vals = { x[2], lineinfo = x[2].lineinfo };
+              return { tag="Localrec", vars, vals };
+          } },
+        // local <id_list> ( = <expr_list> )?
+        default = gg.sequence({
+            gg.list({
+                primary = annot.opt(M, _M.id, 'tf'),
+                separators = ',' }),
+            gg.onkeyword({ "=", _M.expr_list }),
+            builder = function(x) {
+                 var annotated_left, right = unpack(x);
+                 var left, annotations = annot.split(annotated_left);
+                 return {tag="Local", left, right || { }, annotations };
+             } }) });
+
+    //----------------------------------------------------------------------
+    // statement
+    //----------------------------------------------------------------------
+    M.stat = gg.multisequence ({
+        name = "statement",
+        { "do", _M.block, "end", builder =
+          function (x) { return { tag="Do", unpack (x[1]) }; } },
+        { "for", _M.for_header, "do", _M.block, "end", builder =
+          function (x) { x[1][#x[1]+1] = x[2]; return x[1]; } },
+        { "function", func_name, method_name, _M.func_val, builder=funcdef_builder },
+        { "while", _M.expr, "do", _M.block, "end", builder = "While" },
+        { "repeat", _M.block, "until", _M.expr, builder = "Repeat" },
+        { "local", _M.local_stat_parser, builder = unpack },
+        { "return", return_expr_list_parser, builder =
+          function(x) { x[1].tag='Return'; return x[1]; } },
+        { "goto", _M.id, builder =
+          function(x) { x[1].tag='Goto'; return x[1]; } },
+        { "::", _M.id, "::", builder =
+          function(x) { x[1].tag='Label'; return x[1]; } },
+        { "break", builder = function() { return { tag="Break" }; } },
+        { "-{", gg.future(M, 'meta').splice_content, "}", builder = unpack },
+        { "if", gg.nonempty(elseifs_parser), gg.onkeyword({ "else", M.block }), "end",
+          builder = if_builder },
+        default = assign_or_call_stat_parser });
+
+    M.assignments = {
+        ["="] = "Set"
+    };
+
+    function M.assignments::add(k, v) { this[k] = v; }
+
+    return M;
+};

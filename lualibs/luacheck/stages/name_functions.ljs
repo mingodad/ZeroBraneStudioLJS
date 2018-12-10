@@ -1,0 +1,71 @@
+var stage = {};
+
+var function get_index_name(base_name, key_node) {
+   if( key_node.tag == "String" ) {
+      return base_name .. "." .. key_node[1];
+   }
+}
+
+var function get_full_field_name(node) {
+   if( node.tag == "Id" ) {
+      return node[1];
+   } else if( node.tag == "Index" ) {
+      var base_name = get_full_field_name(node[1]);
+      return base_name && get_index_name(base_name, node[2]);
+   }
+}
+
+var handle_node;
+
+var function handle_nodes(nodes) {
+   for( _, node in ipairs(nodes) ) {
+      if( type(node) == "table" ) {
+         handle_node(node);
+      }
+   }
+}
+
+function handle_node(node, name) {
+   if( node.tag == "Function" ) {
+      node.name = name;
+      handle_nodes(node[2]);
+   } else if( node.tag == "Set" || node.tag == "Local" || node.tag == "Localrec" ) {
+      var lhs = node[1];
+      var rhs = node[2];
+
+      // No need to handle LHS if there is no RHS, it's always just a list of locals in that case.
+      if( rhs ) {
+         handle_nodes(lhs);
+
+         for( index, rhs_node in ipairs(rhs) ) {
+            var lhs_node = lhs[index];
+            var field_name = lhs_node && get_full_field_name(lhs_node);
+            handle_node(rhs_node, field_name);
+         }
+      }
+   } else if( node.tag == "Table" && name ) {
+      for( _, pair_node in ipairs(node) ) {
+         if( pair_node.tag == "Pair" ) {
+            var key_node = pair_node[1];
+            var value_node = pair_node[2];
+            handle_node(key_node);
+            handle_node(value_node, get_index_name(name, key_node));
+         } else {
+            handle_node(pair_node);
+         }
+      }
+   } else {
+      handle_nodes(node);
+   }
+}
+
+// Adds `name` field to `Function` ast nodes when possible:
+// * Function assigned to a variable (doesn't matter if local or global): "foo".
+// * Function assigned to a field: "foo.bar.baz".
+//   Function can be in a table assigned to a variable or a field, e.g. `foo.bar = {baz = function() ... end}`.
+// * Otherwise: `nil`.
+function stage.run(chstate) {
+   handle_nodes(chstate.ast);
+}
+
+return stage;

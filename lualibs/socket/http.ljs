@@ -1,0 +1,354 @@
+//---------------------------------------------------------------------------
+// HTTP/1.1 client support for the Lua language.
+// LuaSocket toolkit.
+// Author: Diego Nehab
+//---------------------------------------------------------------------------
+
+//---------------------------------------------------------------------------
+// Declare module and import dependencies
+//-----------------------------------------------------------------------------
+var socket = require("socket");
+var url = require("socket.url");
+var ltn12 = require("ltn12");
+var mime = require("mime");
+var string = require("string");
+var headers = require("socket.headers");
+var base = _G;
+var table = require("table");
+socket.http = {};
+var _M = socket.http;
+
+//---------------------------------------------------------------------------
+// Program constants
+//---------------------------------------------------------------------------
+// connection timeout in seconds
+TIMEOUT = 60;
+// default port for document retrieval
+_M.PORT = 80;
+// user agent field sent in request
+_M.USERAGENT = socket._VERSION;
+
+//---------------------------------------------------------------------------
+// Reads MIME headers from a connection, unfolding where needed
+//---------------------------------------------------------------------------
+var function receiveheaders(sock, headers) {
+    var line, name, value, err;
+    headers = headers || {};
+    // get first line
+    line, err = sock->receive();
+    if( err ) { return null, err; }
+    // headers go until a blank line is found
+    while( line != "" ) {
+        // get field-name and value
+        name, value = socket.skip(2, string.find(line, "^(.-):%s*(.*)"));
+        if( ! (name && value) ) { return null, "malformed reponse headers"; }
+        name = string.lower(name);
+        // get next line (value might be folded)
+        line, err  = sock->receive();
+        if( err ) { return null, err; }
+        // unfold any folded values
+        while( string.find(line, "^%s") ) {
+            value = value .. line;
+            line = sock->receive();
+            if( err ) { return null, err; }
+        }
+        // save pair in table
+        if( headers[name] ) { headers[name] = headers[name] .. ", " .. value;
+        } else { headers[name] = value; }
+    }
+    return headers;
+}
+
+//---------------------------------------------------------------------------
+// Extra sources and sinks
+//---------------------------------------------------------------------------
+socket.sourcet["http-chunked"] = function(sock, headers) {
+    return base.setmetatable({
+        getfd = function() { return sock->getfd(); },
+        dirty = function() { return sock->dirty(); }
+    }, {
+        __call = function() {
+            // get chunk size, skip extention
+            var line, err = sock->receive();
+            if( err ) { return null, err; }
+            var size = base.tonumber(string.gsub(line, ";.*", ""), 16);
+            if( ! size ) { return null, "invalid chunk size"; }
+            // was it the last chunk?
+            if( size > 0 ) {
+                // if not, get chunk and skip terminating CRLF
+                var chunk, err, part = sock->receive(size);
+                if( chunk ) { sock->receive(); }
+                return chunk, err;
+            } else {
+                // if it was, read trailers into headers table
+                headers, err = receiveheaders(sock, headers);
+                if( ! headers ) { return null, err; }
+            }
+        }
+    });
+};
+
+socket.sinkt["http-chunked"] = function(sock) {
+    return base.setmetatable({
+        getfd = function() { return sock->getfd(); },
+        dirty = function() { return sock->dirty(); }
+    }, {
+        __call = function(this, chunk, err) {
+            if( ! chunk ) { return sock->send("0\r\n\r\n"); }
+            var size = string.format("%X\r\n", string.len(chunk));
+            return sock->send(size ..  chunk .. "\r\n");
+        }
+    });
+};
+
+//---------------------------------------------------------------------------
+// Low level HTTP API
+//---------------------------------------------------------------------------
+var metat = { __index = {} };
+
+function _M.open(host, port, create) {
+    // create socket with user connect function, or with default
+    var c = socket.try((create || socket.tcp)());
+    var h = base.setmetatable({ c = c }, metat);
+    // create finalized try
+    h.try = socket.newtry(function() { h->close(); });
+    // set timeout before connecting
+    h.try(c->settimeout(_M.TIMEOUT));
+    h.try(c->connect(host, port || _M.PORT));
+    // here everything worked
+    return h;
+}
+
+function metat.__index::sendrequestline(method, uri) {
+    var reqline = string.format("%s %s HTTP/1.1\r\n", method || "GET", uri);
+    return this.try(this.c->send(reqline));
+}
+
+function metat.__index::sendheaders(tosend) {
+    var canonic = headers.canonic;
+    var h = "\r\n";
+    for( f, v in base.pairs(tosend) ) {
+        h = (canonic[f] || f) .. ": " .. v .. "\r\n" .. h;
+    }
+    this.try(this.c->send(h));
+    return 1;
+}
+
+function metat.__index::sendbody(headers, source, step) {
+    source = source || ltn12.source.empty();
+    step = step || ltn12.pump.step;
+    // if we don't know the size in advance, send chunked and hope for the best
+    var mode = "http-chunked";
+    if( headers["content-length"] ) { mode = "keep-open"; }
+    return this.try(ltn12.pump.all(source, socket.sink(mode, this.c), step));
+}
+
+function metat.__index::receivestatusline() {
+    var status = this.try(this.c->receive(5));
+    // identify HTTP/0.9 responses, which do not contain a status line
+    // this is just a heuristic, but is what the RFC recommends
+    if( status != "HTTP/" ) { return null, status; }
+    // otherwise proceed reading a status line
+    status = this.try(this.c->receive("*l", status));
+    var code = socket.skip(2, string.find(status, "HTTP/%d*%.%d* (%d%d%d)"));
+    return this.try(base.tonumber(code), status);
+}
+
+function metat.__index::receiveheaders() {
+    return this.try(receiveheaders(this.c));
+}
+
+function metat.__index::receivebody(headers, sink, step) {
+    sink = sink || ltn12.sink.snull();
+    step = step || ltn12.pump.step;
+    var length = base.tonumber(headers["content-length"]);
+    var t = headers["transfer-encoding"]; // shortcut
+    var mode = "default"; // connection close
+    if( t && t != "identity" ) { mode = "http-chunked";
+    } else if( base.tonumber(headers["content-length"]) ) { mode = "by-length"; }
+    return this.try(ltn12.pump.all(socket.source(mode, this.c, length),
+        sink, step));
+}
+
+function metat.__index::receive09body(status, sink, step) {
+    var source = ltn12.source.rewind(socket.source("until-closed", this.c));
+    source(status);
+    return this.try(ltn12.pump.all(source, sink, step));
+}
+
+function metat.__index::close() {
+    return this.c->close();
+}
+
+//---------------------------------------------------------------------------
+// High level HTTP API
+//---------------------------------------------------------------------------
+var function adjusturi(reqt) {
+    var u = reqt;
+    // if there is a proxy, we need the full url. otherwise, just a part.
+    if( ! reqt.proxy && ! PROXY ) {
+        u = {
+           path = socket.try(reqt.path, "invalid path 'nil'"),
+           params = reqt.params,
+           query = reqt.query,
+           fragment = reqt.fragment
+        };
+    }
+    return url.build(u);
+}
+
+var function adjustproxy(reqt) {
+    var proxy = reqt.proxy || PROXY;
+    if( proxy ) {
+        proxy = url.parse(proxy);
+        return proxy.host, proxy.port || 3128;
+    } else {
+        return reqt.host, reqt.port;
+    }
+}
+
+var function adjustheaders(reqt) {
+    // default headers
+    var lower = {
+        ["user-agent"] = _M.USERAGENT,
+        ["host"] = reqt.host,
+        ["connection"] = "close, TE",
+        ["te"] = "trailers"
+    };
+    // if we have authentication information, pass it along
+    if( reqt.user && reqt.password ) {
+        lower["authorization"] = 
+            "Basic " ..  (mime.b64(reqt.user .. ":" .. reqt.password));
+    }
+    // override with user headers
+    for( i,v in base.pairs(reqt.headers || lower) ) {
+        lower[string.lower(i)] = v;
+    }
+    return lower;
+}
+
+// default url parts
+var default = {
+    host = "",
+    port = _M.PORT,
+    path ="/",
+    scheme = "http"
+};
+
+var function adjustrequest(reqt) {
+    // parse url if provided
+    var nreqt = reqt.url && url.parse(reqt.url, default) || {};
+    // explicit components override url
+    for( i,v in base.pairs(reqt) ) { nreqt[i] = v; }
+    if( nreqt.port == "" ) { nreqt.port = 80; }
+    socket.try(nreqt.host && nreqt.host != "", 
+        "invalid host '" .. base.tostring(nreqt.host) .. "'");
+    // compute uri if user hasn't overriden
+    nreqt.uri = reqt.uri || adjusturi(nreqt);
+    // ajust host and port if there is a proxy
+    nreqt.host, nreqt.port = adjustproxy(nreqt);
+    // adjust headers in request
+    nreqt.headers = adjustheaders(nreqt);
+    return nreqt;
+}
+
+var function shouldredirect(reqt, code, headers) {
+    return headers.location &&
+           string.gsub(headers.location, "%s", "") != "" &&
+           (reqt.redirect != false) &&
+           (code == 301 || code == 302 || code == 303 || code == 307) &&
+           (! reqt.method || reqt.method == "GET" || reqt.method == "HEAD")
+           && (! reqt.nredirects || reqt.nredirects < 5);
+}
+
+var function shouldreceivebody(reqt, code) {
+    if( reqt.method == "HEAD" ) { return null; }
+    if( code == 204 || code == 304 ) { return null; }
+    if( code >= 100 && code < 200 ) { return null; }
+    return 1;
+}
+
+// forward declarations
+var trequest, tredirect;
+
+/*local*/ function tredirect(reqt, location) {
+    var result, code, headers, status = trequest ({
+        // the RFC says the redirect URL has to be absolute, but some
+        // servers do not respect that
+        url = url.absolute(reqt.url, location),
+        source = reqt.source,
+        sink = reqt.sink,
+        headers = reqt.headers,
+        proxy = reqt.proxy, 
+        nredirects = (reqt.nredirects || 0) + 1,
+        create = reqt.create
+    });   
+    // pass location header back as a hint we redirected
+    headers = headers || {};
+    headers.location = headers.location || location;
+    return result, code, headers, status;
+}
+
+/*local*/ function trequest(reqt) {
+    // we loop until we get what we want, or
+    // until we are sure there is no way to get it
+    var nreqt = adjustrequest(reqt);
+    var h = _M.open(nreqt.host, nreqt.port, nreqt.create);
+    // send request line and headers
+    h->sendrequestline(nreqt.method, nreqt.uri);
+    h->sendheaders(nreqt.headers);
+    // if there is a body, send it
+    if( nreqt.source ) {
+        h->sendbody(nreqt.headers, nreqt.source, nreqt.step); 
+    }
+    var code, status = h->receivestatusline();
+    // if it is an HTTP/0.9 server, simply get the body and we are done
+    if( ! code ) {
+        h->receive09body(status, nreqt.sink, nreqt.step);
+        return 1, 200;
+    }
+    var headers;
+    // ignore any 100-continue messages
+    while( code == 100 ) { 
+        headers = h->receiveheaders();
+        code, status = h->receivestatusline();
+    }
+    headers = h->receiveheaders();
+    // at this point we should have a honest reply from the server
+    // we can't redirect if we already used the source, so we report the error 
+    if( shouldredirect(nreqt, code, headers) && ! nreqt.source ) {
+        h->close();
+        return tredirect(reqt, headers.location);
+    }
+    // here we are finally done
+    if( shouldreceivebody(nreqt, code) ) {
+        h->receivebody(headers, nreqt.sink, nreqt.step);
+    }
+    h->close();
+    return 1, code, headers, status;
+}
+
+var function srequest(u, b) {
+    var t = {};
+    var reqt = {
+        url = u,
+        sink = ltn12.sink.table(t)
+    };
+    if( b ) {
+        reqt.source = ltn12.source.string(b);
+        reqt.headers = {
+            ["content-length"] = string.len(b),
+            ["content-type"] = "application/x-www-form-urlencoded"
+        };
+        reqt.method = "POST";
+    }
+    var code, headers, status = socket.skip(1, trequest(reqt));
+    return table.concat(t), code, headers, status;
+}
+
+_M.request = socket.protect(function(reqt, body) {
+    if( base.type(reqt) == "string" ) { return srequest(reqt, body);
+    } else { return trequest(reqt); }
+});
+
+return _M;

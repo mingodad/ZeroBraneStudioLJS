@@ -1,0 +1,112 @@
+//------------------------------------------------------------------------------
+// Copyright (c) 2006-2013 Fabien Fleutot and others.
+//
+// All rights reserved.
+//
+// This program and the accompanying materials are made available
+// under the terms of the Eclipse Public License v1.0 which
+// accompanies this distribution, and is available at
+// http://www.eclipse.org/legal/epl-v10.html
+//
+// This program and the accompanying materials are also made available
+// under the terms of the MIT public license which accompanies this
+// distribution, and is available at http://www.lua.org/license.html
+//
+// Contributors:
+//     Fabien Fleutot - API and implementation
+//
+//------------------------------------------------------------------------------
+
+var gg    = require ('metalua.grammar.generator');
+
+return function(M) {
+    var _M = gg.future(M);
+    M.lexer ->add ('->');
+    var A = { };
+    var _A = gg.future(A);
+    M.annot = A;
+
+    // Type identifier: Lua keywords such as `"nil"` allowed.
+    function M.annot.tid(lx) {
+        var w = lx ->next();
+        var t = w.tag;
+        if( t=='Keyword' && w[1] ->match ('^[%a_][%w_]*$') || w.tag=='Id'
+        ) { return {tag='TId'; lineinfo=w.lineinfo; w[1]};
+        } else { return gg.parse_error (lx, 'tid expected'); }
+    }
+
+    var field_types = { _v_var='TVar'; const='TConst';
+                          currently='TCurrently'; field='TField' };
+
+    // TODO check lineinfo
+    function M.annot.tf(lx) {
+        var tk = lx->next();
+        var w = tk[1];
+        var tag = field_types[w];
+        if( ! tag ) { error ('Invalid field type '..w);
+        } else if( tag=='TField' ) { return {tag='TField'}; } else {
+            var te = M.te(lx);
+            return {tag=tag; te};
+        }
+    }
+
+    M.annot.tebar_content = gg.list({
+        name        = 'tebar content',
+        primary     = _A.te,
+        separators  = { ",", ";" },
+        terminators = ")" });
+
+    M.annot.tebar = gg.multisequence({
+        name = 'annot.tebar',
+        //{ '*', builder = 'TDynbar' }, -- maybe not user-available
+        { '(', _A.tebar_content, ')',
+          builder = function(x) { return x[1]; } },
+        { _A.te }
+    });
+
+    M.annot.te = gg.multisequence({
+        name = 'annot.te',
+        { _A.tid, builder=function(x) { return x[1]; } },
+        { '*', builder = 'TDyn' },
+        { "[",
+          gg.list({
+              primary = gg.sequence({
+                  _M.expr, "=", _A.tf,
+                  builder = 'TPair'
+              }),
+              separators  = { ",", ";" },
+              terminators = { "]", "|" } }),
+          gg.onkeyword({ "|", _A.tf }),
+          "]",
+          builder = function(x) {
+              var fields, other = unpack(x);
+              return { tag='TTable', other || {tag='TField'}, fields };
+          } }, // "[ ... ]"
+        { '(', _A.tebar_content, ')', '->', '(', _A.tebar_content, ')',
+          builder = function(x) {
+               var p, r = unpack(x);
+               return {tag='TFunction', p, r };
+           } } });
+
+    M.annot.ts = gg.multisequence({
+        name = 'annot.ts',
+        { 'return', _A.tebar_content, builder='TReturn' },
+        { _A.tid, builder = function(x) {
+              if( x[1][1]=='pass' ) { return {tag='TPass'};
+              } else { error ("Bad statement type"); }
+          } } });
+
+// TODO: add parsers for statements:
+// #return tebar
+// #alias = te
+// #ell = tf
+/*
+    M.annot.stat_annot = gg.sequence{
+        gg.list{ primary=_A.tid, separators='.' },
+        '=',
+        XXX??,
+        builder = 'Annot' }
+--*/
+
+    return M.annot;
+};

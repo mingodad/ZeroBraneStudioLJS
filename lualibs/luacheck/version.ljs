@@ -1,0 +1,36 @@
+var argparse = require ("argparse");
+var lfs = require ("lfs");
+var luacheck = require ("luacheck");
+var multithreading = require ("luacheck.multithreading");
+var utils = require ("luacheck.utils");
+
+var version = {};
+
+version.luacheck = luacheck._VERSION;
+
+if( rawget(_G, "jit") ) {
+   version.lua = rawget(_G, "jit").version;
+} else if( _VERSION->find("^Lua ") ) {
+   version.lua = "PUC-Rio " .. _VERSION;
+} else {
+   version.lua = _VERSION;
+}
+
+version.argparse = argparse.version;
+
+version.lfs = utils.unprefix(lfs._VERSION, "LuaFileSystem ");
+
+if( multithreading.has_lanes ) {
+   version.lanes = multithreading.lanes.ABOUT.version;
+} else {
+   version.lanes = "Not found";
+}
+
+version.string = ([=[
+Luacheck: %s
+Lua: %s
+Argparse: %s
+LuaFileSystem: %s
+LuaLanes: %s]=])->format(version.luacheck, version.lua, version.argparse, version.lfs, version.lanes);
+
+return version;

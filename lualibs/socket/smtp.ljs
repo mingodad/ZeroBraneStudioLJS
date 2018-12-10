@@ -1,0 +1,256 @@
+//---------------------------------------------------------------------------
+// SMTP client support for the Lua language.
+// LuaSocket toolkit.
+// Author: Diego Nehab
+//---------------------------------------------------------------------------
+
+//---------------------------------------------------------------------------
+// Declare module and import dependencies
+//---------------------------------------------------------------------------
+var base = _G;
+var coroutine = require("coroutine");
+var string = require("string");
+var math = require("math");
+var os = require("os");
+var socket = require("socket");
+var tp = require("socket.tp");
+var ltn12 = require("ltn12");
+var headers = require("socket.headers");
+var mime = require("mime");
+
+socket.smtp = {};
+var _M = socket.smtp;
+
+//---------------------------------------------------------------------------
+// Program constants
+//---------------------------------------------------------------------------
+// timeout for connection
+_M.TIMEOUT = 60;
+// default server used to send e-mails
+_M.SERVER = "localhost";
+// default port
+_M.PORT = 25;
+// domain used in HELO command and default sendmail
+// If we are under a CGI, try to get from environment
+_M.DOMAIN = os.getenv("SERVER_NAME") || "localhost";
+// default time zone (means we don't know)
+_M.ZONE = "-0000";
+
+//-------------------------------------------------------------------------
+// Low level SMTP API
+//---------------------------------------------------------------------------
+var metat = { __index = {} };
+
+function metat.__index::greet(domain) {
+    this.try(this.tp->check("2.."));
+    this.try(this.tp->command("EHLO", domain || _M.DOMAIN));
+    return socket.skip(1, this.try(this.tp->check("2..")));
+}
+
+function metat.__index::mail(from) {
+    this.try(this.tp->command("MAIL", "FROM:" .. from));
+    return this.try(this.tp->check("2.."));
+}
+
+function metat.__index::rcpt(to) {
+    this.try(this.tp->command("RCPT", "TO:" .. to));
+    return this.try(this.tp->check("2.."));
+}
+
+function metat.__index::data(src, step) {
+    this.try(this.tp->command("DATA"));
+    this.try(this.tp->check("3.."));
+    this.try(this.tp->source(src, step));
+    this.try(this.tp->send("\r\n.\r\n"));
+    return this.try(this.tp->check("2.."));
+}
+
+function metat.__index::quit() {
+    this.try(this.tp->command("QUIT"));
+    return this.try(this.tp->check("2.."));
+}
+
+function metat.__index::close() {
+    return this.tp->close();
+}
+
+function metat.__index::login(user, password) {
+    this.try(this.tp->command("AUTH", "LOGIN"));
+    this.try(this.tp->check("3.."));
+    this.try(this.tp->send(mime.b64(user) .. "\r\n"));
+    this.try(this.tp->check("3.."));
+    this.try(this.tp->send(mime.b64(password) .. "\r\n"));
+    return this.try(this.tp->check("2.."));
+}
+
+function metat.__index::plain(user, password) {
+    var auth = "PLAIN " .. mime.b64("\0" .. user .. "\0" .. password);
+    this.try(this.tp->command("AUTH", auth));
+    return this.try(this.tp->check("2.."));
+}
+
+function metat.__index::auth(user, password, ext) {
+    if( ! user || ! password ) { return 1; }
+    if( string.find(ext, "AUTH[^\n]+LOGIN") ) {
+        return this->login(user, password);
+    } else if( string.find(ext, "AUTH[^\n]+PLAIN") ) {
+        return this->plain(user, password);
+    } else {
+        this.try(null, "authentication not supported");
+    }
+}
+
+// send message or throw an exception
+function metat.__index::send(mailt) {
+    this->mail(mailt.from);
+    if( base.type(mailt.rcpt) == "table" ) {
+        for( i,v in base.ipairs(mailt.rcpt) ) {
+            this->rcpt(v);
+        }
+    } else {
+        this->rcpt(mailt.rcpt);
+    }
+    this->data(ltn12.source.chain(mailt.source, mime.stuff()), mailt.step);
+}
+
+function _M.open(server, port, create) {
+    var tp = socket.try(tp.connect(server || _M.SERVER, port || _M.PORT,
+        _M.TIMEOUT, create));
+    var s = base.setmetatable({tp = tp}, metat);
+    // make sure tp is closed if we get an exception
+    s.try = socket.newtry(function() {
+        s->close();
+    });
+    return s;
+}
+
+// convert headers to lowercase
+var function lower_headers(headers) {
+    var lower = {};
+    for( i,v in base.pairs(headers || lower) ) {
+        lower[string.lower(i)] = v;
+    }
+    return lower;
+}
+
+//-------------------------------------------------------------------------
+// Multipart message source
+//---------------------------------------------------------------------------
+// returns a hopefully unique mime boundary
+var seqno = 0;
+var function newboundary() {
+    seqno +=   1;
+    return string.format('%s%05d==%05u', os.date('%d%m%Y%H%M%S'),
+        math.random(0, 99999), seqno);
+}
+
+// send_message forward declaration
+var send_message;
+
+// yield the headers all at once, it's faster
+var function send_headers(tosend) {
+    var canonic = headers.canonic;
+    var h = "\r\n";
+    for( f,v in base.pairs(tosend) ) {
+        h = (canonic[f] || f) .. ': ' .. v .. "\r\n" .. h;
+    }
+    coroutine.yield(h);
+}
+
+// yield multipart message body from a multipart message table
+var function send_multipart(mesgt) {
+    // make sure we have our boundary and send headers
+    var bd = newboundary();
+    var headers = lower_headers(mesgt.headers || {});
+    headers['content-type'] = headers['content-type'] || 'multipart/mixed';
+    headers['content-type'] = headers['content-type'] ..
+        '; boundary="' ..  bd .. '"';
+    send_headers(headers);
+    // send preamble
+    if( mesgt.body.preamble ) {
+        coroutine.yield(mesgt.body.preamble);
+        coroutine.yield("\r\n");
+    }
+    // send each part separated by a boundary
+    for( i, m in base.ipairs(mesgt.body) ) {
+        coroutine.yield("\r\n--" .. bd .. "\r\n");
+        send_message(m);
+    }
+    // send last boundary
+    coroutine.yield("\r\n--" .. bd .. "--\r\n\r\n");
+    // send epilogue
+    if( mesgt.body.epilogue ) {
+        coroutine.yield(mesgt.body.epilogue);
+        coroutine.yield("\r\n");
+    }
+}
+
+// yield message body from a source
+var function send_source(mesgt) {
+    // make sure we have a content-type
+    var headers = lower_headers(mesgt.headers || {});
+    headers['content-type'] = headers['content-type'] ||
+        'text/plain; charset="iso-8859-1"';
+    send_headers(headers);
+    // send body from source
+    while( true ) {
+        var chunk, err = mesgt.body();
+        if( err ) { coroutine.yield(null, err);
+        } else if( chunk ) { coroutine.yield(chunk);
+        } else { break; }
+    }
+}
+
+// yield message body from a string
+var function send_string(mesgt) {
+    // make sure we have a content-type
+    var headers = lower_headers(mesgt.headers || {});
+    headers['content-type'] = headers['content-type'] ||
+        'text/plain; charset="iso-8859-1"';
+    send_headers(headers);
+    // send body from string
+    coroutine.yield(mesgt.body);
+}
+
+// message source
+function send_message(mesgt) {
+    if( base.type(mesgt.body) == "table" ) { send_multipart(mesgt);
+    } else if( base.type(mesgt.body) == "function" ) { send_source(mesgt);
+    } else { send_string(mesgt); }
+}
+
+// set defaul headers
+var function adjust_headers(mesgt) {
+    var lower = lower_headers(mesgt.headers);
+    lower["date"] = lower["date"] ||
+        os.date("!%a, %d %b %Y %H:%M:%S ") .. (mesgt.zone || _M.ZONE);
+    lower["x-mailer"] = lower["x-mailer"] || socket._VERSION;
+    // this can't be overriden
+    lower["mime-version"] = "1.0";
+    return lower;
+}
+
+function _M.message(mesgt) {
+    mesgt.headers = adjust_headers(mesgt);
+    // create and return message source
+    var co = coroutine.create(function() { send_message(mesgt); });
+    return function() {
+        var ret, a, b = coroutine.resume(co);
+        if( ret ) { return a, b;
+        } else { return null, a; }
+    };
+}
+
+//-------------------------------------------------------------------------
+// High level SMTP API
+//---------------------------------------------------------------------------
+_M.send = socket.protect(function(mailt) {
+    var s = _M.open(mailt.server, mailt.port, mailt.create);
+    var ext = s->greet(mailt.domain);
+    s->auth(mailt.user, mailt.password, ext);
+    s->send(mailt);
+    s->quit();
+    return s->close();
+});
+
+return _M;

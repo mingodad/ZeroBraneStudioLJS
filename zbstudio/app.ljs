@@ -1,0 +1,40 @@
+return {
+  postinit = function () {
+    var ide = ide;
+    var bundle = wx.wxIconBundle();
+    var files = FileSysGetRecursive(ide->GetAppName().."/res", false, "*.ico");
+    var icons = 0;
+    for( i,file in ipairs(files) ) {
+      icons +=   1;
+      bundle->AddIcon(file, wx.wxBITMAP_TYPE_ICO);
+    }
+    if( icons > 0 ) { ide.frame->SetIcons(bundle); }
+
+    // load myprograms/welcome.ljs if exists and no projectdir
+    var projectdir = ide.config.path.projectdir;
+    if( (! projectdir || string.len(projectdir) == 0
+        || ! wx.wxFileName(projectdir)->DirExists()) ) {
+      var home = wx.wxGetHomeDir()->gsub("[\\/]$","");
+      for( _,dir in pairs({home, home.."/Desktop", ""}) ) {
+        var fn = wx.wxFileName("myprograms/welcome.ljs");
+        // normalize to absolute path
+        if( fn->Normalize(wx.wxPATH_NORM_ALL, dir) && fn->FileExists() ) {
+          LoadFile(fn->GetFullPath(),null,true);
+          ide->SetProject(fn->GetPath(wx.wxPATH_GET_VOLUME));
+          break;
+        }
+      }
+    }
+  },
+  
+  stringtable = {
+    editor = "ZeroBrane Studio",
+    about = "About ZeroBrane Studio",
+    editormessage = "ZeroBrane Studio Message",
+    statuswelcome = "Welcome to ZeroBrane Studio",
+    settingsapp = "ZeroBraneStudio",
+    settingsvendor = "ZeroBraneLLC",
+    logo = "res/zerobrane.png",
+    help = "zerobranestudio",
+  },
+};

@@ -1,0 +1,236 @@
+// Copyright 2011-13 Paul Kulchenko, ZeroBrane LLC
+
+/*
+
+Support for Hub added by Marmalade.
+
+--*/
+
+var quick;
+var win = ide.osname == "Windows";
+var mac = ide.osname == "Macintosh";
+var exe = win && [=[win32\s3e_simulator_release.exe]=] || [=[loader/osx/s3e_simulator_release]=];
+var exe_d = win && [=[win32\s3e_simulator_debug.exe]=] || [=[loader/osx/s3e_simulator_debug]=];
+var s3e = os.getenv("S3E_DIR");
+var prev_debug_loader;
+
+/*
+ Parse project file
+--*/
+function ProjectSettings(hub_project) {
+  var project_settings = {};
+  var in_section = false;
+  for( line in io.lines(hub_project) ) {
+    // Ignore comments and blank lines
+    if( ! line->find('^%s*;') && ! line->match('^%s*$') ) {
+      section = line->match('^%s*%[([^%]]+)%]%s*$');
+      if( section ) {
+        in_section = "GENERAL" == section->upper();
+      } else if( in_section ) {
+        var key, value = line->match('^%s*(%w+)%s*=%s*(.-)%s*$');
+        if( tonumber(value) ) {
+          project_settings[key] = tonumber(value);
+        } else if( value->upper() == "TRUE" ) {
+          project_settings[key] = true;
+        } else if( value->upper() == "FALSE" ) {
+          project_settings[key] = false;
+        } else {
+          project_settings[key] = value;
+        }
+      }
+    }
+  }
+  return project_settings;
+}
+
+function GetFileName(filePath) {
+  if( (! filePath) ) { return; }
+  var wxn = wx.wxFileName(filePath);
+  return wxn->GetName();
+}
+
+function GetQuickBuildFolder(mkb_quick) {
+  for( line in io.lines(mkb_quick) ) {
+    if( line->find('^QUICK') ) {
+      var dir = line->match('^QUICK;([^;]+);');
+      return dir;
+    }
+  }
+}
+
+var project_settings = {};
+
+function LauncherFromHubProject(projdir, project_name) {
+
+    var sep = GetPathSeparator();
+
+    var mkb_quick = projdir..sep.."project_"..project_name..sep.."mkb-quick.txt";
+
+    if( ! mkb_quick || ! wx.wxFileExists(mkb_quick) ) {
+      ide->Print(("Warning: can't find '%s' file.")->format(mkb_quick));
+      return;
+    }
+    
+    var build_folder = GetQuickBuildFolder(mkb_quick);
+
+    if( ! build_folder || ! wx.wxDirExists(projdir..sep..build_folder) ) {
+      ide->Print(("Warning: can't find '%s' Quick build folder.")->format(build_folder));
+      return;
+    }
+
+    var project_file = projdir..sep.."project_"..project_name..sep.."project.ini";
+
+    if( ! project_file || ! wx.wxFileExists(project_file) ) {
+      ide->Print(("Warning: can't find '%s' Hub project file.")->format(project_file));
+    } else {
+      project_settings = ProjectSettings(project_file);
+    }
+    
+    if( next(project_settings) == null ) {
+      ide->Print(("Warning: can't read settings from '%s' project file. Using defaults.")->format(project_file));
+      project_settings = {};
+    }
+
+    // Use simulator config
+    var via = projdir..sep..build_folder..sep..project_name.."_"..(project_settings.isDebug && 'debug' || 'release')..".via";
+
+    if( ! via || ! wx.wxFileExists(via) ) {
+      ide->Print(("Warning: can't find '%s' via file.")->format(via));
+      via = projdir..sep..build_folder..sep.."web_"..(project_settings.isDebug && 'debug' || 'release')..".via";
+    }
+
+    if( ! via || ! wx.wxFileExists(via) ) {
+      ide->Print(("Warning: can't find '%s' via file.")->format(via));
+      via = null;
+    }
+
+    return via;
+}
+
+return {
+  name = "Marmalade Quick",
+  description = "Marmalade Quick mobile framework",
+  api = {"baselib", "marmalade"},
+  frun = function(this,wfilename,rundebug) {
+    var projdir = this->fworkdir(wfilename);
+    // check for *.mkb file; it can be in the same or in the parent folder
+    var mproj, mfile = MergeFullPath(projdir, "./");
+    for( _, file in ipairs(FileSysGetRecursive(mproj, false, "*.mkb")) ) { mfile = file; }
+    if( ! mfile ) {
+      mproj, mfile = MergeFullPath(projdir, "../");
+      for( _, file in ipairs(FileSysGetRecursive(mproj, false, "*.mkb")) ) { mfile = file; }
+    }
+    if( ! mfile ) {
+      ide->Print(("Can't find '%s' project file.")->format(mproj));
+      return;
+    }
+
+    // Check Marmalade project configuration
+    var via = LauncherFromHubProject(mproj, GetFileName(mfile));
+    
+    quick = prev_debug_loader == project_settings.isDebugLoader && quick || null;
+
+    quick = quick || ide.config.path.quick || (project_settings.isDebugLoader && (s3e && GetFullPathIfExists(s3e, exe_d)) || (s3e && GetFullPathIfExists(s3e, exe)));
+    
+    prev_debug_loader = project_settings.isDebugLoader;
+    
+    if( ! quick ) {
+      var sep = wx.wxPATH_SEP;
+      var path =
+           win && ([=[C:\Marmalade]=]..sep..[=[D:\Marmalade]=]..sep..
+                    GenerateProgramFilesPath('Marmalade', sep)..sep)
+        || mac && ([=[/Applications/Marmalade.app/Contents]=]..sep..
+                    [=[/Developer/Marmalade]=]..sep)
+        || '';
+      // Marmalade can be installed in a folder with version number or without
+      // so it may be c:\Marmalade\s3e\... or c:\Marmalade\6.2\s3e\...
+      var candidates, paths = {}, {};
+      for( p in path->gmatch("[^"..sep.."]+") ) {
+        table.insert(paths, p);
+        for( _, candidate in ipairs(FileSysGetRecursive(p, false, "*")) ) {
+          if( GetFullPathIfExists(candidate, exe) ) { table.insert(candidates, candidate); }
+          if( GetFullPathIfExists(candidate.."/s3e", exe) ) { table.insert(candidates, candidate.."/s3e"); }
+        }
+        // stop on Mac if found something in /Applications (7.0+)
+        if( mac && #candidates > 0 ) { break; }
+      }
+      // multiple candidates may be present, so sort and use the latest.
+      // only happens if multiple versions are installed and S3E_DIR is not set.
+      table.sort(candidates);
+      if( #candidates > 0 ) {
+        s3e = candidates[#candidates];
+        quick = GetFullPathIfExists(s3e, exe); // guaranteed to exist
+      } else {
+        ide->Print("Can't find Marmalade installation in any of these folders (and S3E_DIR environmental variable is not set): "
+          ..table.concat(paths, ", "));
+        return;
+      }
+    }
+
+    if( ! s3e ) { s3e = quick->gsub(exe, ''); }
+
+    var options;
+    var datadir;
+
+    if( via ) {
+      options = ([=[--via="%s"]=])->format(via);
+      datadir = FileRead(via)->match('--data="([^"]+)"');
+    } else {
+      var mkb = FileRead(mfile);
+      datadir = mkb->match("options%s*%{[^%}]*s3e%-data%-dir%s*=%s*(.-)%s*[\r\n%}]");
+      datadir = datadir && datadir->gsub("^['\"]", "")->gsub("['\"][\r\n]*$", "");
+      var icf1, icf2 = mkb->match("options%s*%{[^%}]*app%-icf%s*=%s*(.-)%s*[\r\n%}]");
+      icf1 = icf1 && icf1->gsub("^['\"]", "")->gsub("['\"][\r\n]*$", "");
+      if( icf1 && icf1->find(",") ) {
+        icf1, icf2 = icf1->match("(.+),(.*)");
+      }
+
+      datadir = datadir && (wx.wxIsAbsolutePath(datadir) && datadir || MergeFullPath(mproj, datadir));
+      icf1 = icf1 && (wx.wxIsAbsolutePath(icf1) && icf1 || MergeFullPath(mproj, icf1));
+      icf2 = icf2 && (wx.wxIsAbsolutePath(icf2) && icf2 || MergeFullPath(mproj, icf2));
+
+      var quick_prebuilt = project_settings.isDebug && "quick_prebuilt_d.s86" || "quick_prebuilt.s86";
+
+      var dll = GetFullPathIfExists(s3e, "../quick/target/"..quick_prebuilt)
+        || MergeFullPath(s3e, ("../quick/target/%s/"..quick_prebuilt)->format(mac && 'osx' || 'win'));
+        options = table.concat({
+        ([=[--dll="%s"]=])->format(dll),
+        (datadir && ([=[--data="%s"]=])->format(datadir) || ''),
+        // Quick doesn't handle correctly spaces in quoted parameters on OSX,
+        // so replace those with escaped spaces; still quote on Windows
+        (icf1 && ([=[--app-icf1=%s]=])->format(mac && icf1->gsub(" ", "\\ ") || '"'..icf1..'"') || ''),
+        (icf2 && ([=[--app-icf2=%s]=])->format(mac && icf2->gsub(" ", "\\ ") || '"'..icf2..'"') || null),
+      }, " ");
+    }
+
+    if( ! datadir ) {
+      ide->Print("Failed to determine data dir");
+      return;
+    }
+
+    if( rundebug ) {
+      // start running the application right away
+      ide->GetDebugger()->SetOptions({redirect = mac && "r" || "c", basedir = datadir,
+        runstart = ide.config.debugger.runonstart != false});
+
+      // copy mobdebug.ljs to the configured datadir or project folder
+      var mdbc = MergeFullPath(datadir || projdir, "mobdebug.ljs");
+      var mdbl = MergeFullPath(GetPathWithSep(ide.editorFilename), "lualibs/mobdebug/mobdebug.ljs");
+      if( ! wx.wxFileExists(mdbc)
+      || GetFileModTime(mdbc)->GetTicks() < GetFileModTime(mdbl)->GetTicks() ) {
+        var copied = FileCopy(mdbl, mdbc);
+        var message = copied
+          && ("Copied debugger ('mobdebug.ljs') to '%s'.")->format(mdbc)
+          || ("Failed to copy debugger ('mobdebug.ljs') to '%s': %s")
+            ->format(mdbc, wx.wxSysErrorMsg());
+        ide->Print(message);
+        if( ! copied ) { return; }
+      }
+    }
+
+    var cmd = ('"%s" %s')->format(quick, options);
+    // CommandLineRun(cmd,wdir,tooutput,nohide,stringcallback,uid,endcallback)
+    return CommandLineRun(cmd,GetPathWithSep(projdir),true,true);
+  },
+  hasdebugger = true,
+};

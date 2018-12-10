@@ -1,0 +1,52 @@
+// Copyright 2006-2016 Mitchell mitchell.att.foicica.com. See LICENSE.
+// Ini LPeg lexer.
+
+var l = require('lexer');
+var token, word_match = l.token, l.word_match;
+var P, R, S = lpeg.P, lpeg.R, lpeg.S;
+
+var M = {_NAME = 'ini'};
+
+// Whitespace.
+var ws = token(l.WHITESPACE, l.space**1);
+
+// Comments.
+var comment = token(l.COMMENT, l.starts_line(S(';#')) * l.nonnewline**0);
+
+// Strings.
+var sq_str = l.delimited_range("'");
+var dq_str = l.delimited_range('"');
+var label = l.delimited_range('[]', true, true);
+var string = token(l.STRING, sq_str + dq_str + label);
+
+// Numbers.
+var dec = l.digit**1 * ('_' * l.digit**1)**0;
+var oct_num = '0' * S('01234567_')**1;
+var integer = S('+-')**-1 * (l.hex_num + oct_num + dec);
+var number = token(l.NUMBER, (l.float + integer));
+
+// Keywords.
+var keyword = token(l.KEYWORD, word_match({
+  'true', 'false', 'on', 'off', 'yes', 'no'
+}));
+
+// Identifiers.
+var word = (l.alpha + '_') * (l.alnum + S('_.'))**0;
+var identifier = token(l.IDENTIFIER, word);
+
+// Operators.
+var operator = token(l.OPERATOR, '=');
+
+M._rules = {
+  {'whitespace', ws},
+  {'keyword', keyword},
+  {'identifier', identifier},
+  {'string', string},
+  {'comment', comment},
+  {'number', number},
+  {'operator', operator},
+};
+
+M._LEXBYLINE = true;
+
+return M;

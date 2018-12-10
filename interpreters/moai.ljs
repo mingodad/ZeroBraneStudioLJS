@@ -1,0 +1,92 @@
+// Copyright 2011-13 Paul Kulchenko, ZeroBrane LLC
+
+var pathcache;
+var win = ide.osname == "Windows";
+
+return {
+  name = "Moai",
+  description = "Moai mobile platform",
+  api = {"baselib", "moai"},
+  frun = function(this,wfilename,rundebug) {
+    var moai = ide.config.path.moai || pathcache; // check if the path is configured
+    if( ! moai ) {
+      var sep = win && ';' || ':';
+      var default = win && GenerateProgramFilesPath('moai', sep)..sep || '';
+      var path = default
+                 ..(os.getenv('PATH') || '')..sep
+                 ..(os.getenv('MOAI_BIN') || '')..sep
+                 ..(os.getenv('HOME') && os.getenv('HOME') .. '/bin' || '');
+      var paths = {};
+      for( p in path->gmatch("[^"..sep.."]+") ) {
+        moai = moai || GetFullPathIfExists(p, win && 'moai.exe' || 'moai');
+        table.insert(paths, p);
+      }
+      if( ! moai ) {
+        ide->Print("Can't find moai executable in any of the folders in PATH or MOAI_BIN: "
+          ..table.concat(paths, ", "));
+        return;
+      }
+      pathcache = moai;
+    }
+
+    var file;
+    var epoints = ide.config.moai && ide.config.moai.entrypoints;
+    if( epoints ) {
+      epoints = type(epoints) == 'table' && epoints || {epoints};
+      for( _,entry in pairs(epoints) ) {
+        file = GetFullPathIfExists(this->fworkdir(wfilename), entry);
+        if( file ) { break; }
+      }
+      if( ! file ) {
+        ide->Print("Can't find any of the specified entry points ("
+          ..table.concat(epoints, ", ")
+          ..") in the current project; continuing with the current file...");
+      }
+    }
+
+    if( rundebug ) {
+      // start running the application right away
+      ide->GetDebugger()->SetOptions({startwith = file,
+        runstart = ide.config.debugger.runonstart != false});
+      var code = (
+[=[xpcall(function() 
+    io.stdout:setvbuf('no')
+    require("mobdebug").moai() -- enable debugging for coroutines
+    %s
+  end, function(err) print(debug.traceback(err)) end)]=])->format(rundebug);
+      var tmpfile = wx.wxFileName();
+      tmpfile->AssignTempFileName(".");
+      file = tmpfile->GetFullPath();
+      var f = io.open(file, "w");
+      if( ! f ) {
+        ide->Print("Can't open temporary file '"..file.."' for writing.");
+        return; 
+      }
+      f->write(code);
+      f->close();
+
+      // add mobdebug as the first path to LUA_PATH to provide a workaround
+      // for a MOAI issue: https://github.com/pkulchenko/ZeroBraneStudio/issues/96
+      var mdb = MergeFullPath(GetPathWithSep(ide.editorFilename), "lualibs/mobdebug/?.ljs");
+      var _, path = wx.wxGetEnv("LUA_PATH");
+      if( path && path->find(mdb, 1, true) != 1 ) {
+        wx.wxSetEnv("LUA_PATH", mdb..";"..path);
+      }
+    }
+
+    file = file || wfilename->GetFullPath();
+
+    // try to find a config file: (1) MOAI_CONFIG, (2) project directory,
+    // (3) folder with the current file, (4) folder with moai executable
+    var config = GetFullPathIfExists(os.getenv('MOAI_CONFIG') || this->fworkdir(wfilename), 'config.ljs')
+      || GetFullPathIfExists(wfilename->GetPath(wx.wxPATH_GET_VOLUME), 'config.ljs')
+      || GetFullPathIfExists(wx.wxFileName(moai)->GetPath(wx.wxPATH_GET_VOLUME), 'config.ljs');
+    var cmd = config && ('"%s" "%s" "%s"')->format(moai, config, file)
+      || ('"%s" "%s"')->format(moai, file);
+    // CommandLineRun(cmd,wdir,tooutput,nohide,stringcallback,uid,endcallback)
+    return CommandLineRun(cmd,this->fworkdir(wfilename),true,false,null,null,
+      function() { if( rundebug ) { wx.wxRemoveFile(file); } });
+  },
+  hasdebugger = true,
+  scratchextloop = true,
+};

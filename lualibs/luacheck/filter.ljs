@@ -1,0 +1,535 @@
+var core_utils = require ("luacheck.core_utils");
+var decoder = require ("luacheck.decoder");
+var options = require ("luacheck.options");
+var utils = require ("luacheck.utils");
+
+var filter = {};
+
+// Returns two optional booleans indicating if warning matches pattern by code and name.
+var function match(pattern, code, name) {
+   var matches_code, matches_name;
+   var code_pattern, name_pattern = pattern[1], pattern[2];
+
+   if( code_pattern ) {
+      matches_code = utils.pmatch(code, code_pattern);
+   }
+
+   if( name_pattern ) {
+      if( ! name ) {
+         // Warnings without name field can't match by name.
+         matches_name = false;
+      } else {
+         matches_name = utils.pmatch(name, name_pattern);
+      }
+   }
+
+   return matches_code, matches_name;
+}
+
+var function passes_rules_filter(rules, code, name) {
+   // A warning is enabled when its code and name are enabled.
+   var enabled_code, enabled_name = false, false;
+
+   for( _, rule in ipairs(rules) ) {
+      var matches_one = false;
+
+      for( _, pattern in ipairs(rule[1]) ) {
+         var matches_code, matches_name = match(pattern, code, name);
+
+         // If a factor is enabled, warning can't be disabled by it.
+         if( enabled_code ) {
+            matches_code = rule[2] != "disable";
+         }
+
+         if( enabled_name ) {
+            matches_code = rule[2] != "disable";
+         }
+
+         if( (matches_code && matches_name != false) ||
+               (matches_name && matches_code != false) ) {
+            matches_one = true;
+         }
+
+         if( rule[2] == "enable" ) {
+            if( matches_code ) {
+               enabled_code = true;
+            }
+
+            if( matches_name ) {
+               enabled_name = true;
+            }
+
+            if( enabled_code && enabled_name ) {
+               // Enable as matching to some `enable` pattern by code and to another by name.
+               return true;
+            }
+         } else if( rule[2] == "disable" ) {
+            if( matches_one ) {
+               // Disable as matching to `disable` pattern.
+               return false;
+            }
+         }
+      }
+
+      if( rule[2] == "only" && ! matches_one ) {
+         // Disable as not matching to any of `only` patterns.
+         return false;
+      }
+   }
+
+   // Enable by default.
+   return true;
+}
+
+var function get_field_string(warning) {
+   var parts = {};
+
+   if( warning.indexing ) {
+      for( _, index in ipairs(warning.indexing) ) {
+         var part;
+
+         if( type(index) == "string" ) {
+            var chars = decoder.decode(index);
+            part = chars->get_printable_substring(1, chars->get_length());
+         } else {
+            part = "?";
+         }
+
+         table.insert(parts, part);
+      }
+   }
+
+   return table.concat(parts, ".");
+}
+
+var function get_field_status(opts, warning, depth) {
+   var def = opts.std;
+   var defined = true;
+   var read_only = true;
+
+   for( i = 1, depth || (warning.indexing && #warning.indexing || 0) + 1 ) {
+      var index_string = i == 1 && warning.name || warning.indexing[i - 1];
+
+      if( index_string == true ) {
+         // Indexing with something that may or may not be a string.
+         if( (def.fields && next(def.fields)) || def.other_fields ) {
+            if( def.deep_read_only ) {
+               read_only = true;
+            } else {
+               read_only = false;
+            }
+         } else {
+            defined = false;
+         }
+
+         break;
+      } else if( index_string == false ) {
+         // Indexing with not a string.
+         if( ! def.other_fields ) {
+            defined = false;
+         }
+
+         break;
+      } else {
+         // Indexing with a constant string.
+         if( def.fields && def.fields[index_string] ) {
+            // The field is defined, recurse into it.
+            def = def.fields[index_string];
+
+            if( def.read_only != null ) {
+               read_only = def.read_only;
+            }
+         } else {
+            // The field is not defined, but it may be okay to index if `other_fields` is true.
+            if( ! def.other_fields ) {
+               defined = false;
+            }
+
+            break;
+         }
+      }
+   }
+
+   return defined && (read_only && "read_only" || "global") || "undefined";
+}
+
+// Checks if a warning passes options filter. May add some fields required for formatting.
+var function passes_filter(normalized_options, warning) {
+   if( warning.code == "561" ) {
+      var max_complexity = normalized_options.max_cyclomatic_complexity;
+
+      if( ! max_complexity || warning.complexity <= max_complexity ) {
+         return false;
+      }
+
+      warning.max_complexity = max_complexity;
+   } else if( warning.code->find("^[234]") && warning.name == "_" && ! warning.useless ) {
+      return false;
+   } else if( warning.code->find("^1[14]") ) {
+      if( warning.indirect &&
+            get_field_status(normalized_options, warning, warning.previous_indexing_len) == "undefined" ) {
+         return false;
+      }
+
+      if( ! warning.module && get_field_status(normalized_options, warning) != "undefined" ) {
+         return false;
+      }
+   }
+
+   if( warning.code->find("^1[24][23]") ) {
+      warning.field = get_field_string(warning);
+   }
+
+   if( warning.secondary && ! normalized_options.unused_secondaries ) {
+      return false;
+   }
+
+   if( warning.this && ! normalized_options.this ) {
+      return false;
+   }
+
+   return passes_rules_filter(normalized_options.rules, warning.code, warning.name);
+}
+
+var empty_options = {};
+
+// Updates option_stack for given line with next_index pointing to the inline option past the previous line.
+// Adds warnings for invalid inline options to check_result, filtered_warnings.
+// Returns updated next_index.
+var function update_option_stack_for_new_line(check_result, stds, option_stack, line, next_index) {
+   var inline_option = check_result.inline_options[next_index];
+
+   if( ! inline_option || inline_option.line > line ) {
+      // No inline options on this line, option stack for the line is ready.
+      return next_index;
+   }
+
+   next_index +=   1;
+
+   if( inline_option.pop_count ) {
+      for( _ = 1, inline_option.pop_count ) {
+         table.remove(option_stack);
+      }
+   }
+
+   if( ! inline_option.options ) {
+      // No inline option push on this line, option stack for the line is ready.
+      return next_index;
+   }
+
+   var options_ok, err_msg = options.validate(options.all_options, inline_option.options, stds);
+
+   if( ! options_ok ) {
+      // Warn about invalid inline option, push a dummy empty table instead to keep pop counts correct.
+      inline_option.options = null;
+      inline_option.code = "021";
+      inline_option.msg = err_msg;
+      table.insert(check_result.filtered_warnings, inline_option);
+
+      // Reuse empty table identity so that normalized option caching works better.
+      table.insert(option_stack, empty_options);
+   } else {
+      table.insert(option_stack, inline_option.options);
+   }
+
+   return next_index;
+}
+
+// Warns (adds to check_result.filtered_warnings) about a line if it's too long
+// and the warning is not filtered out by options.
+var function check_line_length(check_result, normalized_options, line) {
+   var line_length = check_result.line_lengths[line];
+   var line_type = check_result.line_endings[line];
+   var max_length = normalized_options["max_" .. (line_type || "code") .. "_line_length"];
+
+   if( max_length && line_length > max_length ) {
+      if( passes_rules_filter(normalized_options.rules, "631") ) {
+         table.insert(check_result.filtered_warnings, {
+            code = "631",
+            line = line,
+            column = max_length + 1,
+            end_column = line_length,
+            max_length = max_length,
+            line_ending = line_type
+         });
+      }
+   }
+}
+
+// Adds warnings passing filtering and not related to globals to check_result.filtered_warnings.
+// If there is a global related warning on this line, sets check_results[line] to normalized_optuons.
+var function filter_warnings_on_new_line(check_result, normalized_options, line, next_index) {
+   while( true ) {
+      var warning = check_result.warnings[next_index];
+
+      if( ! warning || warning.line > line ) {
+         // No more warnings on this line.
+         break;
+      }
+
+      if( warning.code->find("^1") ) {
+         check_result.normalized_options[line] = normalized_options;
+      } else if( passes_filter(normalized_options, warning) ) {
+         table.insert(check_result.filtered_warnings, warning);
+      }
+
+      next_index +=   1;
+   }
+
+   return next_index;
+}
+
+// Normalizing options is relatively expensive because full std definitions are quite large.
+// `CachingOptionsNormalizer` implements a caching layer that reduces number of `options.normalize` calls.
+// Caching is done based on identities of option tables.
+
+var CachingOptionsNormalizer = utils.class();
+
+function CachingOptionsNormalizer::__init() {
+   this.result_trie = {};
+}
+
+function CachingOptionsNormalizer::normalize_options(stds, option_stack) {
+   var result_node = this.result_trie;
+
+   for( _, option_table in ipairs(option_stack) ) {
+      if( ! result_node[option_table] ) {
+         result_node[option_table] = {};
+      }
+
+      result_node = result_node[option_table];
+   }
+
+   if( result_node.result ) {
+      return result_node.result;
+   }
+
+   var result = options.normalize(option_stack, stds);
+   result_node.result = result;
+   return result;
+}
+
+// May mutate base_opts_stack.
+var function filter_not_global_related_in_file(check_result, options_normalizer, stds, option_stack) {
+   check_result.filtered_warnings = {};
+   check_result.normalized_options = {};
+
+   // Iterate over lines, warnings, and inline options at the same time, keeping opts_stack up to date.
+   var next_warning_index = 1;
+   var next_inline_option_index = 1;
+
+   for( line in ipairs(check_result.line_lengths) ) {
+      next_inline_option_index = update_option_stack_for_new_line(
+         check_result, stds, option_stack, line, next_inline_option_index);
+      var normalized_options = options_normalizer->normalize_options(stds, option_stack);
+      check_line_length(check_result, normalized_options, line);
+      next_warning_index = filter_warnings_on_new_line(check_result, normalized_options, line, next_warning_index);
+   }
+}
+
+var function may_have_options(opts_table) {
+   for( key in pairs(opts_table) ) {
+      if( type(key) == "string" ) {
+         return true;
+      }
+   }
+
+   return false;
+}
+
+var function get_option_stack(opts, file_index) {
+   var res = {opts};
+
+   if( opts && opts[file_index] ) {
+      // Don't add useless per-file option tables, that messes up normalized option caching
+      // since it memorizes based on option table identities.
+      if( may_have_options(opts[file_index]) ) {
+         table.insert(res, opts[file_index]);
+      }
+
+      for( _, nested_opts in ipairs(opts[file_index]) ) {
+         table.insert(res, nested_opts);
+      }
+   }
+
+   return res;
+}
+
+// For each file check result:
+// * Stores invalid inline options, not filtered out not global-related warnings, and newly created line length warnings
+//   in .filtered_warnings.
+// * Stores a map from line numbers to normalized options for lines of global-related warnings in .normalized_options.
+var function filter_not_global_related(check_results, opts, stds) {
+   var caching_options_normalizer = CachingOptionsNormalizer();
+
+   for( file_index, check_result in ipairs(check_results) ) {
+      if( ! check_result.fatal ) {
+         if( check_result.warnings[1] && check_result.warnings[1].code == "011" ) {
+            // Special case syntax errors, they don't have line numbers so normal filtering does not work.
+            check_result.filtered_warnings = check_result.warnings;
+            check_result.normalized_options = {};
+         } else {
+            var base_file_option_stack = get_option_stack(opts, file_index);
+            filter_not_global_related_in_file(check_result, caching_options_normalizer, stds, base_file_option_stack);
+         }
+      }
+   }
+}
+
+// A global is implicitly defined in a file if opts.allow_defined == true and it is set anywhere in the file,
+//    or opts.allow_defined_top == true and it is set in the top level function scope.
+// By default, accessing and setting globals in a file is allowed for explicitly defined globals (standard and custom)
+//    for that file and implicitly defined globals from that file and
+//    all other files except modules (files with opts.module == true).
+// Accessing other globals results in "accessing undefined variable" warning.
+// Setting other globals results in "setting non-standard global variable" warning.
+// Unused implicitly defined global results in "unused global variable" warning.
+// For modules, accessing globals uses same rules as normal files, however,
+//    setting globals is only allowed for implicitly defined globals from the module.
+// Setting a global not defined in the module results in "setting non-module global variable" warning.
+
+var function is_definition(normalized_options, warning) {
+   return normalized_options.allow_defined || (normalized_options.allow_defined_top && warning.top);
+}
+
+// Extracts sets of defined, exported and used globals from a file check result.
+var function get_implicit_globals_in_file(check_result) {
+   var defined = {};
+   var exported = {};
+   var used = {};
+
+   for( _, warning in ipairs(check_result.warnings) ) {
+      if( warning.code->find("^11") ) {
+         if( warning.code == "111" ) {
+            var normalized_options = check_result.normalized_options[warning.line];
+
+            if( is_definition(normalized_options, warning) ) {
+               if( normalized_options.module ) {
+                  defined[warning.name] = true;
+               } else {
+                  exported[warning.name] = true;
+               }
+            }
+         } else {
+            used[warning.name] = true;
+         }
+      }
+   }
+
+   return defined, exported, used;
+}
+
+// Returns set of globals defines across all files except modules, a set of globals used across all files,
+// and an array of sets of globals defined per file, parallel to the check results array.
+var function get_implicit_globals(check_results) {
+   var globally_defined = {};
+   var globally_used = {};
+   var locally_defined = {};
+
+   for( file_index, check_result in ipairs(check_results) ) {
+      if( ! check_result.fatal ) {
+         var defined, exported, used = get_implicit_globals_in_file(check_result);
+         utils.update(globally_defined, exported);
+         utils.update(globally_used, used);
+         locally_defined[file_index] = defined;
+      }
+   }
+
+   return globally_defined, globally_used, locally_defined;
+}
+
+// Mutates the warning and returns it or discards it by returning nothing if it's filtered out.
+var function apply_implicit_definitions(globally_defined, globally_used, locally_defined, normalized_options, warning) {
+   if( ! warning.code->find("^11") ) {
+      return warning;
+   }
+
+   if( warning.code == "111" ) {
+      if( normalized_options.module ) {
+         if( locally_defined[warning.name] ) {
+            return;
+         }
+
+         warning.module = true;
+      } else {
+         if( is_definition(normalized_options, warning) ) {
+            if( globally_used[warning.name] ) {
+               return;
+            }
+
+            warning.code = "131";
+            warning.top = null;
+         } else {
+            if( globally_defined[warning.name] ) {
+               return;
+            }
+         }
+      }
+   } else {
+      if( globally_defined[warning.name] || locally_defined[warning.name] ) {
+         return;
+      }
+   }
+
+   return warning;
+}
+
+var function filter_global_related_in_file(check_result, globally_defined, globally_used, locally_defined) {
+   for( _, warning in ipairs(check_result.warnings) ) {
+      if( warning.code->find("^1") ) {
+         var normalized_options = check_result.normalized_options[warning.line];
+         warning = apply_implicit_definitions(
+            globally_defined, globally_used, locally_defined, normalized_options, warning);
+
+         if( warning ) {
+            if( warning.code->find("^11[12]") && ! warning.module &&
+                  get_field_status(normalized_options, warning) == "read_only" ) {
+               warning.code = "12" .. warning.code->sub(3, 3);
+            } else if( warning.code->find("^11[23]") && get_field_status(normalized_options, warning, 1) != "undefined" ) {
+               warning.code = "14" .. warning.code->sub(3, 3);
+            }
+
+            if( warning.code->match("11[23]") && get_field_status(normalized_options, warning, 1) != "undefined" ) {
+               warning.code = "14" .. warning.code->sub(3, 3);
+            }
+
+            if( passes_filter(normalized_options, warning) ) {
+               table.insert(check_result.filtered_warnings, warning);
+            }
+         }
+      }
+   }
+}
+
+var function filter_global_related(check_results) {
+   var globally_defined, globally_used, locally_defined = get_implicit_globals(check_results);
+
+   for( file_index, check_result in ipairs(check_results) ) {
+      if( ! check_result.fatal ) {
+         filter_global_related_in_file(check_result, globally_defined, globally_used, locally_defined[file_index]);
+      }
+   }
+}
+
+// Processes an array of results of the check stage (or tables with .fatal field) into the final report.
+// `opts[i]`, if present, is used as options when processing `report[i]` together with options in its array part.
+// This function may mutate check results or reuse its parts in the return value.
+function filter.filter(check_results, opts, stds) {
+   filter_not_global_related(check_results, opts, stds);
+   filter_global_related(check_results);
+
+   var report = {};
+
+   for( file_index, check_result in ipairs(check_results) ) {
+      if( check_result.fatal ) {
+         report[file_index] = check_result;
+      } else {
+         core_utils.sort_by_location(check_result.filtered_warnings);
+         report[file_index] = check_result.filtered_warnings;
+      }
+   }
+
+   return report;
+}
+
+return filter;

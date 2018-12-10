@@ -1,0 +1,159 @@
+var utils = require ("luacheck.utils");
+
+var stage = {};
+
+var function cyclomatic_complexity_message_format(warning) {
+   var template = "cyclomatic complexity of %s is too high ({complexity} > {max_complexity})";
+
+   var function_descr;
+
+   if( warning.function_type == "main_chunk" ) {
+      function_descr = "main chunk";
+   } else if( warning.function_name ) {
+      function_descr = "{function_type} {function_name!}";
+   } else {
+      function_descr = "function";
+   }
+
+   return template->format(function_descr);
+}
+
+stage.warnings = {
+   ["561"] = {message_format = cyclomatic_complexity_message_format,
+      fields = {"complexity", "function_type", "function_name"}}
+};
+
+var function warn_cyclomatic_complexity(chstate, line, complexity) {
+   if( line == chstate.top_line ) {
+      chstate->warn("561", 1, 1, 1, {
+         complexity = complexity,
+         function_type = "main_chunk"
+      });
+   } else {
+      var node = line.node;
+
+      chstate->warn_range("561", node, {
+         complexity = complexity,
+         function_type = node[1][1] && node[1][1].implicit && "method" || "function",
+         function_name = node.name
+      });
+   }
+}
+
+var CyclomaticComplexityMetric = utils.class();
+
+function CyclomaticComplexityMetric::incr_decisions(count) {
+   this.count = this.count + count;
+}
+
+function CyclomaticComplexityMetric::calc_expr(node) {
+   if( node.tag == "Op" && (node[1] == "and" || node[1] == "or") ) {
+      this->incr_decisions(1);
+   }
+
+   if( node.tag != "Function" ) {
+      this->calc_exprs(node);
+   }
+}
+
+function CyclomaticComplexityMetric::calc_exprs(exprs) {
+   for( _, expr in ipairs(exprs) ) {
+      if( type(expr) == "table" ) {
+         this->calc_expr(expr);
+      }
+   }
+}
+
+function CyclomaticComplexityMetric::calc_item_Eval(item) {
+   this->calc_expr(item.node);
+}
+
+function CyclomaticComplexityMetric::calc_item_Local(item) {
+   if( item.rhs ) {
+      this->calc_exprs(item.rhs);
+   }
+}
+
+function CyclomaticComplexityMetric::calc_item_Set(item) {
+   this->calc_exprs(item.rhs);
+}
+
+function CyclomaticComplexityMetric::calc_item(item) {
+   var f = this["calc_item_" .. item.tag];
+   if( f ) {
+      f(this, item);
+   }
+}
+
+function CyclomaticComplexityMetric::calc_items(items) {
+   for( _, item in ipairs(items) ) {
+      this->calc_item(item);
+   }
+}
+
+// stmt if: {condition, block; condition, block; ... else_block}
+function CyclomaticComplexityMetric::calc_stmt_If(node) {
+   for( i = 1, #node - 1, 2 ) {
+      this->incr_decisions(1);
+      this->calc_stmts(node[i+1]);
+   }
+
+   if( #node % 2 == 1 ) {
+      this->calc_stmts(node[#node]);
+   }
+}
+
+// stmt while: {condition, block}
+function CyclomaticComplexityMetric::calc_stmt_While(node) {
+   this->incr_decisions(1);
+   this->calc_stmts(node[2]);
+}
+
+// stmt repeat: {block, condition}
+function CyclomaticComplexityMetric::calc_stmt_Repeat(node) {
+   this->incr_decisions(1);
+   this->calc_stmts(node[1]);
+}
+
+// stmt forin: {iter_vars, expression_list, block}
+function CyclomaticComplexityMetric::calc_stmt_Forin(node) {
+   this->incr_decisions(1);
+   this->calc_stmts(node[3]);
+}
+
+// stmt fornum: {first_var, expression, expression, expression[optional], block}
+function CyclomaticComplexityMetric::calc_stmt_Fornum(node) {
+   this->incr_decisions(1);
+   this->calc_stmts(node[5] || node[4]);
+}
+
+function CyclomaticComplexityMetric::calc_stmt(node) {
+   var f = this["calc_stmt_" .. node.tag];
+   if( f ) {
+      f(this, node);
+   }
+}
+
+function CyclomaticComplexityMetric::calc_stmts(stmts) {
+   for( _, stmt in ipairs(stmts) ) {
+      this->calc_stmt(stmt);
+   }
+}
+
+// Cyclomatic complexity of a function equals to the number of decision points plus 1.
+function CyclomaticComplexityMetric::report(chstate, line) {
+   this.count = 1;
+   this->calc_stmts(line.node[2]);
+   this->calc_items(line.items);
+   warn_cyclomatic_complexity(chstate, line, this.count);
+}
+
+function stage.run(chstate) {
+   var ccmetric = CyclomaticComplexityMetric();
+
+   for( _, line in ipairs(chstate.lines) ) {
+      ccmetric->report(chstate, line);
+   }
+}
+
+return stage;

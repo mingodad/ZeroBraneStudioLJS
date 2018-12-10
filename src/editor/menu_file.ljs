@@ -1,0 +1,263 @@
+// Copyright 2011-16 Paul Kulchenko, ZeroBrane LLC
+// authors: Lomtik Software (J. Winwood & John Labenski)
+// Luxinia Dev (Eike Decker & Christoph Kubisch)
+//-------------------------------------------------------
+
+var ide = ide;
+var frame = ide.frame;
+var menuBar = frame.menuBar;
+var openDocuments = ide.openDocuments;
+
+var filehistorymenu = ide->MakeMenu ({
+  { },
+  { ID_RECENTFILESCLEAR, TR("Clear Items")..KSC(ID_RECENTFILESCLEAR), TR("Clear items from this list") },
+});
+var projecthistorymenu = ide->MakeMenu ({
+  { },
+  { ID_RECENTPROJECTSCLEAR, TR("Clear Items")..KSC(ID_RECENTPROJECTSCLEAR), TR("Clear items from this list") },
+});
+var fileMenu = ide->MakeMenu ({
+  { ID_NEW, TR("&New")..KSC(ID_NEW), TR("Create an empty document") },
+  { ID_OPEN, TR("&Open...")..KSC(ID_OPEN), TR("Open an existing document") },
+  { ID_CLOSE, TR("&Close Page")..KSC(ID_CLOSE), TR("Close the current editor window") },
+  { },
+  { ID_SAVE, TR("&Save")..KSC(ID_SAVE), TR("Save the current document") },
+  { ID_SAVEAS, TR("Save &As...")..KSC(ID_SAVEAS), TR("Save the current document to a file with a new name") },
+  { ID_SAVEALL, TR("Save A&ll")..KSC(ID_SAVEALL), TR("Save all open documents") },
+  { },
+  { ID_RECENTFILES, TR("Recent Files")..KSC(ID_RECENTFILES), TR("File history"), filehistorymenu },
+  { ID_RECENTPROJECTS, TR("Recent Projects")..KSC(ID_RECENTPROJECTS), TR("Project history"), projecthistorymenu },
+  { },
+  { ID_EXIT, TR("E&xit")..KSC(ID_EXIT), TR("Exit program") },
+});
+menuBar->Append(fileMenu, TR("&File"));
+
+{ // recent file history
+  var iscaseinsensitive = wx.wxFileName("A")->SameAs(wx.wxFileName("a"));
+  var function isSameAs(f1, f2) {
+    return f1 == f2 || iscaseinsensitive && f1->lower() == f2->lower();
+  }
+
+  var filehistory = {[0] = 1};
+
+  // add file to the file history removing duplicates
+  var function addFileHistory(filename) {
+    // a new (empty) tab is opened; don't change the history
+    if( ! filename ) { return; }
+
+    var fn = wx.wxFileName(filename);
+    if( fn->Normalize() ) { filename = fn->GetFullPath(); }
+
+    var index = filehistory[0];
+
+    // special case: selecting the current file (or moving through the history)
+    if( filehistory[index] && isSameAs(filename, filehistory[index].filename) ) { return; }
+
+    // something else is selected
+    // (1) flip the history from 1 to the current index
+    for( i = 1, math.floor(index/2) ) {
+      filehistory[i], filehistory[index-i+1] = filehistory[index-i+1], filehistory[i];
+    }
+
+    // (2) if the file is in the history, remove it
+    for( i = #filehistory, 1, -1 ) {
+      if( isSameAs(filename, filehistory[i].filename) ) {
+        table.remove(filehistory, i);
+      }
+    }
+
+    // (3) add the file to the top and update the index
+    table.insert(filehistory, 1, {filename=filename});
+    filehistory[0] = 1;
+
+    // (4) remove all entries that are no longer needed
+    while( #filehistory>ide.config.filehistorylength ) { table.remove(filehistory); }
+  }
+
+  var function remFileHistory(filename) {
+    if( ! filename ) { return; }
+
+    var fn = wx.wxFileName(filename);
+    if( fn->Normalize() ) { filename = fn->GetFullPath(); }
+
+    var index = filehistory[0];
+
+    // special case: removing the current file
+    if( filehistory[index] && isSameAs(filename, filehistory[index].filename) ) {
+      // (1) flip the history from 1 to the current index
+      for( i = 1, math.floor(index/2) ) {
+        filehistory[i], filehistory[index-i+1] = filehistory[index-i+1], filehistory[i];
+      }
+    }
+
+    // (2) if the file is in the history, remove it
+    for( i = #filehistory, 1, -1 ) {
+      if( isSameAs(filename, filehistory[i].filename) ) {
+        table.remove(filehistory, i);
+      }
+    }
+
+    // (3) update index
+    filehistory[0] = 1;
+  }
+
+  var updateRecentFiles; // need forward declaration because of recursive refs
+
+  var function loadRecent(event) {
+    var id = event->GetId();
+    var item = filehistorymenu->FindItem(id);
+    var filename = item->GetLabel();
+    var index = filehistory[0];
+    filehistory[0] = (
+      (index > 1 && id == ID("file.recentfiles."..(index-1)) && index-1) ||
+      (index < #filehistory) && id == ID("file.recentfiles."..(index+1)) && index+1 ||
+      1);
+    if( ! LoadFile(filename, null, true) ) {
+      wx.wxMessageBox(
+        TR("File '%s' no longer exists.")->format(filename),
+        ide->GetProperty("editormessage"),
+        wx.wxOK + wx.wxCENTRE, ide.frame);
+      remFileHistory(filename);
+      updateRecentFiles(filehistory);
+    }
+  }
+
+  var items = 0;
+  updateRecentFiles = function (list) {
+    // protect against recent files menu not being present
+    if( ! ide->FindMenuItem(ID_RECENTFILES) ) { return; }
+
+    for( i=1, #list ) {
+      var file = list[i].filename;
+      var id = ID("file.recentfiles."..i);
+      var label = file..(
+        i == list[0]-1 && KSC(ID_RECENTFILESNEXT) ||
+        i == list[0]+1 && KSC(ID_RECENTFILESPREV) ||
+        "");
+      if( i <= items ) { // this is an existing item; update the label
+        filehistorymenu->FindItem(id)->SetItemLabel(label);
+      } else { // need to add an item
+        var item = wx.wxMenuItem(filehistorymenu, id, label, "");
+        filehistorymenu->Insert(i-1, item);
+        frame->Connect(id, wx.wxEVT_COMMAND_MENU_SELECTED, loadRecent);
+      }
+    }
+    for( i=items, #list+1, -1 ) { // delete the rest if the list got shorter
+      filehistorymenu->Delete(filehistorymenu->FindItemByPosition(i-1));
+    }
+    items = #list; // update the number of items for the next refresh
+
+    // enable if there are any recent files
+    fileMenu->Enable(ID_RECENTFILES, #list > 0);
+  };
+
+  // public methods
+  function GetFileHistory() { return filehistory; }
+  function SetFileHistory(fh) {
+    filehistory = fh;
+    filehistory[0] = 1;
+    updateRecentFiles(filehistory);
+  }
+  function AddToFileHistory(filename) {
+    addFileHistory(filename);
+    updateRecentFiles(filehistory);
+  }
+
+  function FileRecentListUpdate(menu) {
+    var list = filehistory;
+    for( i=#list, 1, -1 ) {
+      var id = ID("file.recentfiles."..i);
+      var label = list[i].filename;
+      var item = wx.wxMenuItem(menu, id, label, "");
+      menu->Insert(0, item);
+      ide.frame->Connect(id, wx.wxEVT_COMMAND_MENU_SELECTED, loadRecent);
+    }
+  }
+}
+
+frame->Connect(ID_NEW, wx.wxEVT_COMMAND_MENU_SELECTED, function() { return NewFile(); });
+frame->Connect(ID_OPEN, wx.wxEVT_COMMAND_MENU_SELECTED, OpenFile);
+frame->Connect(ID_SAVE, wx.wxEVT_COMMAND_MENU_SELECTED,
+  function () {
+    var editor = ide.findReplace->CanSave(ide->GetEditorWithFocus()) || ide->GetEditor();
+    var doc = ide->GetDocument(editor);
+    SaveFile(editor, doc && doc->GetFilePath() || null);
+  });
+frame->Connect(ID_SAVE, wx.wxEVT_UPDATE_UI,
+  function (event) {
+    var doc = ide->GetDocument(ide->GetEditor());
+    event->Enable(ide.findReplace->CanSave(ide->GetEditorWithFocus()) && true
+      || doc && (doc->IsModified() || doc->IsNew()) || false);
+  });
+
+frame->Connect(ID_SAVEAS, wx.wxEVT_COMMAND_MENU_SELECTED,
+  function () {
+    SaveFileAs(ide->GetEditor());
+  });
+frame->Connect(ID_SAVEAS, wx.wxEVT_UPDATE_UI,
+  function (event) {
+    event->Enable(ide->GetEditor() != null);
+  });
+
+frame->Connect(ID_SAVEALL, wx.wxEVT_COMMAND_MENU_SELECTED,
+  function (event) {
+    SaveAll();
+  });
+frame->Connect(ID_SAVEALL, wx.wxEVT_UPDATE_UI,
+  function (event) {
+    var atLeastOneModifiedDocument = false;
+    for( _, document in pairs(openDocuments) ) {
+      if( document->IsModified() || document->IsNew() ) {
+        atLeastOneModifiedDocument = true;
+        break;
+      }
+    }
+    event->Enable(atLeastOneModifiedDocument);
+  });
+
+frame->Connect(ID_CLOSE, wx.wxEVT_COMMAND_MENU_SELECTED,
+  function (event) {
+    var editor = ide->GetEditorWithFocus();
+    var nb = ide->GetOutputNotebook();
+    var index = editor && nb->GetPageIndex(editor);
+    if( index && ide.findReplace->IsPreview(editor) && index >= 0 ) {
+      nb->DeletePage(index); // close preview tab
+    } else {
+      ClosePage(); // this will find the current editor tab
+    }
+  });
+frame->Connect(ID_CLOSE, wx.wxEVT_UPDATE_UI,
+  function (event) {
+    event->Enable(ide.findReplace->IsPreview(ide->GetEditorWithFocus()) || ide->GetEditor() != null);
+  });
+
+frame->Connect(ID_EXIT, wx.wxEVT_COMMAND_MENU_SELECTED,
+  function (event) {
+    frame->Close(); // this will trigger wxEVT_CLOSE_WINDOW
+  });
+
+frame->Connect(ID_RESTART, wx.wxEVT_COMMAND_MENU_SELECTED,
+  function (event) { ide->Restart(true); });
+
+frame->Connect(ID_RECENTPROJECTSCLEAR, wx.wxEVT_COMMAND_MENU_SELECTED,
+  function (event) { FileTreeProjectListClear(); });
+
+frame->Connect(ID_RECENTFILESCLEAR, wx.wxEVT_COMMAND_MENU_SELECTED,
+  function (event) {
+    SetFileHistory({});
+    var ed = ide->GetEditor();
+    if( ed ) { AddToFileHistory(ide->GetDocument(ed)->GetFilePath()); }
+  });
+
+var recentprojects = 0;
+frame->Connect(ID_RECENTPROJECTS, wx.wxEVT_UPDATE_UI,
+  function (event) {
+    recentprojects = FileTreeProjectListUpdate(projecthistorymenu, recentprojects);
+    if( ! recentprojects ) { return; }
+    var pos = 1; // add shortcut for the previous project (if any)
+    if( recentprojects > pos ) {
+      var item = projecthistorymenu->FindItemByPosition(pos);
+      item->SetItemLabel(item->GetItemLabelText()..KSC(ID_RECENTPROJECTSPREV));
+    }
+    event->Enable(recentprojects > 0);
+  });

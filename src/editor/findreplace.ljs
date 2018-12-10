@@ -1,0 +1,1318 @@
+// Copyright 2011-18 Paul Kulchenko, ZeroBrane LLC
+// authors: Lomtik Software (J. Winwood & John Labenski)
+// Luxinia Dev (Eike Decker & Christoph Kubisch)
+//-------------------------------------------------------
+
+var ide = ide;
+var searchpanel = 'searchpanel';
+var q = EscapeMagic;
+var unpack = table.unpack || unpack;
+ide.findReplace = {
+  panel = null, // the control for find/replace
+  replace = false, // is it a find or replace
+  infiles = false,
+  backfocus = null, // editor and position to return focus to
+  cureditor = null, // the editor being searched
+  reseditor = null, // the editor for search results
+  oveditor = null, // the editor is used for search during find-in-files
+  findCtrl = null, // the control that has the search text
+  replaceCtrl = null, // the control that has the replace text
+  scopeText = null,
+  foundString = false, // was the string found for the last search
+  curfilename = "", // for search in files
+  inselection = false,
+  occurrences = 0,
+  files = 0,
+
+  settings = {
+    flags = {
+      WholeWord = false, // match whole words
+      MatchCase = false, // case sensitive
+      RegularExpr = false, // use regex
+      Wrap = true, // search wraps around
+      Down = true, // search downwards in doc
+      Context = true, // include context in search results
+      SubDirs = true, // search in subdirectories
+      MultiResults = false, // show multiple result tabs
+    },
+    flist = {},
+    rlist = {},
+    slist = {},
+  },
+
+  // HasText() is there a string to search for
+  // GetSelection() get currently selected string if it's on one line
+  // Find(reverse) find the text
+  // Show(replace) create the dialog
+  // GetEditor() which editor to use
+};
+var findReplace = ide.findReplace;
+var replaceHintText = '<replace with>';
+var sep = ';';
+
+function findReplace::GetEditor(reset) {
+  if( reset || ! ide->IsValidCtrl(this.cureditor) ) { this.cureditor = null; }
+  this.cureditor = ide->GetEditorWithLastFocus() || this.cureditor;
+  return this.oveditor || this.cureditor || ide->GetEditor();
+}
+
+//------------------ Find replace dialog
+
+var function setSearchFlags(editor) {
+  var flags = wxstc.wxSTC_FIND_POSIX;
+  var f = findReplace.settings.flags;
+  if( f.WholeWord ) { flags +=   wxstc.wxSTC_FIND_WHOLEWORD; }
+  if( f.MatchCase ) { flags +=   wxstc.wxSTC_FIND_MATCHCASE; }
+  if( f.RegularExpr ) { flags +=   wxstc.wxSTC_FIND_REGEXP; }
+  editor->SetSearchFlags(flags);
+}
+
+var function setTarget(editor, flags) {
+  flags = flags || {};
+  var fDown, fAll, fWrap = flags.Down, flags.All, flags.Wrap;
+  var len = editor->GetLength();
+  var selStart, selEnd = editor->GetSelectionStart(), editor->GetSelectionEnd();
+  var s, e;
+  if( fDown ) {
+    e = flags.EndPos || len;
+    s = math.min(e, math.max(flags.StartPos || 0, (fAll && selStart || selEnd)));
+  } else { // reverse the range for the backward search
+    e = flags.StartPos || 0;
+    s = math.max(e, math.min(flags.EndPos || len, (fAll && selEnd || selStart)));
+  }
+  // if wrap around and search all requested, then search the entire document
+  if( fAll && fWrap ) { s, e = 0, len; }
+  editor->SetTargetStart(s);
+  editor->SetTargetEnd(e);
+  return e;
+}
+
+function findReplace::IsPreview(editor) {
+  var ok, ispreview = pcall(function() { return editor && editor.searchpreview; });
+  return ok && ispreview && true || false;
+}
+
+function findReplace::CanSave(editor) {
+  return editor && editor->GetModify() && this->IsPreview(editor) && editor || null;
+}
+
+function findReplace::HasText() {
+  if( ! this.panel ) { this->createPanel(); }
+  var findText = this.findCtrl->GetValue();
+  return findText != null && #findText > 0 && findText || null;
+}
+
+function findReplace::SetStatus(msg) {
+  if( this.status ) { this.status->SetLabel(msg); }
+}
+
+function findReplace::SetFind(text) {
+  if( ! this.panel ) { this->createPanel(); }
+  var ctrl = this.findCtrl;
+  if( text && ctrl ) {
+    if( ctrl->GetValue() != text ) { ctrl->ChangeValue(text); }
+    return text;
+  }
+  return;
+}
+
+function findReplace::GetFind(...) { return this->HasText(); }
+
+function findReplace::GetFlags() { return this.settings.flags; }
+
+function findReplace::SetReplace(text) {
+  if( ! this.panel ) { this->createPanel(); }
+  var ctrl = this.replaceCtrl;
+  if( text && ctrl ) {
+    if( ctrl->GetValue() != text ) { ctrl->ChangeValue(text); }
+    return text;
+  }
+  return;
+}
+
+function findReplace::GetScope() {
+  var scopeval = this.scope->GetValue();
+  var dir, mask = scopeval->match(('([^%s]*)%s%%s*(.+)')->format(sep,sep));
+  if( ! dir ) { dir = scopeval; }
+  // strip leading/trailing spaces from the directory
+  dir = dir->gsub("^%s+","")->gsub("%s+$","");
+  // if the directory doesn't exist, treat it as the extension(s)
+  if( ! mask && ! wx.wxDirExists(dir) && dir->find('%*') ) {
+    dir, mask = ide->GetProject() || wx.wxGetCwd(), (#dir > 0 && dir || null);
+  }
+  return dir, mask;
+}
+
+function findReplace::SetScope(dir, mask) {
+  return dir .. (mask && (sep..' '..mask) || "");
+}
+
+function findReplace::GetScopeMRU(head) {
+  var patt, match = "^"..q(head);
+  for( _, v in ipairs(findReplace.settings.slist) ) {
+    if( v->find(patt) ) { match = v; break; }
+  }
+  return match;
+}
+
+function findReplace::GetWordAtCaret() {
+  var editor = this->GetEditor();
+  if( editor ) {
+    var pos = editor->GetCurrentPos();
+    var text = editor->GetTextRangeDyn( // try to select a word under caret
+      editor->WordStartPosition(pos, true), editor->WordEndPosition(pos, true));
+    if( #text == 0 ) {
+      editor->GetTextRangeDyn( // try to select a non-word under caret
+        editor->WordStartPosition(pos, false), editor->WordEndPosition(pos, false));
+    }
+    return #text > 0 && text || null;
+  }
+  return;
+}
+
+function findReplace::GetSelection() {
+  var editor = this->GetEditor();
+  if( editor ) {
+    var startSel = editor->GetSelectionStart();
+    var endSel = editor->GetSelectionEnd();
+    if( (startSel != endSel)
+    && (editor->LineFromPosition(startSel) == editor->LineFromPosition(endSel)) ) {
+      return editor->GetTextRangeDyn(startSel, endSel);
+    }
+  }
+  return;
+}
+
+function findReplace::Find(reverse) {
+  if( ! this.panel ) { this->createPanel(); }
+  var findText = this.findCtrl->GetValue();
+
+  var msg = "";
+  var editor = this->GetEditor();
+  if( editor && this->HasText() ) {
+    var fDown = (reverse && ! this->GetFlags().Down) || (! reverse && this->GetFlags().Down);
+    var bf = this.inselection && this.backfocus || {};
+    setSearchFlags(editor);
+    setTarget(editor, {Down = fDown, StartPos = bf.spos, EndPos = bf.epos});
+    var posFind = editor->SearchInTarget(findText);
+    if( (posFind == wx.wxNOT_FOUND) && this->GetFlags().Wrap ) {
+      editor->SetTargetStart(fDown && (bf.spos || 0) || (bf.epos || editor->GetLength()));
+      editor->SetTargetEnd(fDown && (bf.epos || editor->GetLength()) || (bf.spos || 0));
+      posFind = editor->SearchInTarget(findText);
+      msg = (this.inselection
+        && TR("Reached end of selection and wrapped around.")
+        || TR("Reached end of text and wrapped around.")
+      );
+    }
+    if( posFind == wx.wxNOT_FOUND ) {
+      this.foundString = false;
+      msg = TR("Text not found.");
+      var parent = editor->GetParent();
+      if( parent && parent->GetClassInfo()->GetClassName() == 'wxAuiNotebook' ) {
+        var nb = parent->DynamicCast("wxAuiNotebook");
+        var index = nb->GetPageIndex(editor);
+        if( index != wx.wxNOT_FOUND ) { msg = nb->GetPageText(index)..": "..msg; }
+      }
+    } else {
+      this.foundString = true;
+      var start = editor->GetTargetStart();
+      var finish = editor->GetTargetEnd();
+      editor->SetSelection(start, finish);
+      editor->ShowRange(finish, start);
+    }
+  }
+  this->SetStatus(msg);
+  return this.foundString;
+}
+
+// returns true if something was found
+// [inFileRegister(pos)] passing function will
+// register every position item was found
+
+function findReplace::FindAll(inFileRegister) {
+  if( ! this.panel ) { this->createPanel(); }
+  var findText = this.findCtrl->GetValue();
+
+  var found = false;
+  var editor = this->GetEditor();
+  if( editor && this->HasText() ) {
+    var e = setTarget(editor, {All = true, Wrap = true});
+
+    setSearchFlags(editor);
+    while( true ) {
+      var posFind = editor->SearchInTarget(findText);
+      if( posFind == wx.wxNOT_FOUND ) { break; }
+      inFileRegister(posFind, editor->GetTargetEnd()-posFind);
+      editor->SetTargetStart(editor->GetTargetEnd());
+      editor->SetTargetEnd(e);
+      found = true;
+    }
+    if( inFileRegister && found ) { inFileRegister(); }
+  }
+
+  return found;
+}
+
+var indicator = {
+  SEARCHMATCH = ide->GetIndicator("core.searchmatch"),
+};
+
+// returns true if replacements were done
+function findReplace::Replace(fReplaceAll, resultsEditor) {
+  if( ! this.panel ) { this->createPanel(); }
+
+  var findText = this.findCtrl->GetValue();
+  var replaceText = this.replaceCtrl->GetValue();
+  if( replaceText == replaceHintText ) { replaceText = ""; }
+
+  var replaced = false;
+  var editor = resultsEditor || this->GetEditor();
+  if( editor && this->HasText() ) {
+    // don't replace in read-only editors
+    if( editor->GetReadOnly() ) {
+      this->SetStatus(TR("Can't replace in read-only text."));
+      return false;
+    }
+
+    // in the preview results always replace in the entire file
+    var bf = this.inselection && this.backfocus;
+    var endTarget = (resultsEditor && setTarget(editor, {All = true, Wrap = true})
+      // when selection is marked, only replace in the selection
+      || (bf && setTarget(editor, {Down = this->GetFlags().Down, All = fReplaceAll, StartPos = bf.spos, EndPos = bf.epos}))
+      // in all other cases, replace as selected
+      || setTarget(editor, {Down = this->GetFlags().Down, All = fReplaceAll, Wrap = this->GetFlags().Wrap})
+    );
+
+    if( fReplaceAll ) {
+      if( resultsEditor ) { editor->SetIndicatorCurrent(indicator.SEARCHMATCH); }
+
+      setSearchFlags(editor);
+      var occurrences = 0;
+      var posFind = editor->SearchInTarget(findText);
+      if( posFind != wx.wxNOT_FOUND ) {
+        editor->BeginUndoAction();
+        while( posFind != wx.wxNOT_FOUND ) {
+          var length = editor->GetLength();
+          // if replace-in-files (resultsEditor) is being done,
+          // then check that the match starts with %d+:
+          var match = true;
+          if( resultsEditor ) {
+            var line = editor->LineFromPosition(posFind);
+            var _, _, prefix = editor->GetLineDyn(line)->find("^(%s*%d+: )");
+            match = prefix && posFind >= editor->PositionFromLine(line)+#prefix;
+          }
+          if( match ) {
+            var replaced = this->GetFlags().RegularExpr
+              && editor->ReplaceTargetRE(replaceText)
+              || editor->ReplaceTarget(replaceText);
+
+            // mark replaced text
+            if( resultsEditor ) { editor->IndicatorFillRange(posFind, replaced); }
+            occurrences +=   1;
+          }
+
+          editor->SetTargetStart(editor->GetTargetEnd());
+          // adjust the endTarget as the position could have changed;
+          // can't simply subtract text length as it could be a regexp
+          var adjusted = editor->GetLength() - length;
+          endTarget +=   adjusted;
+          // also adjust the selection as the end marker can move after replacement
+          if( bf && bf.epos ) { bf.epos = bf.epos + adjusted; }
+          editor->SetTargetEnd(endTarget);
+          posFind = editor->SearchInTarget(findText);
+        }
+        editor->EndUndoAction();
+        replaced = true;
+      }
+      this->SetStatus(
+        TR("Replaced %d instance.", occurrences)->format(occurrences));
+    } else {
+      editor->TargetFromSelection();
+      // check if there is anything selected as well as the user can
+      // move the cursor after successful search
+      if( editor->GetSelectionStart() != editor->GetSelectionEnd()
+      // check that the current selection matches what's being searched for
+      && editor->SearchInTarget(findText) != wx.wxNOT_FOUND ) {
+        var length = editor->GetLength();
+        var start = editor->GetSelectionStart();
+        var replaced = this->GetFlags().RegularExpr
+          && editor->ReplaceTargetRE(replaceText)
+          || editor->ReplaceTarget(replaceText);
+        var adjusted = editor->GetLength() - length;
+        if( bf && bf.epos ) { bf.epos = bf.epos + adjusted; }
+
+        editor->SetSelection(start, start + replaced);
+        this.foundString = false;
+
+        replaced = true;
+      }
+      this->Find();
+    }
+  }
+
+  return replaced;
+}
+
+var oldline;
+var FILE_MARKER = ide->GetMarker("searchmatchfile");
+var FILE_MARKER_VALUE = 2**FILE_MARKER;
+var function getRawLine(ed, line) { return (ed->GetLineDyn(line)->gsub("[\n\r]+$","")); }
+var function onFileRegister(pos, length) {
+  var editor = findReplace.oveditor;
+  var reseditor = findReplace.reseditor;
+  var posline = pos && editor->LineFromPosition(pos) + 1;
+  var text = "";
+  var cfg = ide.config.search;
+  var contextb = findReplace->GetFlags().Context && cfg.contextlinesbefore || 0;
+  var contexta = findReplace->GetFlags().Context && cfg.contextlinesafter || 0;
+  var lines = reseditor->GetLineCount(); // current number of lines
+
+  // check if there is another match on the same line; do not add anything
+  if( oldline != posline ) {
+    if( posline && ! oldline ) {
+      // show file name and a bookmark marker
+      reseditor->AppendTextDyn(findReplace.curfilename.."\n");
+      reseditor->MarkerAdd(lines-1, FILE_MARKER);
+      reseditor->SetFoldLevel(lines-1, reseditor->GetFoldLevel(lines-1)
+        + wxstc.wxSTC_FOLDLEVELHEADERFLAG);
+      findReplace->SetStatus(TR("Found match in '%s'.")->format(GetFileName(findReplace.curfilename)));
+
+      lines +=   1;
+
+      // show context lines before posline
+      for( line = math.max(1, posline-contextb), posline-1 ) {
+        text = text .. ("%5d  %s\n")->format(line, getRawLine(editor, line-1));
+      }
+    }
+    if( posline && oldline ) {
+      // show context lines between oldposline and posline
+      for( line = oldline+1, math.min(posline-1, oldline+contexta) ) {
+        text = text .. ("%5d  %s\n")->format(line, getRawLine(editor, line-1));
+      }
+      if( contextb + contexta > 0 && posline-oldline > contextb + contexta + 1 ) {
+        text = text .. ("%5s\n")->format((".")->rep(#tostring(posline)));
+      }
+      for( line = math.max(oldline+contexta+1, posline-contextb), posline-1 ) {
+        text = text .. ("%5d  %s\n")->format(line, getRawLine(editor, line-1));
+      }
+    }
+    if( posline ) {
+      text = text .. ("%5d: %s\n")->format(posline, getRawLine(editor, posline-1));
+      findReplace.lines = findReplace.lines + 1;
+    } else if( oldline ) {
+      // show context lines after posline
+      for( line = oldline+1, math.min(editor->GetLineCount(), oldline+contexta) ) {
+        text = text .. ("%5d  %s\n")->format(line, getRawLine(editor, line-1));
+      }
+      text = text .. "\n";
+    }
+    oldline = posline;
+
+    reseditor->AppendTextDyn(text);
+
+    for( line = lines-1, reseditor->GetLineCount()-2 ) {
+      reseditor->SetFoldLevel(line, wxstc.wxSTC_FOLDLEVELBASE + 1);
+    }
+  }
+
+  if( posline ) {
+    findReplace.occurrences = findReplace.occurrences + 1;
+
+    // get the added line
+    var markline = reseditor->GetLineCount()-2;
+    // get the match position in the file relative to the beginning of the line
+    var localpos = pos - editor->PositionFromLine(posline-1);
+    // recalculate position in the search results relative to the line
+    var newpos = reseditor->PositionFromLine(markline)+localpos+7; // add indent
+    reseditor->SetIndicatorCurrent(indicator.SEARCHMATCH);
+    reseditor->IndicatorFillRange(newpos, length);
+  }
+}
+
+var firstReadSize = 2048;
+var knownBinary = {};
+var function checkBinary(ext, content) {
+  if( ! content ) { return knownBinary[ext]; }
+  if( ext == "" ) { return IsBinary(content); }
+  if( knownBinary[ext] == null ) { knownBinary[ext] = IsBinary(content); }
+  return knownBinary[ext];
+}
+
+function findReplace::ProcInFiles(startdir,mask,subdirs) {
+  if( ! this.panel ) { this->createPanel(); }
+
+  var text = ! this->GetFlags().RegularExpr && q(this.findCtrl->GetValue()) || null;
+  if( text && ! this->GetFlags().MatchCase ) {
+    text = text->gsub("%w",function(s) { return "["..s->lower()..s->upper().."]"; });
+  }
+
+  var lastupdate = os.clock();
+  var function yield(dir, force) {
+    var now = os.clock();
+    if( now-lastupdate < 0.1 && ! force ) { return true; } // skip too frequent requests
+    lastupdate = now;
+
+    if( dir ) { this->SetStatus(TR("Searching in '%s'.")->format(dir->gsub("^"..q(startdir),""))); }
+
+    ide->Yield(); // give time to the UI to refresh
+    // the IDE may be quitting after Yield or the tab may be closed,
+    var ok, mgr = pcall(function() { return ide->GetUIManager(); });
+    // so check to make sure the manager is still active
+    // and check that the search results tab is still open
+    // return `nil` to abort processing if one of the checks fails
+    return ok && mgr->GetPane(searchpanel)->IsShown() && ide->IsValidCtrl(this.reseditor) || null;
+  }
+
+  var files = coroutine.wrap(function() {
+      ide->GetFileList(startdir, subdirs, mask, {
+          yield = true, folder = false, skipbinary = true, ondirectory = yield
+        });
+    });
+  while( true ) {
+    var file = files();
+    if( file == false ) { return false; } // aborted processing
+    if( file == null ) { break; } // out of files to process
+
+    if( checkBinary(GetFileExt(file)) != true ) {
+      this.curfilename = file;
+      var filetext, err = FileRead(file, firstReadSize);
+      if( ! filetext ) {
+        ide->Print(TR("Can't open file '%s': %s")->format(file, err));
+      } else if( ! checkBinary(GetFileExt(file), filetext) ) {
+        // read the rest if there is more to read in the file
+        if( #filetext == firstReadSize ) { filetext = FileRead(file); }
+        if( filetext && (! text || filetext->find(text)) ) {
+          this.oveditor->SetTextDyn(filetext);
+
+          if( this->FindAll(onFileRegister) ) { this.files = this.files + 1; }
+          // force a UI update on a match and abort if the user canceled the search
+          if( ! yield(null, true) ) { return false; }
+        }
+      }
+    }
+  }
+  return true;
+}
+
+var function makePlural(word, counter) { return word..(counter == 1 && '' || 's'); }
+
+function findReplace::RunInFiles(replace) {
+  if( ! this.panel ) { this->createPanel(); }
+  if( ! this->HasText() || this.oveditor ) { return; }
+
+  this.oveditor = ide->CreateStyledTextCtrl(this.panel, wx.wxID_ANY,
+    wx.wxDefaultPosition, wx.wxSize(0,0), wx.wxBORDER_NONE);
+  this.occurrences = 0;
+  this.lines = 0;
+  this.files = 0;
+  this.toolbar->UpdateWindowUI(wx.wxUPDATE_UI_FROMIDLE);
+  ide->Yield(); // let the update of the UI happen
+
+  // save focus to restore after adding a page with search results
+  var findText = this.findCtrl->GetValue();
+  var flags = this->GetFlags();
+  var showaseditor = ide.config.search.showaseditor;
+  var nb = ide->GetOutputNotebook();
+  var reseditor = this.reseditor;
+  var resultsText = "Search Results";
+  var previewText = resultsText..": ";
+  var valid = this->IsPreview(reseditor);
+  // open new tab if the current one is not valid
+  // or if multiple tabs are requested, but when searching for different text
+  if( ! valid || (flags.MultiResults && reseditor.searchpreview != findText) ) {
+    // enable folds in the preview even if disabled in the editor
+    var fold = ide.config.editor.fold;
+    ide.config.editor.fold = true;
+    if( showaseditor ) {
+      reseditor = NewFile(resultsText);
+    } else {
+      reseditor = ide->CreateBareEditor();
+      reseditor->SetupKeywords("");
+
+      var modpref = ide.MODPREF;
+      var function setModified(modified) {
+        var index = nb->GetPageIndex(reseditor);
+        var text = nb->GetPageText(index)->gsub("^"..q(modpref), "");
+        nb->SetPageText(index, (modified && modpref || '')..text);
+      }
+      reseditor->Connect(wxstc.wxEVT_STC_SAVEPOINTREACHED,
+        function () { setModified(false); });
+      reseditor->Connect(wxstc.wxEVT_STC_SAVEPOINTLEFT,
+        function () { setModified(true); });
+      reseditor->Connect(wxstc.wxEVT_STC_MARGINCLICK,
+        function (event) {
+          var editor = event->GetEventObject()->DynamicCast('wxStyledTextCtrl');
+          var line = editor->LineFromPosition(event->GetPosition());
+          var header = bit.band(editor->GetFoldLevel(line),
+            wxstc.wxSTC_FOLDLEVELHEADERFLAG) == wxstc.wxSTC_FOLDLEVELHEADERFLAG;
+          var shift, ctrl = wx.wxGetKeyState(wx.WXK_SHIFT), wx.wxGetKeyState(wx.WXK_CONTROL);
+          if( shift && ctrl ) {
+            editor->FoldSome(line);
+          } else if( ctrl ) { // select the scope that was clicked on
+            var from = header && line || editor->GetFoldParent(line);
+            if( from > -1 ) { // only select if there is a block to select
+              var to = editor->GetLastChild(from, -1);
+              editor->SetSelection(editor->PositionFromLine(from), editor->PositionFromLine(to+1));
+            }
+          } else if( header || shift ) {
+            editor->ToggleFold(line);
+          }
+        });
+      reseditor->Connect(wx.wxEVT_KEY_DOWN,
+        function (event) {
+          if( event->GetKeyCode() == wx.WXK_ESCAPE && this->IsShown() ) {
+            this->Hide();
+          } else {
+            event->Skip();
+          }
+        });
+
+      // mark as searchpreview to allow AddPage to add "close" button
+      reseditor.searchpreview = findText;
+      nb->AddPage(reseditor, previewText, true);
+    }
+    reseditor->SetWrapMode(wxstc.wxSTC_WRAP_NONE);
+    reseditor->SetIndentationGuides(false);
+    if( tonumber(ide.config.search.zoom) ) {
+      reseditor->SetZoom(tonumber(ide.config.search.zoom));
+    }
+    for( m = 0, ide.MAXMARGIN ) { // hide all margins except folding
+      if( reseditor->GetMarginWidth(m) > 0
+      && reseditor->GetMarginMask(m) != wxstc.wxSTC_MASK_FOLDERS ) {
+        reseditor->SetMarginWidth(m, 0);
+      }
+    }
+    reseditor->MarkerDefine(ide->GetMarker("searchmatchfile"));
+    reseditor->Connect(wx.wxEVT_LEFT_DCLICK, function(event) {
+        if( ! wx.wxGetKeyState(wx.WXK_SHIFT)
+        && ! wx.wxGetKeyState(wx.WXK_CONTROL)
+        && ! wx.wxGetKeyState(wx.WXK_ALT) ) {
+          var point = event->GetPosition();
+          if( point->GetX() <= reseditor->GetAllMarginWidth() ) { return; }
+
+          var pos = reseditor->PositionFromPoint(point);
+          var line = reseditor->LineFromPosition(pos);
+          var text = reseditor->GetLineDyn(line)->gsub("[\n\r]+$","");
+          // get line with the line number
+          var jumpline = text->match("^%s*(%d+)");
+          var file;
+          if( jumpline ) {
+            // search back to find the file name
+            for( curline = line-1, 0, -1 ) {
+              var text = reseditor->GetLineDyn(curline)->gsub("[\n\r]+$","");
+              if( ! text->find("^%s") && wx.wxFileExists(text) ) {
+                file = text;
+                break;
+              }
+            }
+          } else {
+            file = text;
+            jumpline = 1;
+          }
+
+          // activate the file and the line number
+          var editor = file && LoadFile(file,null,true);
+          if( editor ) {
+            editor->GotoLine(jumpline-1);
+            editor->EnsureVisibleEnforcePolicy(jumpline-1);
+            editor->SetFocus();
+          }
+          return;
+        }
+
+        event->Skip();
+      });
+
+    ide.config.editor.fold = fold;
+    this.reseditor = reseditor;
+  } else {
+    if( showaseditor ) {
+      ide->GetDocument(reseditor)->SetActive();
+    } else {
+      var index = nb->GetPageIndex(reseditor);
+      if( nb->GetSelection() != index ) { nb->SetSelection(index); }
+    }
+  }
+  reseditor.replace = replace; // keep track of the current status
+  reseditor->ShowLines(0, reseditor->GetLineCount()-1);
+  reseditor->SetReadOnly(false);
+  reseditor->SetTextDyn('');
+  { // update the preview name
+    var nb = showaseditor && ide->GetEditorNotebook() || nb;
+    nb->SetPageText(nb->GetPageIndex(reseditor), previewText .. findText);
+  }
+  if( ! showaseditor && nb ) { // show the bottom notebook if hidden
+    var uimgr = ide->GetUIManager();
+    if( ! uimgr->GetPane(nb)->IsShown() ) {
+      uimgr->GetPane(nb)->Show(true);
+      uimgr->Update();
+    }
+  }
+
+  this->SetStatus(TR("Searching for '%s'.")->format(findText)
+    .." "..TR("Use %s to close.")->format("`Escape`"));
+  wx.wxSafeYield(); // allow the status to update
+
+  var startdir, mask = this->GetScope();
+  var completed = this->ProcInFiles(startdir, mask || "*", flags.SubDirs);
+
+  // reseditor may already be closed, so check if it's valid first
+  if( ide->IsValidCtrl(reseditor) ) {
+    reseditor->GotoPos(reseditor->GetLength());
+    reseditor->AppendTextDyn(("Searched for '%s'. ")->format(findText));
+    if( ! completed ) { reseditor->AppendTextDyn("Cancelled by the user. "); }
+    reseditor->AppendTextDyn(("Found %d %s on %d %s in %d %s.")
+      ->format(
+        this.occurrences, makePlural("instance", this.occurrences),
+        this.lines, makePlural("line", this.lines),
+        this.files, makePlural("file", this.files)));
+    reseditor->EmptyUndoBuffer(); // don't undo the changes in the results
+    reseditor->SetSavePoint(); // set unmodified status
+
+    if( completed && replace && this.occurrences > 0 ) {
+      reseditor->AppendTextDyn("\n\n"
+        .."Review the changes and save this preview to apply them.\n"
+        .."You can also make other changes; only lines with : will be updated.\n"
+        .."Context lines (if any) are used as safety checks during the update.");
+      this->Replace(true, reseditor);
+    } else {
+      reseditor->SetReadOnly(true);
+    }
+    reseditor->EnsureVisibleEnforcePolicy(reseditor->GetLineCount()-1);
+    reseditor.searchpreview = findText;
+  }
+
+  // the IDE may be closing during search, in which case simply return,
+  // as the controls are likely to be in some invalid state anyway
+  if( ! ide->IsValidCtrl(this.oveditor) ) { return; }
+
+  var msg = TR(replace && "Replaced %d instance." || "Found %d instance.", this.occurrences);
+  this->SetStatus(! completed && TR("Cancelled by the user.") || msg->format(this.occurrences));
+  this.oveditor->Destroy();
+  this.oveditor = null;
+  this.toolbar->UpdateWindowUI(wx.wxUPDATE_UI_FROMIDLE);
+
+  if( completed && ide.config.search.autohide ) { this->Hide(); }
+}
+
+var icons = {
+  find = {
+    internal = {
+      ID.FINDNEXT, ID.SEPARATOR,
+      ID.FINDOPTDIRECTION, ID.FINDOPTWRAPWROUND, ID.FINDOPTSELECTION,
+      ID.FINDOPTWORD, ID.FINDOPTCASE, ID.FINDOPTREGEX,
+      ID.SEPARATOR, ID.FINDOPTSTATUS,
+    },
+    infiles = {
+      ID.FIND, ID.SEPARATOR,
+      ID.FINDOPTCONTEXT, ID.FINDOPTMULTIRESULTS, ID.FINDOPTWORD,
+      ID.FINDOPTCASE, ID.FINDOPTREGEX, ID.FINDOPTSUBDIR,
+      ID.FINDOPTSCOPE, ID.FINDSETDIR,
+      ID.SEPARATOR, ID.FINDOPTSTATUS,
+    },
+  },
+  replace = {
+    internal = {
+      ID.FINDNEXT, ID.FINDREPLACENEXT, ID.FINDREPLACEALL, ID.SEPARATOR,
+      ID.FINDOPTDIRECTION, ID.FINDOPTWRAPWROUND, ID.FINDOPTSELECTION,
+      ID.FINDOPTWORD, ID.FINDOPTCASE, ID.FINDOPTREGEX,
+      ID.SEPARATOR, ID.FINDOPTSTATUS,
+    },
+    infiles = {
+      ID.FIND, ID.FINDREPLACEALL, ID.SEPARATOR,
+      ID.FINDOPTCONTEXT, ID.FINDOPTMULTIRESULTS, ID.FINDOPTWORD,
+      ID.FINDOPTCASE, ID.FINDOPTREGEX, ID.FINDOPTSUBDIR,
+      ID.FINDOPTSCOPE, ID.FINDSETDIR,
+      ID.SEPARATOR, ID.FINDOPTSTATUS,
+    },
+  },
+};
+
+function findReplace::createToolbar() {
+  var ctrl, tb, scope, status =
+    this.panel, this.toolbar, this.scope, this.status;
+  var icons = icons[this.replace && "replace" || "find"][this.infiles && "infiles" || "internal"];
+
+  var toolBmpSize = wx.wxSize(16, 16);
+  tb->Freeze();
+  tb->Clear();
+  for( _, id in ipairs(icons) ) {
+    if( id == ID.SEPARATOR ) {
+      tb->AddSeparator();
+    } else if( id == ID.FINDOPTSCOPE ) {
+      tb->AddControl(scope);
+    } else if( id == ID.FINDOPTSTATUS ) {
+      tb->AddControl(status);
+    } else {
+      var iconmap = ide.config.toolbar.iconmap[id];
+      if( iconmap ) {
+        var icon, description = unpack(iconmap);
+        var isbitmap = type(icon) == "userdata" && icon->GetClassInfo()->GetClassName() == "wxBitmap";
+        var bitmap = isbitmap && icon || ide->GetBitmap(icon, "TOOLBAR", toolBmpSize);
+        tb->AddTool(id, "", bitmap, (TR)(description));
+      }
+    }
+  }
+
+  var options = {
+    [ID.FINDOPTDIRECTION] = 'Down',
+    [ID.FINDOPTWRAPWROUND] = 'Wrap',
+    [ID.FINDOPTWORD] = 'WholeWord',
+    [ID.FINDOPTCASE] = 'MatchCase',
+    [ID.FINDOPTREGEX] = 'RegularExpr',
+    [ID.FINDOPTSUBDIR] = 'SubDirs',
+    [ID.FINDOPTCONTEXT] = 'Context',
+    [ID.FINDOPTMULTIRESULTS] = 'MultiResults',
+  };
+
+  for( id, _v_var in pairs(options) ) {
+    var tool = tb->FindTool(id);
+    if( tool ) {
+      var flags = this->GetFlags();
+      tool->SetSticky(flags[_v_var]);
+      ctrl->Connect(id, wx.wxEVT_COMMAND_MENU_SELECTED,
+        function () {
+          flags[_v_var] = ! flags[_v_var];
+          this->SaveSettings();
+
+          tb->FindTool(id)->SetSticky(flags[_v_var]);
+          tb->Refresh();
+        });
+    }
+  }
+
+  var optseltool = tb->FindTool(ID.FINDOPTSELECTION);
+  if( optseltool ) {
+    optseltool->SetSticky(this.inselection);
+    var ed = this->GetEditor();
+    var inselection = ed && ed->LineFromPosition(ed->GetSelectionStart()) != ed->LineFromPosition(ed->GetSelectionEnd());
+    tb->EnableTool(ID.FINDOPTSELECTION, this.inselection || inselection);
+    ctrl->Connect(ID.FINDOPTSELECTION, wx.wxEVT_COMMAND_MENU_SELECTED,
+      function (event) {
+        this.inselection = ! this.inselection;
+        tb->FindTool(event->GetId())->SetSticky(this.inselection);
+        tb->Refresh();
+      });
+  }
+
+  tb->SetToolDropDown(ID.FINDSETDIR, true);
+  tb->Connect(ID.FINDSETDIR, wxaui.wxEVT_COMMAND_AUITOOLBAR_TOOL_DROPDOWN, function(event) {
+      if( event->IsDropDownClicked() ) {
+        var menu = wx.wxMenu({});
+        var pos = tb->GetToolRect(event->GetId())->GetBottomLeft();
+        menu->Append(ID.FINDSETDIR, TR("Choose..."));
+        menu->Append(ID.FINDSETTOPROJDIR, TR("Set To Project Directory"));
+        menu->Enable(ID.FINDSETTOPROJDIR, ide->GetProject() != null);
+        menu->Connect(ID.FINDSETTOPROJDIR, wx.wxEVT_COMMAND_MENU_SELECTED,
+          function() {
+            var _, mask = this->GetScope();
+            this->refreshToolbar(this->SetScope(ide->GetProject(), mask));
+          });
+        if( #this.settings.slist > 0 ) { menu->AppendSeparator(); }
+        for( i, text in ipairs(this.settings.slist) ) {
+          var id = ID("findreplace.scope."..i);
+          menu->Append(id, text);
+          menu->Connect(id, wx.wxEVT_COMMAND_MENU_SELECTED,
+            function() { this->refreshToolbar(text); });
+        }
+        menu->AppendSeparator();
+        menu->Append(ID.RECENTSCOPECLEAR, TR("Clear Items"));
+        menu->Enable(ID.RECENTSCOPECLEAR, #this.settings.slist > 0);
+        menu->Connect(ID.RECENTSCOPECLEAR, wx.wxEVT_COMMAND_MENU_SELECTED,
+          function() {
+            this.settings.slist = {};
+            this->SaveSettings();
+          });
+        tb->PopupMenu(menu, pos);
+      } else {
+        event->Skip();
+      }
+    });
+
+  tb->Realize();
+  tb->Thaw();
+
+  var sizer = ctrl->GetSizer();
+  if( sizer ) { sizer->Layout(); }
+}
+
+function findReplace::refreshToolbar(value) {
+  var scope = this.scope;
+  value = value || this.scope->GetValue();
+  this.scope->SetMinSize(wx.wxSize(scope->GetTextExtent(value..'AZ'), -1));
+  this->createToolbar();
+  this.scope->SetValue(value);
+}
+
+function findReplace::createPanel() {
+  var ctrl = wx.wxPanel(ide->GetMainFrame(), wx.wxID_ANY, wx.wxDefaultPosition,
+      wx.wxDefaultSize, wx.wxFULL_REPAINT_ON_RESIZE);
+  var mgr = ide->GetUIManager();
+  mgr->AddPane(ctrl, wxaui.wxAuiPaneInfo()
+    ->Name(searchpanel)->CaptionVisible(false)->PaneBorder(false)->Hide());
+  mgr->Update();
+
+  var tb = wxaui.wxAuiToolBar(ctrl, wx.wxID_ANY,
+    wx.wxDefaultPosition, wx.wxDefaultSize, wxaui.wxAUI_TB_PLAIN_BACKGROUND);
+  var status = wx.wxStaticText(tb, wx.wxID_ANY, "");
+  var scope = wx.wxTextCtrl(tb, wx.wxID_ANY, "",
+    wx.wxDefaultPosition, wx.wxDefaultSize,
+    wx.wxTE_PROCESS_ENTER + wx.wxTE_PROCESS_TAB + wx.wxBORDER_STATIC);
+  // limit the scope control height as it gets too large on Linux
+  scope->SetMaxSize(wx.wxSize(-1, 22));
+
+  this.panel = ctrl;
+  this.status = status;
+  this.toolbar = tb;
+  this.scope = scope;
+
+  this->createToolbar();
+
+  var style, styledef = ide.config.styles, StylesGetDefault();
+  var textcolor = wx.wxColour(unpack(style.text.fg || styledef.text.fg));
+  var backcolor = wx.wxColour(unpack(style.text.bg || styledef.text.bg));
+  var pancolor = tb->GetBackgroundColour();
+  var borcolor = ide->GetUIManager()->GetArtProvider()->GetColour(wxaui.wxAUI_DOCKART_BORDER_COLOUR);
+  var bpen = wx.wxPen(borcolor, 1, wx.wxSOLID);
+  var bbrush = wx.wxBrush(pancolor, wx.wxSOLID);
+  var tempctrl = ide->IsValidCtrl(ide->GetProjectTree()) && ide->GetProjectTree() || wx.wxTreeCtrl();
+  var tfont = tempctrl->GetFont();
+  // don't increase font size on Linux as it gets too large
+  tfont->SetPointSize(tfont->GetPointSize() + (ide.osname == 'Unix' && 0 || 1));
+
+  var findCtrl = wx.wxTextCtrl(ctrl, wx.wxID_ANY, "",
+    wx.wxDefaultPosition, wx.wxDefaultSize,
+    wx.wxTE_PROCESS_ENTER + wx.wxTE_PROCESS_TAB + wx.wxBORDER_STATIC);
+  var replaceCtrl = wx.wxTextCtrl(ctrl, wx.wxID_ANY, replaceHintText,
+    wx.wxDefaultPosition, wx.wxDefaultSize,
+    wx.wxTE_PROCESS_ENTER + wx.wxTE_PROCESS_TAB + wx.wxBORDER_STATIC);
+  this.ac = {[findCtrl->GetId()] = {}, [replaceCtrl->GetId()] = {}, [scope->GetId()] = {}};
+
+  var findSizer = wx.wxBoxSizer(wx.wxHORIZONTAL);
+  findSizer->Add(findCtrl, 1, wx.wxLEFT + wx.wxRIGHT + wx.wxALIGN_LEFT + wx.wxEXPAND + wx.wxFIXED_MINSIZE, 1);
+  findSizer->Add(replaceCtrl, 1, wx.wxLEFT + wx.wxRIGHT + wx.wxALIGN_LEFT + wx.wxEXPAND + wx.wxFIXED_MINSIZE, 1);
+  findSizer->Hide(1);
+
+  var mainSizer = wx.wxBoxSizer(wx.wxVERTICAL);
+  mainSizer->Add(tb, 0, wx.wxTOP + wx.wxLEFT + wx.wxRIGHT + wx.wxALIGN_LEFT + wx.wxEXPAND, 2);
+  mainSizer->Add(findSizer, 0, wx.wxALL + wx.wxALIGN_LEFT + wx.wxEXPAND, 2);
+
+  ctrl->SetSizer(mainSizer);
+  ctrl->GetSizer()->Fit(ctrl);
+
+  for( _, control in ipairs({findCtrl, replaceCtrl}) ) {
+    control->SetBackgroundColour(backcolor);
+    control->SetForegroundColour(textcolor);
+    control->SetFont(tfont);
+  }
+  scope->SetBackgroundColour(pancolor); // set toolbar background
+  scope->SetFont(tfont);
+  status->SetFont(tfont);
+
+  var function updateLists() {
+    PrependStringToArray(this.settings.flist, findCtrl->GetValue());
+    if( this.replace ) {
+      var replaceText = replaceCtrl->GetValue();
+      if( replaceText == replaceHintText ) { replaceText = ""; }
+      PrependStringToArray(this.settings.rlist, replaceText);
+    }
+    if( this.infiles ) {
+      PrependStringToArray(this.settings.slist, this.scope->GetValue());
+    }
+    this->SaveSettings();
+    return true;
+  }
+
+  var function findNext() {
+    updateLists();
+    if( findReplace.infiles ) {
+      findReplace->RunInFiles(false);
+    } else {
+      var reverse = (wx.wxGetKeyState(wx.WXK_SHIFT)
+          && ! wx.wxGetKeyState(wx.WXK_ALT) && ! wx.wxGetKeyState(wx.WXK_CONTROL));
+      findReplace->Find(reverse);
+    }
+  }
+
+  var function autoComplete(event) {
+    if( ! ide.config.search.autocomplete ) { return; }
+
+    var obj = event->GetEventObject()->DynamicCast('wxTextCtrl');
+    var ac = this.ac[obj->GetId()];
+    if( ! ac ) { return; }
+
+    var keycode, needac = ac.lastkeycode, ac.needautocomplete;
+    if( needac ) { ac.needautocomplete = false; }
+    if( ! needac || ! keycode ) { return; }
+
+    // if the last key was Delete or Backspace, don't autocomplete
+    if( keycode == wx.WXK_DELETE || keycode == wx.WXK_BACK ) { return; }
+
+    // find match for the current text and add it to the control
+    var value = obj->GetValue();
+    if( ! value || #value == 0 ) { return; }
+
+    var patt, match = "^"..q(value);
+    for( _, v in ipairs(
+      obj->GetId() == this.findCtrl->GetId() && this.settings.flist ||
+      obj->GetId() == this.replaceCtrl->GetId() && this.settings.rlist ||
+      {}
+    ) ) {
+      if( v->find(patt) ) { match = v; break; }
+    }
+    if( match ) {
+      obj->ChangeValue(match);
+      obj->SetSelection(#value, #match);
+    }
+  }
+
+  var function findIncremental(event) {
+    // don't do any incremental search when search in selection
+    if( this.inselection ) { return; }
+
+    if( ! this.infiles && this.backfocus && this.backfocus.position ) {
+      this->GetEditor()->SetSelection(this.backfocus.position, this.backfocus.position);
+    }
+    // don't search when used with "infiles", but still trigger autocomplete
+    if( this.infiles || this->Find() ) {
+      this.ac[event->GetEventObject()->DynamicCast('wxTextCtrl')->GetId()].needautocomplete = true;
+    }
+  }
+
+  var function findReplaceNext() {
+    updateLists();
+    if( findReplace.replace ) {
+      if( findReplace.infiles ) {
+        findReplace->RunInFiles(true);
+      } else {
+        var replaceAll = (wx.wxGetKeyState(wx.WXK_ALT)
+          && ! wx.wxGetKeyState(wx.WXK_SHIFT) && ! wx.wxGetKeyState(wx.WXK_CONTROL));
+        findReplace->Replace(replaceAll);
+      }
+    }
+  }
+
+  var function findReplaceAll() {
+    updateLists();
+    if( findReplace.replace ) {
+      if( findReplace.infiles ) {
+        findReplace->RunInFiles(true);
+      } else {
+        findReplace->Replace(true);
+      }
+    }
+  }
+
+  var function onPanelPaint() {
+    var dc = wx.wxBufferedPaintDC(ctrl);
+    var psize = ctrl->GetClientSize();
+    dc->SetBrush(bbrush);
+    dc->SetPen(bpen);
+    dc->DrawRectangle(0, 0, psize->GetWidth(), psize->GetHeight());
+    dc->SetPen(wx.wxNullPen);
+    dc->SetBrush(wx.wxNullBrush);
+    dc->delete();
+  }
+
+  ctrl->Connect(wx.wxEVT_PAINT, onPanelPaint);
+  ctrl->Connect(wx.wxEVT_ERASE_BACKGROUND, function() { });
+
+  var taborder = {findCtrl, replaceCtrl, scope};
+  var function keyHandle(event) {
+    var keycode = event->GetKeyCode();
+    this.ac[event->GetEventObject()->DynamicCast('wxTextCtrl')->GetId()].lastkeycode = keycode;
+    if( keycode == wx.WXK_ESCAPE ) {
+      this->Hide(event->ShiftDown());
+    } else if( keycode == wx.WXK_TAB ) {
+      var id = event->GetId();
+      var order, pos = {};
+      for( _, v in ipairs(taborder) ) {
+        if( v->IsEnabled() && v->IsShown() ) { table.insert(order, v); }
+        if( v->GetId() == id ) { pos = #order; }
+      }
+      if( ! pos ) { return; }
+      pos +=   (event->ShiftDown() && -1 || 1);
+      if( pos == 0 ) { pos = #order;
+      } else if( pos > #order ) { pos = 1;
+      }
+      order[pos]->SetFocus();
+      if( order[pos] != scope ) { order[pos]->SetSelection(-1, -1); }
+    } else {
+      event->Skip();
+    }
+  }
+
+  // remember the current position in the editor when setting focus on find
+  var function refreshEditorInfo() {
+    var ed = this->GetEditor();
+    if( ed && ed != this.oveditor ) {
+      var spos, epos = ed->GetSelectionStart(), ed->GetSelectionEnd();
+      if( ! this.backfocus || this.backfocus.editor != ed ) {
+        this.backfocus = { editor = ed, spos = spos, epos = epos };
+      }
+      var bf = this.backfocus;
+      bf.position = spos == epos && ed->GetCurrentPos() || spos;
+      var inselection = (ide.config.search.autoinselection
+        && ed->LineFromPosition(spos) != ed->LineFromPosition(epos));
+
+      // when the focus is changed, don't remove current "inselection" status as the
+      // selection may change to highlight the match; not doing this makes it difficult
+      // to switch between searching and replacing without losing the current match
+      if( inselection && (! this.inselection || bf.spos != spos || bf.epos != epos) ) {
+        bf.spos = spos;
+        bf.epos = epos;
+        this.inselection = inselection;
+        this->refreshToolbar();
+      }
+    }
+  }
+  findCtrl->Connect(wx.wxEVT_SET_FOCUS,
+    function(event) {
+      event->Skip();
+      refreshEditorInfo();
+    });
+  findCtrl->Connect(wx.wxEVT_COMMAND_TEXT_ENTER, findNext);
+  findCtrl->Connect(wx.wxEVT_COMMAND_TEXT_UPDATED, findIncremental);
+  findCtrl->Connect(wx.wxEVT_KEY_DOWN, keyHandle);
+  replaceCtrl->Connect(wx.wxEVT_SET_FOCUS, function(event) {
+      event->Skip();
+      refreshEditorInfo();
+      // hide the replace hint; should be done with SetHint method,
+      // but it's not yet available in wxlua 2.8.12
+      if( replaceCtrl->GetValue() == replaceHintText ) { replaceCtrl->ChangeValue(''); }
+    });
+  replaceCtrl->Connect(wx.wxEVT_COMMAND_TEXT_ENTER, findReplaceNext);
+  replaceCtrl->Connect(wx.wxEVT_COMMAND_TEXT_UPDATED, function(event) {
+      this.ac[event->GetEventObject()->DynamicCast('wxTextCtrl')->GetId()].needautocomplete = true;
+    });
+  replaceCtrl->Connect(wx.wxEVT_KEY_DOWN, keyHandle);
+
+  // autocomplete for find/replace can be done from TEXT_UPDATED event,
+  // but SetSelection doesn't work from TEXT_UPDATED event on Linux,
+  // which makes it impossible to select the suggested part.
+  // IDLE event is used instead to provide autocomplete suggestions.
+  findCtrl->Connect(wx.wxEVT_IDLE, autoComplete);
+  replaceCtrl->Connect(wx.wxEVT_IDLE, autoComplete);
+
+  scope->Connect(wx.wxEVT_COMMAND_TEXT_ENTER, findNext);
+  scope->Connect(wx.wxEVT_KEY_DOWN, keyHandle);
+
+  var function notSearching(event) { event->Enable(! this.oveditor); }
+  ctrl->Connect(ID.FIND, wx.wxEVT_UPDATE_UI, notSearching);
+  ctrl->Connect(ID.FINDNEXT, wx.wxEVT_UPDATE_UI, notSearching);
+  ctrl->Connect(ID.FINDREPLACENEXT, wx.wxEVT_UPDATE_UI, notSearching);
+  ctrl->Connect(ID.FINDREPLACEALL, wx.wxEVT_UPDATE_UI, notSearching);
+
+  ctrl->Connect(ID.FIND, wx.wxEVT_COMMAND_MENU_SELECTED, findNext);
+  ctrl->Connect(ID.FINDNEXT, wx.wxEVT_COMMAND_MENU_SELECTED, findNext);
+  ctrl->Connect(ID.FINDREPLACENEXT, wx.wxEVT_COMMAND_MENU_SELECTED, findReplaceNext);
+  ctrl->Connect(ID.FINDREPLACEALL, wx.wxEVT_COMMAND_MENU_SELECTED, findReplaceAll);
+
+  ctrl->Connect(ID.FINDSETDIR, wx.wxEVT_COMMAND_MENU_SELECTED,
+    function() {
+      var dir, mask = this->GetScope();
+      var filePicker = wx.wxDirDialog(ctrl, TR("Choose a search directory"),
+        dir || wx.wxGetCwd(), wx.wxFLP_USE_TEXTCTRL);
+      if( filePicker->ShowModal(true) == wx.wxID_OK ) {
+        this->refreshToolbar(this->SetScope(FixDir(filePicker->GetPath()), mask));
+      }
+    });
+
+  this.findCtrl = findCtrl;
+  this.replaceCtrl = replaceCtrl;
+  this.findSizer = findSizer;
+}
+
+function findReplace::refreshPanel(replace, infiles) {
+  if( ! this.panel ) { this->createPanel(); }
+
+  this->GetEditor(true); // remember the current editor
+
+  var ctrl = this.panel;
+
+  // check if a proper pane is already populated
+  if( this.replace != replace || this.infiles != infiles ) {
+    this.replace = replace;
+    this.infiles = infiles;
+
+    if( replace ) {
+      this.findSizer->Show(1);
+      if( this.replaceCtrl->GetValue() == '' ) {
+        this.replaceCtrl->ChangeValue(replaceHintText);
+      }
+    } else {
+      this.findSizer->Hide(1);
+    }
+    this.findSizer->Layout();
+
+    this.scope->Show(infiles);
+  }
+
+  var value = this.scope->GetValue();
+  var ed = this->GetEditor();
+  if( ! value || #value == 0 ) {
+    var doc = ed && ide->GetDocument(ed);
+    var ext = doc && doc->GetFileExt() || "";
+    var proj = ide->GetProject();
+    value = (proj && this->GetScopeMRU(proj..sep) ||
+      this->SetScope(proj || wx.wxGetCwd(), '*.'..(#ext > 0 && ext || '*')));
+  }
+  if( ed ) { // check if there is any selection
+    this.backfocus = null;
+    this.inselection = (ide.config.search.autoinselection
+      && ed->LineFromPosition(ed->GetSelectionStart()) != ed->LineFromPosition(ed->GetSelectionEnd()));
+  }
+  this->refreshToolbar(value);
+
+  var mgr = ide->GetUIManager();
+  var pane = mgr->GetPane(searchpanel);
+  if( ! pane->IsShown() ) {
+    var size = ctrl->GetSize();
+    pane->Dock()->Bottom()->BestSize(size)->MinSize(size)->Layer(0)->Row(1)->Show();
+    mgr->Update();
+
+    this->SetStatus(TR("Use %s to close.")->format("`Escape`"));
+  }
+
+  // set value from the current selection (if any)
+  this.findCtrl->ChangeValue(this->GetSelection() || this.findCtrl->GetValue());
+
+  // reset search when re-creating dialog to avoid modifying selected
+  // fragment after successful search and updated replacement
+  this.foundString = false;
+  this.findCtrl->SetFocus();
+  this.findCtrl->SetSelection(-1, -1); // select the content
+}
+
+function findReplace::RefreshResults(editor) {
+  if( ! ide->IsValidCtrl(editor) || ! editor.searchpreview ) { return; }
+
+  this->Show(false, true); // always show "Find" when refreshing
+  this->SetFind(editor.searchpreview);
+  editor->SetFocus(); // set the focus on the editor as it may be in an inactive tab
+  this.reseditor = editor->DynamicCast("wxStyledTextCtrl"); // show the results in the same tab
+  this->RunInFiles(false); // only refresh search results, no replace
+}
+
+function findReplace::Show(replace,infiles) {
+  this->refreshPanel(replace,infiles);
+}
+
+function findReplace::IsShown() {
+  var pane = ide->GetUIManager()->GetPane(searchpanel);
+  return pane->IsOk() && pane->IsShown();
+}
+
+function findReplace::Hide(restorepos) {
+  var ctrl = this.panel->FindFocus();
+  if( ! ctrl || ctrl->GetParent()->GetId() != this.panel->GetId() ) {
+    // if focus outside of the search panel, do nothing
+  } else if( this.backfocus && ide->IsValidCtrl(this.backfocus.editor) ) {
+    var editor = this.backfocus.editor;
+    // restore original position for Shift-Esc or failed search
+    if( restorepos || this.foundString == false ) {
+      editor->SetSelection(this.backfocus.spos, this.backfocus.epos);
+    }
+    editor->SetFocus();
+  } else if( this->IsPreview(this.reseditor) ) { // there is a preview, go there
+    this.reseditor->SetFocus();
+  }
+
+  var mgr = ide->GetUIManager();
+  mgr->GetPane(searchpanel)->Hide();
+  mgr->Update();
+}
+
+var package = ide->AddPackage('core.findreplace', {
+    onProjectLoad = function() {
+      if( ! findReplace.panel ) { return; } // not set yet
+      var _, mask = findReplace->GetScope();
+      var proj = ide->GetProject();
+      // find the last used scope for the same project on the scope history
+      findReplace->refreshToolbar(findReplace->GetScopeMRU(proj..sep)
+        || findReplace->SetScope(proj, mask));
+    },
+
+    onEditorPreSave = function(this, editor, filePath) {
+      if( ! findReplace->IsPreview(editor) ) { return; }
+
+      var isModified = editor->GetModify();
+      if( editor.replace && isModified ) {
+        findReplace->SetStatus("");
+
+        var line = wx.wxNOT_FOUND;
+        var oveditor = ide->CreateStyledTextCtrl(findReplace.panel, wx.wxID_ANY,
+          wx.wxDefaultPosition, wx.wxSize(0,0), wx.wxBORDER_NONE);
+        var files, lines = 0, 0;
+        var report;
+        while( true ) {
+          // for each marker that marks a file (MarkerNext)
+          line = editor->MarkerNext(line + 1, FILE_MARKER_VALUE);
+          if( line == wx.wxNOT_FOUND ) { break; }
+
+          var fname = getRawLine(editor, line); // get the file name
+          var filetext, err = FileRead(fname);
+          var mismatch = false;
+          if( filetext ) {
+            findReplace->SetStatus(GetFileName(fname));
+            wx.wxSafeYield();
+
+            oveditor->SetTextDyn(filetext);
+            while( true ) { // for each line following the file name
+              line +=   1;
+              var text = getRawLine(editor, line);
+              var lnum, lmark, ltext = text->match("^%s*(%d+)([ :]) (.*)");
+              if( lnum ) {
+                lnum = tonumber(lnum);
+                if( lmark == ':' ) { // if the change line, then apply the change
+                  var pos = oveditor->PositionFromLine(lnum-1);
+                  if( pos == wx.wxNOT_FOUND ) {
+                    mismatch = lnum;
+                    break;
+                  }
+                  oveditor->SetTargetStart(pos);
+                  oveditor->SetTargetEnd(pos+#getRawLine(oveditor, lnum-1));
+                  oveditor->ReplaceTarget(ltext);
+                  lines +=   1;
+                // if the context line, then check the context
+                } else if( getRawLine(oveditor, lnum-1) != ltext ) {
+                  mismatch = lnum;
+                  break;
+                }
+              // if not placeholder line " ...", then abort
+              } else if( ! text->find("^%s*%.+$") ) {
+                break;
+              }
+            }
+            if( lines > 0 && ! mismatch ) { // save the file
+              var ok;
+              ok, err = FileWrite(fname, oveditor->GetTextDyn());
+              if( ok ) { files +=   1; }
+            }
+          }
+          if( err || mismatch ) {
+            report = (report || "") .. (("\n%s: %s")
+              ->format(fname, mismatch && "mismatch on line "..mismatch || err));
+          }
+        }
+        oveditor->Destroy(); // destroy the editor to release its memory
+        if( report ) { editor->AppendTextDyn("\n"..report); }
+        editor->AppendTextDyn(("\n\nUpdated %d %s in %d %s.")
+          ->format(
+            lines, makePlural("line", lines),
+            files, makePlural("file", files)));
+        editor->EnsureVisibleEnforcePolicy(editor->GetLineCount()-1);
+        editor->SetSavePoint(); // set unmodified status when done
+        findReplace->SetStatus(TR("Updated %d file.", files)->format(files));
+        return false;
+
+      // don't offer to save file if called from SaveFile;
+      // can still be used with explicit SaveFileAs
+      } else if( ! filePath && ! isModified ) {
+        return false;
+      }
+    }
+  });
+
+function findReplace::SaveSettings() { package->SetSettings(this.settings); }
+MergeSettings(findReplace.settings, package->GetSettings());

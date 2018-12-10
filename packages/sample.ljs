@@ -1,0 +1,158 @@
+var id = ID("sample.samplemenu");
+
+var P = {
+  name = "Sample plugin",
+  description = "Sample plugin to demonstrate various event types.",
+  author = "Paul Kulchenko",
+};
+
+// Events that are marked with "return false" can return `false` to
+// abort further processing.
+// For `onEditorPreSave` event it means that file saving will be aborted.
+// For `onEditorPreClose` event it means that closing an editor tab will be aborted.
+// For `onEditorKeyDown` event it means that the key will be "eaten".
+// For `onEditorAction` event it means that the action will not be executed.
+// For `onFiletreeActivate` event it means that no further processing is done.
+// For `onEditorCharAdded` event it means that no further processing is done
+// (but the character is still added to the editor).
+// line numbers are 1-based in callbacks
+
+var events = {
+  onRegister =         function(this) { },
+  onUnRegister =       function(this) { },
+  onEditorLoad =       function(this, editor) { },
+  onEditorPreClose =   function(this, editor) { }, // return false
+  onEditorClose =      function(this, editor) { },
+  onEditorNew =        function(this, editor) { },
+  onEditorPreSave =    function(this, editor, filepath) { }, // return false
+  onEditorSave =       function(this, editor) { },
+  onEditorFocusLost =  function(this, editor) { },
+  onEditorFocusSet =   function(this, editor) { },
+  onEditorAction =     function(this, editor, event) { }, // return false
+  onEditorKeyDown =    function(this, editor, event) { }, // return false
+  onEditorCharAdded =  function(this, editor, event) { }, // return false
+  onEditorUserlistSelection = function(this, editor, event) { }, // return false
+  onEditorMarkerUpdate = function(this, editor, marker, line, value) { }, // return false
+  onEditorUpdateUI =   function(this, editor, event) { },
+  onEditorPainted =    function(this, editor, event) { },
+  onEditorCallTip =    function(this, editor, tip, value, eval) { }, // return false
+  onFiletreeActivate = function(this, tree, event, item) { }, // return false
+  onFiletreePreExpand = function(this, tree, event, item) { }, // return false
+  onFiletreeExpand =   function(this, tree, event, item) { },
+  onFiletreePreCollapse = function(this, tree, event, item) { }, // return false
+  onFiletreeCollapse = function(this, tree, event, item) { },
+  onFiletreeLDown =    function(this, tree, event, item) { },
+  onFiletreeRDown =    function(this, tree, event, item) { },
+  onFiletreeFileAdd =  function(this, tree, item, filepath) { },
+  onFiletreeFileRemove = function(this, tree, item, filepath) { },
+  onFiletreeFileRefresh = function(this, tree, item, filepath) { },
+  onFiletreeFilePreRename = function(this, tree, item, filepath, target) { }, // return false
+  onFiletreeFileRename = function(this, tree, item, filepath, target) { },
+  onFiletreeFilePreDelete = function(this, tree, item, filepath) { }, // return false
+  onFiletreeFileDelete = function(this, tree, item, filepath) { },
+  onMenuEditor =       function(this, menu, editor, event) { },
+  onMenuEditorTab =    function(this, menu, notebook, event, index) { },
+  onMenuOutput =       function(this, menu, editor, event) { },
+  onMenuOutputTab =    function(this, menu, notebook, event, index) { },
+  onMenuConsole =      function(this, menu, editor, event) { },
+  onMenuFiletree =     function(this, menu, tree, event) { },
+  onMenuOutline =      function(this, menu, tree, event) { },
+  onMenuWatch =        function(this, menu, tree, event) { },
+  onProjectPreLoad =   function(this, project) { }, // before project is changed
+  onProjectLoad =      function(this, project) { }, // after project is changed
+  onProjectClose =     function(this, project) { },
+  onInterpreterLoad =  function(this, interpreter) { },
+  onInterpreterClose = function(this, interpreter) { },
+  onDebuggerPreLoad =  function(this, debugger, options) { }, // return false
+  onDebuggerLoad =     function(this, debugger, options) { },
+  onDebuggerPreClose = function(this, debugger) { }, // return false
+  onDebuggerClose =    function(this, debugger) { },
+  onDebuggerPreActivate = function(this, debugger, file, line) { }, // return false
+  onDebuggerActivate = function(this, debugger, file, line, editor) { },
+  onDebuggerStatusUpdate = function(this, debugger, status) { }, // return false
+  onDebuggerCommand =  function(this, debugger, command, server, options) { },
+  onIdle =             function(this, event) { },
+  onIdleOnce =         function(this, event) { },
+  onAppFocusLost =     function(this, app) { },
+  onAppFocusSet =      function(this, app) { },
+  onAppLoad =          function(this, app) { },
+  onAppClose =         function(this, app) { },
+  onAppShutdown =      function(this, app) { }, // the last event right before exiting
+};
+
+/* Uncomment this to see event names printed in the Output window
+  local skipEvents = {onIdle = true, onEditorPainted = true, onEditorUpdateUI = true}
+  for k in pairs(events) do
+    if not skipEvents[k] then
+      P[k] = k:find("^onEditor")
+        and function(self, ed)
+          -- document can be empty for newly added documents
+          local doc = ide:GetDocument(ed)
+          ide:Print(self:GetFileName(), k, doc and doc:GetFilePath() or "new document") end
+        or function(self, ...)
+          ide:Print(self:GetFileName(), k, ...) end
+    end
+  end
+
+  P.onMenuEditor = function(self, menu, editor, event)
+    local point = editor:ScreenToClient(event:GetPosition())
+    pos = editor:PositionFromPointClose(point.x, point.y)
+    menu:Append(id, ">> Sample item; pos "..pos)
+    menu:Enable(id, true)
+
+    editor:Connect(id, wx.wxEVT_COMMAND_MENU_SELECTED,
+      function() ide:Print("Selected "..pos) end)
+
+    ide:Print(self:GetFileName(), "onMenuEditor")
+  end
+
+  P.onMenuEditorTab = function(self, menu, notebook, event, index)
+    menu:Append(id, ">> Sample item; tab "..index)
+    menu:Enable(id, true)
+
+    notebook:Connect(id, wx.wxEVT_COMMAND_MENU_SELECTED,
+      function() ide:Print("Selected "..index) end)
+
+    ide:Print(self:GetFileName(), "onMenuEditorTab")
+  end
+
+  P.onMenuFiletree = function(self, menu, tree, event)
+    local item_id = event:GetItem()
+    local name = tree:GetItemFullName(item_id)
+    menu:Append(id, ">> Sample item; name "..name)
+    menu:Enable(id, true)
+
+    tree:Connect(id, wx.wxEVT_COMMAND_MENU_SELECTED,
+      function() ide:Print("Selected "..name) end)
+
+    ide:Print(self:GetFileName(), "onMenuFiletree")
+  end
+
+  P.onInterpreterLoad = function(self, interpreter)
+    ide:Print(self:GetFileName(), "onInterpreterLoad", interpreter:GetFileName())
+  end
+
+  P.onInterpreterClose = function(self, interpreter)
+    ide:Print(self:GetFileName(), "onInterpreterClose", interpreter:GetFileName())
+  end
+
+  P.onEditorPreSave = function(self, editor, filepath)
+    if filepath and filepath:find("%.txt$") then
+      ide:Print(self:GetFileName(), "onEditorPreSave", "Aborted saving a .txt file")
+      return false
+    else
+      ide:Print(self:GetFileName(), "onEditorPreSave", filepath or "New file")
+    end
+  end
+
+  P.onEditorCharAdded = function(self, editor, event)
+    ide:Print(self:GetFileName(), "onEditorCharAdded", event:GetKey())
+  end
+
+  P.onEditorKeyDown = function(self, editor, event)
+    ide:Print(self:GetFileName(), "onEditorKeyDown", event:GetKeyCode())
+  end
+
+--*/
+
+return P;

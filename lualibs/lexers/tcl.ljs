@@ -1,0 +1,59 @@
+// Copyright 2014-2016 Joshua Krämer. See LICENSE.
+// Tcl LPeg lexer.
+// This lexer follows the TCL dodekalogue (http://wiki.tcl.tk/10259).
+// It is based on the previous lexer by Mitchell.
+
+var l = require('lexer');
+var token, word_match = l.token, l.word_match;
+var P, R, S = lpeg.P, lpeg.R, lpeg.S;
+
+var M = {_NAME = 'tcl'};
+
+// Whitespace.
+var whitespace = token(l.WHITESPACE, l.space**1);
+
+// Separator (semicolon).
+var separator = token(l.CLASS, P(';'));
+
+// Delimiters.
+var braces = token(l.KEYWORD, S('{}'));
+var quotes = token(l.FUNCTION, '"');
+var brackets = token(l.VARIABLE, S('[]'));
+
+// Argument expander.
+var expander = token(l.LABEL, P('{*}'));
+
+// Variable substitution.
+var variable = token(l.STRING, '$' * (l.alnum + '_' + P(':')**2)**0);
+
+// Backslash substitution.
+var backslash = token(l.TYPE, '\\' * ((l.digit * l.digit**-2) +
+                        ('x' * l.xdigit**1) + ('u' * l.xdigit * l.xdigit**-3) +
+                        ('U' * l.xdigit * l.xdigit**-7) + P(1)));
+
+// Comment.
+var comment = token(l.COMMENT, '#' * P(function(input, index) {
+  var i = index - 2;
+  while( i > 0 && input->find('^[ \t]', i) ) { i -=   1; }
+  if( i < 1 || input->find('^[\r\n;]', i) ) { return index; }
+}) * l.nonnewline**0);
+
+M._rules = {
+  {'whitespace', whitespace},
+  {'comment', comment},
+  {'separator', separator},
+  {'expander', expander},
+  {'braces', braces},
+  {'quotes', quotes},
+  {'brackets', brackets},
+  {'variable', variable},
+  {'backslash', backslash},
+};
+
+M._foldsymbols = {
+  _patterns = {'[{}]', '#'},
+  [l.KEYWORD] = {['{'] = 1, ['}'] = -1},
+  [l.COMMENT] = {['#'] = l.fold_line_comments('#')}
+};
+
+return M;

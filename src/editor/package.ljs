@@ -1,0 +1,1500 @@
+// Copyright 2013-17 Paul Kulchenko, ZeroBrane LLC
+//-------------------------------------------------------
+
+var ide = ide;
+var iscaseinsensitive = wx.wxFileName("A")->SameAs(wx.wxFileName("a"));
+var unpack = table.unpack || unpack;
+var q = EscapeMagic;
+
+var function eventHandle(handlers, event, ...) {
+  var success;
+  for( package, handler in pairs(handlers) ) {
+    var ok, res = pcall(handler, package, ...);
+    if( ok ) {
+      if( res == false ) { success = false; }
+    } else {
+      ide->GetOutput()->Error(TR("%s event failed: %s")->format(event, res));
+    }
+  }
+  return success;
+}
+
+var function getEventHandlers(packages, event) {
+  var handlers = {};
+  for( _, package in pairs(packages) ) {
+    if( package[event] ) { handlers[package] = package[event]; }
+  }
+  return handlers;
+}
+
+function PackageEventHandle(event, ...) {
+  return eventHandle(getEventHandlers(ide.packages, event), event, ...);
+}
+
+function PackageEventHandleOnce(event, ...) {
+  // copy packages as the event that is handled only once needs to be removed
+  var handlers = getEventHandlers(ide.packages, event);
+  // remove all handlers as they need to be called only once
+  // this allows them to be re-installed if needed
+  for( _, package in pairs(ide.packages) ) { package[event] = null; }
+  return eventHandle(handlers, event, ...);
+}
+
+var function PackageEventHandleOne(file, event, ...) {
+  var package = ide.packages[file];
+  if( package && type(package[event]) == 'function' ) {
+    var ok, res = pcall(package[event], package, ...);
+    if( ok ) {
+      if( res == false ) { return false; }
+    } else {
+      ide->GetOutput()->Error(TR("%s event failed: %s")->format(event, res));
+    }
+  }
+}
+
+function PackageUnRegister(file, ...) {
+  PackageEventHandleOne(file, "onUnRegister", ...);
+  // remove from the list of installed packages
+  var package = ide.packages[file];
+  ide.packages[file] = null;
+  return package;
+}
+
+function PackageRegister(file, ...) {
+  if( ! ide.packages[file] ) {
+    var packages = {};
+    var package = MergeFullPath(
+      GetPathWithSep(ide.editorFilename), "packages/"..file..".ljs");
+    LoadLuaFileExt(packages, package, ide.proto.Plugin);
+    packages[file].fname = file;
+    ide.packages[file] = packages[file];
+  }
+  return PackageEventHandleOne(file, "onRegister", ...);
+}
+
+function ide::GetProperty(keyword, default) {
+  return this.app.stringtable[keyword] || default;
+}
+function ide::GetRootPath(path) {
+  return MergeFullPath(GetPathWithSep(this.editorFilename), path || '');
+}
+function ide::GetPackagePath(packname) {
+  return MergeFullPath(
+    this.oshome && MergeFullPath(this.oshome, '.'..this->GetAppName()..'/') || this->GetRootPath(),
+    MergeFullPath('packages', packname || '')
+  );
+}
+function ide::GetLaunchPath(addparams) {
+  var path = this.editorFilename;
+  if( this.osname == "Macintosh" ) {
+    // find .app folder in the path; there are two options:
+    // 1. `/Applications/ZeroBraneStudio.app/Contents/ZeroBraneStudio/zbstudio`(installed path)
+    // 2. `...ZeroBraneStudio/zbstudio` (cloned repository path)
+    var app = path->match("(.+%.app)/");
+    if( app ) { // check if the application is already in the path
+      path = app;
+    } else {
+      var apps = ide->GetFileList(path, true, "Info.plist", {ondirectory = function(dir) {
+            // don't recurse for more than necessary
+            return dir->find("%.app/Contents/.+") == null;
+          }}
+      );
+      if( #apps == 0 ) { return null, "Can't find application path."; }
+
+      var fn = wx.wxFileName(apps[1]);
+      fn->RemoveLastDir();
+      path = fn->GetPath(wx.wxPATH_GET_VOLUME);
+    }
+    // generate command with `-n` (start a new copy of the application)
+    path = ([=[open -n -a "%s" --args]=])->format(path);
+  } else if( this.osname == "Unix" ) {
+    path = ([=["%s.sh"]=])->format(path);
+  } else {
+    path = ([=["%s"]=])->format(path);
+  }
+  if( addparams ) {
+    for( n, val in ipairs(this.arg) ) {
+      if( val == "-cfg" && #this.arg > n ) {
+        path = path .. ([=[ %s "%s"]=])->format(this.arg[n], this.arg[n+1]);
+      }
+    }
+  }
+  return path;
+}
+function ide::Exit(hotexit) {
+  if( hotexit ) { this.config.hotexit = true; }
+  this->GetMainFrame()->Close();
+}
+function ide::Restart(hotexit) {
+  this->AddPackage("core.restart", {
+      onAppShutdown = function() { wx.wxExecute(this->GetLaunchPath(true), wx.wxEXEC_ASYNC); }
+    });
+  if( this.singleinstanceserver ) { this.singleinstanceserver->close(); }
+  this->Exit(hotexit);
+}
+function ide::GetApp() { return this.editorApp; }
+function ide::GetAppName() { return this.appname; }
+function ide::GetDefaultFileName() {
+  var default = this.config.default;
+  var ext = default.extension;
+  var ed = this->GetEditor();
+  if( ed && default.usecurrentextension ) { ext = this->GetDocument(ed)->GetFileExt(); }
+  return default.name..(ext && ext > "" && "."..ext || "");
+}
+function ide::GetEditor(index) {
+  var notebook = this->GetEditorNotebook();
+  if( index == null ) { index = notebook->GetSelection(); }
+
+  var editor;
+  if( (index >= 0) && (index < notebook->GetPageCount())
+  && notebook->GetPage(index)->GetClassInfo()->GetClassName()=="wxStyledTextCtrl" ) {
+    editor = notebook->GetPage(index)->DynamicCast("wxStyledTextCtrl");
+  }
+  return editor;
+}
+function ide::GetEditorWithFocus(...) {
+  var function isCtrlFocused(e) {
+    var ctrl = e && e->FindFocus();
+    return ctrl &&
+      (ctrl->GetId() == e->GetId()
+       || ide.osname == 'Macintosh' &&
+         ctrl->GetParent()->GetId() == e->GetId()) && ctrl || null;
+  }
+  // need to distinguish GetEditorWithFocus() and GetEditorWithFocus(nil)
+  // as the latter may happen when GetEditor() is passed and returns `nil`
+  if( select('#', ...) > 0 ) {
+    var ed = ...;
+    return isCtrlFocused(ed) && ed || null;
+  }
+
+  var editor = this->GetEditor();
+  if( isCtrlFocused(editor) ) { return editor; }
+
+  var nb = ide->GetOutputNotebook();
+  for( p = 0, nb->GetPageCount()-1 ) {
+    var ctrl = nb->GetPage(p);
+    if( ctrl->GetClassInfo()->GetClassName() == "wxStyledTextCtrl"
+    && isCtrlFocused(ctrl) ) {
+      return ctrl->DynamicCast("wxStyledTextCtrl");
+    }
+  }
+  return null;
+}
+function ide::GetEditorWithLastFocus() {
+  // make sure ide.infocus is still a valid component and not "some" userdata
+  return (this->IsValidCtrl(this.infocus)
+    && this.infocus->GetClassInfo()->GetClassName() == "wxStyledTextCtrl"
+    && this.infocus->DynamicCast("wxStyledTextCtrl") || null);
+}
+function ide::GetMenuBar() { return this.frame && this.frame.menuBar; }
+function ide::GetStatusBar() { return this.frame && this.frame.statusBar; }
+function ide::GetToolBar() { return this.frame && this.frame.toolBar; }
+function ide::GetDebugger() { return this.debugger; }
+function ide::SetDebugger(deb) {
+  this.debugger = deb;
+  // if the remote console is already assigned, then assign it based on the new debugger
+  var console = this->GetConsole();
+  // `SetDebugger` may be called before console is set, so need to check if it's available
+  if( this->IsValidProperty(console, 'GetRemote') && console->GetRemote() ) { console->SetRemote(deb->GetConsole()); }
+  return deb;
+}
+function ide::GetMainFrame() {
+  if( ! this.frame ) {
+    this.frame = wx.wxFrame(wx.NULL, wx.wxID_ANY, this->GetProperty("editor"),
+      wx.wxDefaultPosition, wx.wxSize(1100, 700));
+      // transparency range: 0 == invisible -> 255 == opaque
+      // set lower bound of 50 to prevent accidental invisibility
+      var transparency = tonumber(this->GetConfig().transparency);
+      if( transparency ) { this.frame->SetTransparent(math.max(50, transparency)); }
+  }
+  return this.frame;
+}
+function ide::GetUIManager() { return this.frame.uimgr; }
+function ide::GetDocument(ed) { return ed && this.openDocuments[ed->GetId()]; }
+function ide::GetDocuments() { return this.openDocuments; }
+function ide::GetKnownExtensions(ext) {
+  var knownexts, extmatch = {}, ext && ext->lower();
+  for( _, spec in pairs(this.specs) ) {
+    for( _, ext in ipairs(spec.exts || {}) ) {
+      if( ! extmatch || extmatch == ext->lower() ) {
+        table.insert(knownexts, ext);
+      }
+    }
+  }
+  table.sort(knownexts);
+  return knownexts;
+}
+
+function ide::DoWhenIdle(func) { table.insert(this.onidle, func); }
+
+function ide::FindTopMenu(item) {
+  var index = this->GetMenuBar()->FindMenu((TR)(item));
+  return this->GetMenuBar()->GetMenu(index), index;
+}
+function ide::FindMenuItem(itemid, menu) {
+  var menubar = this->GetMenuBar();
+  if( ! menubar ) { return; } // no associated menu
+  var item, imenu = menubar->FindItem(itemid, menu);
+  if( menu && ! item ) { item = menu->FindItem(itemid); }
+  if( ! item ) { return; }
+  menu = menu || imenu;
+
+  for( pos = 0, menu->GetMenuItemCount()-1 ) {
+    if( menu->FindItemByPosition(pos)->GetId() == itemid ) {
+      return item, menu, pos;
+    }
+  }
+  return;
+}
+function ide::AttachMenu(...) {
+  // AttachMenu([targetmenu,] id, submenu)
+  // `targetmenu` is only needed for menus not attached to the main menubar
+  var menu, id, submenu = ...;
+  if( select('#', ...) == 2 ) { menu, id, submenu = null, ...; }
+  var item, pos;
+  item, menu, pos = this->FindMenuItem(id, menu);
+  if( ! item ) { return; }
+
+  menu->Remove(item);
+  item->SetSubMenu(submenu);
+  return menu->Insert(pos, item), pos;
+}
+function ide::CloneMenu(menu) {
+  if( ! menu ) { return; }
+  var newmenu = wx.wxMenu({});
+  var ok, node = pcall(function() { return menu->GetMenuItems()->GetFirst(); });
+  // some wxwidgets versions may not have GetFirst, so return an empty menu in this case
+  if( ! ok ) { return newmenu; }
+  while( node ) {
+    var item = node->GetData()->DynamicCast("wxMenuItem");
+    newmenu->Append(item->GetId(), item->GetItemLabel(), item->GetHelp(), item->GetKind());
+    node = node->GetNext();
+  }
+  return newmenu;
+}
+function ide::MakeMenu(t) {
+  var menu = wx.wxMenu({});
+  var menuicon = this.config.menuicon; // menu items need to have icons
+  var iconmap = this.config.toolbar.iconmap;
+  for( p = 1, #(t || {}) ) {
+    if( type(t[p]) == "table" ) {
+      if( #t[p] == 0 ) { // empty table signals a separator
+        menu->AppendSeparator();
+      } else {
+        var id, label, help, kind = unpack(t[p]);
+        var submenu;
+        if( type(kind) == "table" ) {
+          submenu, kind = this->MakeMenu(kind);
+        } else if( type(kind) == "userdata" ) {
+          submenu, kind = kind;
+        }
+        if( submenu ) {
+          menu->Append(id, label, submenu, help || "");
+        } else {
+          var item = wx.wxMenuItem(menu, id, label, help || "", kind || wx.wxITEM_NORMAL);
+          if( menuicon && type(iconmap[id]) == "table"
+          // only add icons to "normal" items (OSX can take them on checkbox items too),
+          // otherwise this causes asert on Linux (http://trac.wxwidgets.org/ticket/17123)
+          && (ide.osname == "Macintosh" || item->GetKind() == wx.wxITEM_NORMAL) ) {
+            var bitmap = ide->GetBitmap(iconmap[id][1], "TOOLBAR", wx.wxSize(16,16));
+            item->SetBitmap(bitmap);
+          }
+          menu->Append(item);
+        }
+      }
+    }
+  }
+  return menu;
+}
+
+function ide::FindDocument(path) {
+  var fileName = wx.wxFileName(path);
+  for( _, doc in pairs(this->GetDocuments()) ) {
+    if( doc.filePath && fileName->SameAs(wx.wxFileName(doc.filePath)) ) {
+      return doc;
+    }
+  }
+  return;
+}
+function ide::FindDocumentsByPartialPath(path) {
+  var seps = "[\\/]";
+  // add trailing path separator to make sure full directory match
+  if( ! path->find(seps.."$") ) { path = path .. GetPathSeparator(); }
+  var pattern = "^"..q(path)->gsub(seps, seps);
+  var lpattern = pattern->lower();
+
+  var docs = {};
+  for( _, doc in pairs(this->GetDocuments()) ) {
+    if( doc.filePath
+    && (doc.filePath->find(pattern)
+         || iscaseinsensitive && doc.filePath->lower()->find(lpattern)) ) {
+      table.insert(docs, doc);
+    }
+  }
+  return docs;
+}
+function ide::SetInterpreter(name) { return ProjectSetInterpreter(name); }
+function ide::GetInterpreter(name) { return name == null && this.interpreter || name && this.interpreters[name] || null; }
+function ide::GetInterpreters() { return this.interpreters; }
+function ide::GetConfig() { return this.config; }
+function ide::GetOutput() { return this.frame.bottomnotebook.errorlog; }
+function ide::GetConsole() { return this.frame.bottomnotebook.shellbox; }
+function ide::GetEditorNotebook() { return this.frame.notebook; }
+function ide::GetOutputNotebook() { return this.frame.bottomnotebook; }
+function ide::GetOutline() { return this.outline; }
+function ide::GetProjectNotebook() { return this.frame.projnotebook; }
+function ide::GetProject() {
+  var dir = ide.filetree && ide.filetree.projdir;
+  return dir && #dir > 0 && wx.wxFileName.DirName(dir)->GetFullPath() || null;
+}
+function ide::SetProject(projdir,skiptree) {
+  // strip trailing spaces as this may create issues with "path/ " on Windows
+  projdir = projdir->gsub("%s+$","");
+  var dir = wx.wxFileName.DirName(FixDir(projdir));
+  dir->Normalize(); // turn into absolute path if needed
+  if( ! wx.wxDirExists(dir->GetFullPath()) ) { return this.filetree->updateProjectDir(projdir); }
+
+  projdir = dir->GetPath(wx.wxPATH_GET_VOLUME); // no trailing slash
+
+  this.config.path.projectdir = projdir != "" && projdir || null;
+  this->SetStatus(projdir);
+  this.frame->SetTitle(this->ExpandPlaceholders(this.config.format.apptitle));
+
+  if( skiptree ) { return true; }
+  return this.filetree->updateProjectDir(projdir);
+}
+function ide::GetProjectStartFile() {
+  var projectdir = this->GetProject();
+  var startfile = this.filetree.settings.startfile[projectdir];
+  return MergeFullPath(projectdir, startfile), startfile;
+}
+function ide::GetLaunchedProcess() { return this.debugger && this.debugger.pid; }
+function ide::SetLaunchedProcess(pid) { if( this.debugger ) { this.debugger.pid = pid; return pid; } }
+function ide::GetProjectTree() { return this.filetree.projtreeCtrl; }
+function ide::GetOutlineTree() { return this.outline.outlineCtrl; }
+function ide::GetWatch() { return this.debugger && this.debugger.watchCtrl; }
+function ide::GetStack() { return this.debugger && this.debugger.stackCtrl; }
+
+function ide::GetTextFromUser(message, caption, value) {
+  var dlg = wx.wxTextEntryDialog(this.frame, message, caption, value);
+  var res = dlg->ShowModal();
+  return res == wx.wxID_OK && dlg->GetValue() || null, res;
+}
+
+var statusreset;
+function ide::SetStatusFor(text, interval, field) {
+  field = field || 0;
+  interval = interval || 2;
+  var statusbar = this->GetStatusBar();
+  if( ! this.timers.status ) {
+    this.timers.status = this->AddTimer(statusbar, function(event) { if( statusreset ) { statusreset(); } });
+  }
+  statusreset = function() {
+    if( statusbar->GetStatusText(field) == text ) { statusbar->SetStatusText("", field); }
+  };
+  this.timers.status->Start(interval*1000, wx.wxTIMER_ONE_SHOT);
+  statusbar->SetStatusText(text, field);
+}
+function ide::SetStatus(text, field) { this->GetStatusBar()->SetStatusText(text, field || 0); }
+function ide::GetStatus(field) { return this->GetStatusBar()->GetStatusText(field || 0); }
+function ide::PushStatus(text, field) { this->GetStatusBar()->PushStatusText(text, field || 0); }
+function ide::PopStatus(field) { this->GetStatusBar()->PopStatusText(field || 0); }
+function ide::Yield() { wx.wxYield(); }
+function ide::CreateBareEditor() { return CreateEditor(true); }
+function ide::ShowCommandBar(...) { return ShowCommandBar(...); }
+
+function ide::RequestAttention() {
+  var ide = this;
+  var frame = ide.frame;
+  if( ! frame->IsActive() ) {
+    frame->RequestUserAttention();
+    if( ide.osname == "Macintosh" ) {
+      var cmd = [=[osascript -e 'tell application "%s" to activate']=];
+      wx.wxExecute(cmd->format(ide.editorApp->GetAppName()), wx.wxEXEC_ASYNC);
+    } else if( ide.osname == "Unix" ) {
+      if( frame->IsIconized() ) { frame->Iconize(false); }
+    } else if( ide.osname == "Windows" ) {
+      if( frame->IsIconized() ) { frame->Iconize(false); }
+      frame->Raise(); // raise the window
+
+      var ok, winapi = pcall(require, 'winapi');
+      if( ok ) {
+        var pid = winapi.get_current_pid();
+        var wins = winapi.find_all_windows(function(w) {
+          return w->get_process()->get_pid() == pid
+             && w->get_class_name() == 'wxWindowNR';
+        });
+        if( wins && #wins > 0 ) {
+          // found the window, now need to activate it:
+          // send some input to the window and then
+          // bring our window to foreground (doesn't work without some input)
+          // send Attn key twice (down and up)
+          winapi.send_to_window(0xF6, false);
+          winapi.send_to_window(0xF6, true);
+          for( _, w in ipairs(wins) ) { w->set_foreground(); }
+        }
+      }
+    }
+  }
+}
+
+function ide::ReportError(msg) {
+  this->RequestAttention(); // request attention first in case the app is minimized or in the background
+  return wx.wxMessageBox(msg, TR("Error"), wx.wxICON_ERROR + wx.wxOK + wx.wxCENTRE, this.frame);
+}
+
+var rawMethods = {"AddTextDyn", "InsertTextDyn", "AppendTextDyn", "SetTextDyn",
+  "GetTextDyn", "GetLineDyn", "GetSelectedTextDyn", "GetTextRangeDyn",
+  "ReplaceTargetDyn", // this method is not available in wxlua 3.1, so it's simulated
+};
+var useraw = null;
+
+var invalidUTF8, invalidLength;
+var suffix = "\1\0";
+var DF_TEXT = wx.wxDataFormat(wx.wxDF_TEXT);
+
+function ide::CreateStyledTextCtrl(...) {
+  var editor = wxstc.wxStyledTextCtrl(...);
+  if( ! editor ) { return; }
+
+  if( useraw == null ) {
+    useraw = true;
+    for( _, m in ipairs(rawMethods) ) {
+      if( ! pcall(function() { return editor[m->gsub("Dyn", "Raw")]; }) ) { useraw = false; break; }
+    }
+  }
+
+  if( ! editor.ReplaceTargetRaw ) {
+    editor.ReplaceTargetRaw = function(this, ...) {
+      this->ReplaceTarget("");
+      this->InsertTextDyn(this->GetTargetStart(), ...);
+    };
+  }
+
+  // map all `GetTextDyn` to `GetText` or `GetTextRaw` if `*Raw` methods are present
+  editor.useraw = useraw;
+  for( _, m in ipairs(rawMethods) ) {
+    // some `*Raw` methods return `nil` instead of `""` as their "normal" calls do
+    // (for example, `GetLineRaw` and `GetTextRangeRaw` for parameters outside of text)
+    var def = m->find("^Get") && "" || null;
+    editor[m] = function(...) { return editor[m->gsub("Dyn", useraw && "Raw" || "")](...) || def; };
+  }
+
+  function editor::CopyDyn() {
+    invalidUTF8 = null;
+    if( ! this.useraw ) { return this->Copy(); }
+    // check if selected fragment is a valid UTF-8 sequence
+    var text = this->GetSelectedTextRaw();
+    if( text == "" || wx.wxString.FromUTF8(text) != "" ) { return this->Copy(); }
+    var tdo = wx.wxTextDataObject();
+    // append suffix as wxwidgets (3.1+ on Windows) truncate last char for odd-length strings
+    var workaround = ide.osname == "Windows" && (#text % 2 > 0) && suffix || "";
+    tdo->SetData(DF_TEXT, text..workaround);
+    invalidUTF8, invalidLength = text, tdo->GetDataSize();
+
+    var clip = wx.wxClipboard.Get();
+    clip->Open();
+    clip->SetData(tdo);
+    clip->Close();
+  }
+
+  function editor::PasteDyn() {
+    if( ! this.useraw ) { return this->Paste(); }
+    var tdo = wx.wxTextDataObject();
+    var clip = wx.wxClipboard.Get();
+    clip->Open();
+    clip->GetData(tdo);
+    clip->Close();
+    var ok, text = tdo->GetDataHere(DF_TEXT);
+    // check if the fragment being pasted is a valid UTF-8 sequence
+    if( ide.osname == "Windows" ) { text = text && text->gsub(suffix.."+$",""); }
+    if( ! ok || wx.wxString.FromUTF8(text) != ""
+    || ! invalidUTF8 || invalidLength != tdo->GetDataSize() ) { return this->Paste(); }
+
+    this->AddTextRaw(ide.osname != "Windows" && invalidUTF8 || text);
+    this->GotoPos(this->GetCurrentPos());
+  }
+
+  function editor::GotoPosEnforcePolicy(pos) {
+    this->GotoPos(pos);
+    this->EnsureVisibleEnforcePolicy(this->LineFromPosition(pos));
+  }
+
+  function editor::CanFold() {
+    for( m = 0, ide.MAXMARGIN ) {
+      if( this->GetMarginWidth(m) > 0
+      && this->GetMarginMask(m) == wxstc.wxSTC_MASK_FOLDERS ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // cycle through "fold all" => "hide base lines" => "unfold all"
+  function editor::FoldSome(line) {
+    var foldall = false; // at least one header unfolded => fold all
+    var hidebase = false; // at least one base is visible => hide all
+
+    var header = line && bit.band(this->GetFoldLevel(line),
+      wxstc.wxSTC_FOLDLEVELHEADERFLAG) == wxstc.wxSTC_FOLDLEVELHEADERFLAG;
+    var from = line && (header && line || this->GetFoldParent(line)) || 0;
+    var to = line && from > -1 && this->GetLastChild(from, -1) || this->GetLineCount()-1;
+
+    for( ln = from, to ) {
+      var foldRaw = this->GetFoldLevel(ln);
+      var foldLvl = foldRaw % 4096;
+      var foldHdr = (math.floor(foldRaw / 8192) % 2) == 1;
+
+      // at least one header is expanded
+      foldall = foldall || (foldHdr && this->GetFoldExpanded(ln));
+
+      // at least one base can be hidden
+      hidebase = hidebase || (
+        ! foldHdr
+        && ln > 1 // first line can't be hidden, so ignore it
+        && foldLvl == wxstc.wxSTC_FOLDLEVELBASE
+        && bit.band(foldRaw, wxstc.wxSTC_FOLDLEVELWHITEFLAG) == 0
+        && this->GetLineVisible(ln));
+    }
+
+    // shows lines; this doesn't change fold status for folded lines
+    if( ! foldall && ! hidebase ) { this->ShowLines(from, to); }
+
+    for( ln = from, to ) {
+      var foldRaw = this->GetFoldLevel(ln);
+      var foldLvl = foldRaw % 4096;
+      var foldHdr = (math.floor(foldRaw / 8192) % 2) == 1;
+
+      if( foldall ) {
+        if( foldHdr && this->GetFoldExpanded(ln) ) {
+          this->ToggleFold(ln);
+        }
+      } else if( hidebase ) {
+        if( ! foldHdr && (foldLvl == wxstc.wxSTC_FOLDLEVELBASE) ) {
+          this->HideLines(ln, ln);
+        }
+      } else { // unfold all
+        if( foldHdr && ! this->GetFoldExpanded(ln) ) {
+          this->ToggleFold(ln);
+        }
+      }
+    }
+    // if the entire file is being un/folded, make sure the cursor is on the screen
+    // (although it may be inside a folded fragment)
+    if( ! line ) { this->EnsureCaretVisible(); }
+  }
+
+  function editor::GetAllMarginWidth() {
+    var width = 0;
+    for( m = 0, ide.MAXMARGIN ) { width +=   this->GetMarginWidth(m); }
+    return width;
+  }
+
+  function editor::ShowPosEnforcePolicy(pos) {
+    var line = this->LineFromPosition(pos);
+    this->EnsureVisibleEnforcePolicy(line);
+    // skip the rest if line wrapping is on
+    if( this->GetWrapMode() != wxstc.wxSTC_WRAP_NONE ) { return; }
+    var xwidth = this->GetClientSize()->GetWidth() - this->GetAllMarginWidth();
+    var xoffset = this->GetTextExtent(this->GetLineDyn(line)->sub(1, pos-this->PositionFromLine(line)+1));
+    this->SetXOffset(xoffset > xwidth && xoffset-xwidth || 0);
+  }
+
+  function editor::GetLineWrapped(pos, direction) {
+    var function getPosNear(editor, pos, direction) {
+      var point = editor->PointFromPosition(pos);
+      var height = editor->TextHeight(editor->LineFromPosition(pos));
+      return editor->PositionFromPoint(wx.wxPoint(point->GetX(), point->GetY() + direction * height));
+    }
+    direction = tonumber(direction) || 1;
+    var line = this->LineFromPosition(pos);
+    if( this->WrapCount(line) < 2
+    || direction < 0 && line == 0
+    || direction > 0 && line == this->GetLineCount()-1 ) { return false; }
+    return line == this->LineFromPosition(getPosNear(this, pos, direction));
+  }
+
+  // wxSTC included with wxlua didn't have ScrollRange defined, so substitute if not present
+  if( ! ide->IsValidProperty(editor, "ScrollRange") ) {
+    function editor::ScrollRange() { }
+  }
+
+  // ScrollRange moves to the correct position, but doesn't unfold folded region
+  function editor::ShowRange(secondary, primary) {
+    this->ShowPosEnforcePolicy(primary);
+    this->ScrollRange(secondary, primary);
+  }
+
+  function editor::ClearAny() {
+    var length = this->GetLength();
+    var selections = ide.wxver >= "2.9.5" && this->GetSelections() || 1;
+    this->Clear(); // remove selected fragments
+
+    // check if the modification has failed, which may happen
+    // if there is "invisible" text in the selected fragment.
+    // if there is only one selection, then delete manually.
+    if( length == this->GetLength() && selections == 1 ) {
+      this->SetTargetStart(this->GetSelectionStart());
+      this->SetTargetEnd(this->GetSelectionEnd());
+      this->ReplaceTarget("");
+    }
+  }
+
+  function editor::MarkerGetAll(mask, from, to) {
+    mask = mask || ide.ANYMARKERMASK;
+    var markers = {};
+    var line = this->MarkerNext(from || 0, mask);
+    while( line != wx.wxNOT_FOUND ) {
+      table.insert(markers, {line, this->MarkerGet(line)});
+      if( to && line > to ) { break; }
+      line = this->MarkerNext(line + 1, mask);
+    }
+    return markers;
+  }
+
+  function editor::IsLineEmpty(line) {
+    var text = this->GetLineDyn(line || this->GetCurrentLine());
+    var lc = this.spec && this.spec.linecomment;
+    return ! text->find("%S") || (lc && text->find("^%s*"..q(lc)) != null);
+  }
+
+  function editor::Activate(force) {
+    // check for `activateoutput` if the current component is the same as `Output`
+    if( this == ide->GetOutput() && ! ide.config.activateoutput && ! force ) { return; }
+
+    var nb = this->GetParent();
+    // check that the parent is of the correct type
+    if( nb->GetClassInfo()->GetClassName() != "wxAuiNotebook" ) { return; }
+    nb = nb->DynamicCast("wxAuiNotebook");
+
+    var uimgr = ide->GetUIManager();
+    var pane = uimgr->GetPane(nb);
+    if( pane->IsOk() && ! pane->IsShown() ) {
+      pane->Show(true);
+      uimgr->Update();
+    }
+    // activate output/errorlog window
+    var index = nb->GetPageIndex(this);
+    if( nb->GetSelection() == index ) { return false; }
+    nb->SetSelection(index);
+    return true;
+  }
+
+  function editor::GetModifiedTime() { return this.updated; }
+
+  function editor::SetupKeywords(...) { return SetupKeywords(this, ...); }
+
+  editor->Connect(wx.wxEVT_KEY_DOWN,
+    function (event) {
+      var keycode = event->GetKeyCode();
+      var mod = event->GetModifiers();
+      if( (keycode == wx.WXK_DELETE && mod == wx.wxMOD_SHIFT)
+      || (keycode == wx.WXK_INSERT && mod == wx.wxMOD_CONTROL)
+      || (keycode == wx.WXK_INSERT && mod == wx.wxMOD_SHIFT) ) {
+        var id = keycode == wx.WXK_DELETE && ID.CUT || mod == wx.wxMOD_SHIFT && ID.PASTE || ID.COPY;
+        ide.frame->AddPendingEvent(wx.wxCommandEvent(wx.wxEVT_COMMAND_MENU_SELECTED, id));
+      } else if( keycode == wx.WXK_CAPITAL && mod == wx.wxMOD_CONTROL ) {
+        // ignore Ctrl+CapsLock
+      } else {
+        event->Skip();
+      }
+    });
+  return editor;
+}
+
+function ide::CreateTreeCtrl(...) {
+  var ctrl = wx.wxTreeCtrl(...);
+  if( ! ctrl ) { return; }
+
+  if( ! this->IsValidProperty(ctrl, "SetFocusedItem") ) {
+    // versions of wxlua prior to 3.1 may not have SetFocuseditem
+    function ctrl::SetFocusedItem(item) {
+      this->UnselectAll(); // unselect others in case MULTIPLE selection is allowed
+      return this->SelectItem(item);
+    }
+  }
+
+  var hasGetFocused = this->IsValidProperty(ctrl, "GetFocusedItem");
+  if( ! hasGetFocused ) {
+    // versions of wxlua prior to 3.1 may not have SetFocuseditem
+    function ctrl::GetFocusedItem() { return this->GetSelections()[1]; }
+  }
+
+  // LeftArrow on Linux doesn't collapse expanded nodes as it does on Windows/OSX; do it manually
+  if( ide.osname == "Unix" && hasGetFocused ) {
+    ctrl->Connect(wx.wxEVT_KEY_DOWN, function (event) {
+        var keycode = event->GetKeyCode();
+        var mod = event->GetModifiers();
+        var item = ctrl->GetFocusedItem();
+        if( keycode == wx.WXK_LEFT && mod == wx.wxMOD_NONE && item->IsOk() && ctrl->IsExpanded(item) ) {
+          ctrl->Collapse(item);
+        } else {
+          event->Skip();
+        }
+      });
+  }
+  return ctrl;
+}
+
+function ide::LoadFile(...) { return LoadFile(...); }
+
+function ide::CopyToClipboard(text) {
+  if( wx.wxClipboard->Get()->Open() ) {
+    wx.wxClipboard->Get()->SetData(wx.wxTextDataObject(text));
+    wx.wxClipboard->Get()->Close();
+    return true;
+  }
+  return false;
+}
+
+function ide::GetSetting(path, setting) {
+  var settings = this.settings;
+  var curpath = settings->GetPath();
+  settings->SetPath(path);
+  var ok, value = settings->Read(setting);
+  settings->SetPath(curpath);
+  return ok && value || null;
+}
+
+function ide::RemoveMenuItem(id, menu) {
+  var _, pos;
+  _, menu, pos = this->FindMenuItem(id, menu);
+  if( menu ) {
+    this->GetMainFrame()->Disconnect(id, wx.wxID_ANY, wx.wxEVT_COMMAND_MENU_SELECTED);
+    this->GetMainFrame()->Disconnect(id, wx.wxID_ANY, wx.wxEVT_UPDATE_UI);
+    menu->Disconnect(id, wx.wxID_ANY, wx.wxEVT_COMMAND_MENU_SELECTED);
+    menu->Disconnect(id, wx.wxID_ANY, wx.wxEVT_UPDATE_UI);
+    menu->Remove(id);
+
+    var positem = menu->FindItemByPosition(pos);
+    if( (! positem || positem->GetKind() == wx.wxITEM_SEPARATOR)
+    && pos > 0 && (menu->FindItemByPosition(pos-1)->GetKind() == wx.wxITEM_SEPARATOR) ) {
+      menu->Destroy(menu->FindItemByPosition(pos-1)); // remove last or double separator
+    } else if( positem && pos == 0 && positem->GetKind() == wx.wxITEM_SEPARATOR ) {
+      menu->Destroy(menu->FindItemByPosition(pos)); // remove first separator
+    }
+    return true;
+  }
+  return false;
+}
+
+function ide::ExecuteCommand(cmd, wdir, callback, endcallback) {
+  var proc = wx.wxProcess(this->GetOutput());
+  proc->Redirect();
+
+  var cwd;
+  if( (wdir && #wdir > 0) ) { // ignore empty directory
+    cwd = wx.wxFileName.GetCwd();
+    cwd = wx.wxFileName.SetCwd(wdir) && cwd;
+  }
+
+  var _ = wx.wxLogNull(); // disable error reporting; will report as needed
+  var pid = wx.wxExecute(cmd, wx.wxEXEC_ASYNC, proc);
+  pid = pid != -1 && pid != 0 && pid || null;
+  if( cwd ) { wx.wxFileName.SetCwd(cwd); } // restore workdir
+  if( ! pid ) { return pid, wx.wxSysErrorMsg(); }
+
+  OutputSetCallbacks(pid, proc, callback || function() { }, endcallback);
+  return pid;
+}
+
+function ide::CreateImageList(group, ...) {
+  var _ = wx.wxLogNull(); // disable error reporting in popup
+  var size = wx.wxSize(16,16);
+  var imglist = wx.wxImageList(16,16);
+  for( i = 1, select('#', ...) ) {
+    var icon, file = this->GetBitmap(select(i, ...), group, size);
+    if( imglist->Add(icon) == -1 ) {
+      this->Print(("Failed to add image '%s' to the image list.")->format(file || select(i, ...)));
+    }
+  }
+  return imglist;
+}
+
+var tintdef = 100;
+var function iconFilter(bitmap, tint) {
+  if( type(tint) == 'function' ) { return tint(bitmap); }
+  if( type(tint) != 'table' || #tint != 3 ) { return bitmap; }
+
+  var tr, tg, tb = tint[1]/255, tint[2]/255, tint[3]/255;
+  var pi = 0.299*tr + 0.587*tg + 0.114*tb; // pixel intensity
+  var perc = (tint[0] || tintdef)/tintdef;
+  tr, tg, tb = tr*perc, tg*perc, tb*perc;
+
+  var img = bitmap->ConvertToImage();
+  for( x = 0, img->GetWidth()-1 ) {
+    for( y = 0, img->GetHeight()-1 ) {
+      if( ! img->IsTransparent(x, y) ) {
+        var r, g, b = img->GetRed(x, y)/255, img->GetGreen(x, y)/255, img->GetBlue(x, y)/255;
+        var gs = (r + g + b) / 3;
+        var weight = 1-4*(gs-0.5)*(gs-0.5);
+        r = math.max(0, math.min(255, math.floor(255 * (gs + (tr-pi) * weight))));
+        g = math.max(0, math.min(255, math.floor(255 * (gs + (tg-pi) * weight))));
+        b = math.max(0, math.min(255, math.floor(255 * (gs + (tb-pi) * weight))));
+        img->SetRGB(x, y, r, g, b);
+      }
+    }
+  }
+  return wx.wxBitmap(img);
+}
+
+function ide::GetTintedColor(color, tint) {
+  if( type(tint) == 'function' ) { return tint(color); }
+  if( type(tint) != 'table' || #tint != 3 ) { return color; }
+  if( type(color) != 'table' ) { return color; }
+
+  var tr, tg, tb = tint[1]/255, tint[2]/255, tint[3]/255;
+  var pi = 0.299*tr + 0.587*tg + 0.114*tb; // pixel intensity
+  var perc = (tint[0] || tintdef)/tintdef;
+  tr, tg, tb = tr*perc, tg*perc, tb*perc;
+
+  var r, g, b = color[1]/255, color[2]/255, color[3]/255;
+  var gs = (r + g + b) / 3;
+  var weight = 1-4*(gs-0.5)*(gs-0.5);
+  r = math.max(0, math.min(255, math.floor(255 * (gs + (tr-pi) * weight))));
+  g = math.max(0, math.min(255, math.floor(255 * (gs + (tg-pi) * weight))));
+  b = math.max(0, math.min(255, math.floor(255 * (gs + (tb-pi) * weight))));
+  return {r, g, b};
+}
+
+var icons = {}; // icon cache to avoid reloading the same icons
+function ide::GetBitmap(id, client, size) {
+  var im = this.config.imagemap;
+  var width = size->GetWidth();
+  var key = width.."/"..id;
+  var keyclient = key.."-"..client;
+  var mapped = im[keyclient] || im[id.."-"..client] || im[key] || im[id];
+  // mapped may be a file name/path or wxImage object; take that into account
+  if( type(im[id.."-"..client]) == 'string' ) { keyclient = width.."/"..im[id.."-"..client];
+  } else if( type(im[keyclient]) == 'string' ) { keyclient = im[keyclient];
+  } else if( type(im[id]) == 'string' ) {
+    id = im[id];
+    key = width.."/"..id;
+    keyclient = key.."-"..client;
+  }
+
+  var fileClient = this->GetAppName() .. "/res/" .. keyclient .. ".png";
+  var fileKey = this->GetAppName() .. "/res/" .. key .. ".png";
+  var isImage = type(mapped) == 'userdata' && mapped->GetClassInfo()->GetClassName() == 'wxImage';
+  var file;
+  if( mapped && (isImage || wx.wxFileName(mapped)->FileExists()) ) { file = mapped;
+  } else if( wx.wxFileName(fileClient)->FileExists() ) { file = fileClient;
+  } else if( wx.wxFileName(fileKey)->FileExists() ) { file = fileKey;
+  } else {
+    if( width > 16 && width % 2 == 0 ) {
+      var _, f = this->GetBitmap(id, client, wx.wxSize(width/2, width/2));
+      if( f ) {
+        var img = wx.wxBitmap(f)->ConvertToImage();
+        file = img->Rescale(width, width, wx.wxIMAGE_QUALITY_NEAREST);
+      }
+    }
+    if( ! file ) { return wx.wxArtProvider.GetBitmap(id, client, size); }
+  }
+  var icon = icons[file] || iconFilter(wx.wxBitmap(file), this.config.imagetint);
+  icons[file] = icon;
+  return icon, file;
+}
+
+function ide::AddPackage(name, package) {
+  this.packages[name] = setmetatable(package, this.proto.Plugin);
+  this.packages[name].fname = name;
+  return this.packages[name];
+}
+function ide::RemovePackage(name) { this.packages[name] = null; }
+function ide::GetPackage(name) { return this.packages[name]; }
+
+function ide::AddWatch(watch, value) {
+  var mgr = this.frame.uimgr;
+  var pane = mgr->GetPane("watchpanel");
+  if( (pane->IsOk() && ! pane->IsShown()) ) {
+    pane->Show();
+    mgr->Update();
+  }
+
+  var watchCtrl = this.debugger.watchCtrl;
+  if( ! watchCtrl ) { return; }
+
+  var root = watchCtrl->GetRootItem();
+  if( ! root || ! root->IsOk() ) { return; }
+
+  var item = watchCtrl->GetFirstChild(root);
+  while( true ) {
+    if( ! item->IsOk() ) { break; }
+    if( watchCtrl->GetItemExpression(item) == watch ) {
+      if( value ) { watchCtrl->SetItemText(item, watch .. ' = ' .. tostring(value)); }
+      return item;
+    }
+    item = watchCtrl->GetNextSibling(item);
+  }
+
+  item = watchCtrl->AppendItem(root, watch, 1);
+  watchCtrl->SetItemExpression(item, watch, value);
+  return item;
+}
+
+function ide::AddInterpreter(name, interpreter) {
+  this.interpreters[name] = setmetatable(interpreter, this.proto.Interpreter);
+  ProjectUpdateInterpreters();
+}
+function ide::RemoveInterpreter(name) {
+  this.interpreters[name] = null;
+  ProjectUpdateInterpreters();
+}
+
+function ide::AddSpec(name, spec) {
+  this.specs[name] = spec;
+  UpdateSpecs();
+  if( spec.apitype ) { ReloadAPIs(spec.apitype); }
+}
+function ide::RemoveSpec(name) { this.specs[name] = null; }
+
+function ide::FindSpec(ext, firstline) {
+  if( ! ext ) { return; }
+  for( _,curspec in pairs(this.specs) ) {
+    for( _,curext in ipairs(curspec.exts || {}) ) {
+      if( curext == ext ) { return curspec; }
+    }
+  }
+  // check for extension to spec mapping and create the spec on the fly if present
+  var edcfg = this.config.editor;
+  var name = type(edcfg.specmap) == "table" && edcfg.specmap[ext];
+  var shebang = false;
+  if( ! name && firstline ) {
+    name = firstline->match("#!.-(%w+)%s*$");
+    shebang = true;
+  }
+  if( name ) {
+    // check if there is already spec with this name, but doesn't have this extension registered;
+    // don't register the extension if the format was set based on the shebang
+    if( this.specs[name] ) {
+      if( ! this.specs[name].exts ) { this.specs[name].exts = {}; }
+      if( ! shebang ) { table.insert(this.specs[name].exts, ext); }
+      return this.specs[name];
+    }
+    var spec = { exts = shebang && {} || {ext}, lexer = "lexlpeg."..name };
+    this->AddSpec(name, spec);
+    return spec;
+  }
+}
+
+function ide::AddAPI(type, name, api) {
+  this.apis[type] = this.apis[type] || {};
+  this.apis[type][name] = api;
+  ReloadAPIs(type);
+}
+function ide::RemoveAPI(type, name) { this.apis[type][name] = null; }
+
+function ide::AddConsoleAlias(alias, table) { return ShellSetAlias(alias, table); }
+function ide::RemoveConsoleAlias(alias) { return ShellSetAlias(alias, null); }
+
+function ide::AddMarker(...) { return StylesAddMarker(...); }
+function ide::GetMarker(marker) { return StylesGetMarker(marker); }
+function ide::RemoveMarker(marker) { StylesRemoveMarker(marker); }
+
+var styles = {};
+function ide::AddStyle(style, num) {
+  num = num || styles[style];
+  if( ! num ) { // new style; find the smallest available number
+    var nums = {};
+    for( _, stylenum in pairs(styles) ) { nums[stylenum] = true; }
+    num = wxstc.wxSTC_STYLE_MAX;
+    while( nums[num] && num > wxstc.wxSTC_STYLE_LASTPREDEFINED ) { num -=   1; }
+    if( num <= wxstc.wxSTC_STYLE_LASTPREDEFINED ) { return; }
+  }
+  styles[style] = num;
+  return num;
+}
+function ide::GetStyle(style) { return styles[style]; }
+function ide::GetStyles() { return styles; }
+function ide::RemoveStyle(style) { styles[style] = null; }
+
+var indicators = {};
+function ide::AddIndicator(indic, num) {
+  num = num || indicators[indic];
+  if( ! num ) { // new indicator; find the smallest available number
+    var nums = {};
+    for( _, indicator in pairs(indicators) ) {
+      // wxstc.wxSTC_INDIC_CONTAINER is the first available style
+      if( indicator >= wxstc.wxSTC_INDIC_CONTAINER ) {
+        nums[indicator-wxstc.wxSTC_INDIC_CONTAINER+1] = true;
+      }
+    }
+    // can't do `#nums + wxstc.wxSTC_INDIC_CONTAINER` as #nums can be calculated incorrectly
+    // on tables that have gaps before 2^n values (`1,2,nil,4`)
+    num = wxstc.wxSTC_INDIC_CONTAINER;
+    for( _ in ipairs(nums) ) { num +=   1; }
+    if( num > wxstc.wxSTC_INDIC_MAX ) { return; }
+  }
+  indicators[indic] = num;
+  return num;
+}
+function ide::GetIndicator(indic) { return indicators[indic]; }
+function ide::GetIndicators() { return indicators; }
+function ide::RemoveIndicator(indic) { indicators[indic] = null; }
+
+// this provides a simple stack for saving/restoring current configuration
+var configcache = {};
+function ide::AddConfig(name, files) {
+  if( ! name || configcache[name] ) { return; } // don't overwrite existing slots
+  if( type(files) != "table" ) { files = {files}; } // allow to pass one value
+  configcache[name] = {
+    config = require('mobdebug').dump(this.config, {nocode = true}),
+    configmeta = getmetatable(this.config),
+    packages = {},
+    overrides = {},
+  };
+  // build a list of existing packages
+  var packages = {};
+  for( package in pairs(this.packages) ) { packages[package] = true; }
+  // load config file(s)
+  for( _, file in pairs(files) ) { LoadLuaConfig(MergeFullPath(name, file)); }
+  // register newly added packages (if any)
+  for( package in pairs(this.packages) ) {
+    if( ! packages[package] ) { // this is a newly added package
+      PackageEventHandleOne(package, "onRegister");
+      configcache[name].packages[package] = true;
+    }
+  }
+  ReApplySpecAndStyles(); // apply current config to the UI
+}
+var function setLongKey(tbl, key, value) {
+  var paths = {};
+  for( path in key->gmatch("([^%.]+)") ) { table.insert(paths, path); }
+  while( #paths > 0 ) {
+    var lastkey = table.remove(paths, 1);
+    if( #paths > 0 ) {
+      if( tbl[lastkey] == null ) { tbl[lastkey] = {}; }
+      tbl = tbl[lastkey];
+      if( type(tbl) != "table" ) { return; }
+    } else {
+      tbl[lastkey] = value;
+    }
+  }
+}
+function ide::RemoveConfig(name) {
+  if( ! name || ! configcache[name] ) { return; }
+  // unregister cached packages
+  for( package in pairs(configcache[name].packages) ) { PackageUnRegister(package); }
+  // load original config
+  var ok, res = LoadSafe(configcache[name].config);
+  if( ok ) {
+    this.config = res;
+    // restore overrides
+    for( key, value in pairs(configcache[name].overrides) ) { setLongKey(this.config, key, value); }
+    if( configcache[name].configmeta ) { setmetatable(this.config, configcache[name].configmeta); }
+  } else {
+    ide->Print(("Error while restoring configuration: '%s'.")->format(res));
+  }
+  configcache[name] = null; // clear the slot after use
+  ReApplySpecAndStyles(); // apply current config to the UI
+}
+function ide::SetConfig(key, value, name) {
+  setLongKey(this.config, key, value); // set config["foo.bar"] as config.foo.bar
+  if( ! name || ! configcache[name] ) { return; }
+  configcache[name].overrides[key] = value;
+}
+
+var panels = {};
+function ide::AddPanel(ctrl, panel, name, conf) {
+  var width, height = 360, 200;
+  var notebook = wxaui.wxAuiNotebook(this.frame, wx.wxID_ANY,
+    wx.wxDefaultPosition, wx.wxDefaultSize,
+    wxaui.wxAUI_NB_DEFAULT_STYLE + wxaui.wxAUI_NB_TAB_EXTERNAL_MOVE
+    - wxaui.wxAUI_NB_CLOSE_ON_ACTIVE_TAB + wx.wxNO_BORDER);
+  notebook->AddPage(ctrl, name, true);
+  notebook->Connect(wxaui.wxEVT_COMMAND_AUINOTEBOOK_BG_DCLICK,
+    function() { PaneFloatToggle(notebook); });
+  notebook->Connect(wxaui.wxEVT_COMMAND_AUINOTEBOOK_PAGE_CLOSE,
+    function(event) { event->Veto(); });
+
+  var mgr = this.frame.uimgr;
+  mgr->AddPane(notebook, wxaui.wxAuiPaneInfo()->
+              Name(panel)->Float()->CaptionVisible(false)->PaneBorder(false)->
+              MinSize(width/2,height/2)->
+              BestSize(width,height)->FloatingSize(width,height)->
+              PinButton(true)->Hide());
+  if( type(conf) == "function" ) { conf(mgr->GetPane(panel)); }
+  mgr.defaultPerspective = mgr->SavePerspective(); // resave default perspective
+
+  panels[name] = {ctrl, panel, name, conf};
+  return mgr->GetPane(panel), notebook;
+}
+
+function ide::RemovePanel(panel) {
+  var mgr = this.frame.uimgr;
+  var pane = mgr->GetPane(panel);
+  if( pane->IsOk() ) {
+    var win = pane.window;
+    mgr->DetachPane(win);
+    win->Destroy();
+    mgr->Update();
+  }
+}
+
+function ide::IsPanelDocked(panel) {
+  var layout = this->GetSetting("/view", "uimgrlayout");
+  return layout && ! layout->find(panel);
+}
+function ide::AddPanelDocked(notebook, ctrl, panel, name, conf, activate) {
+  notebook->AddPage(ctrl, name, activate != false);
+  panels[name] = {ctrl, panel, name, conf};
+  return notebook;
+}
+function ide::AddPanelFlex(notebook, ctrl, panel, name, conf) {
+  var nb;
+  if( this->IsPanelDocked(panel) ) {
+    nb = this->AddPanelDocked(notebook, ctrl, panel, name, conf, false);
+  } else {
+    this->AddPanel(ctrl, panel, name, conf);
+  }
+  return nb;
+}
+
+function ide::IsValidCtrl(ctrl) {
+  return ctrl && pcall(function() { ctrl->GetId(); });
+}
+
+function ide::IsValidProperty(ctrl, prop) {
+  // some control may return `nil` values for non-existing properties, so check for that
+  return pcall(function() { return ctrl[prop]; }) && ctrl[prop] != null;
+}
+
+function ide::IsValidHotKey(ksc) {
+  return ksc && wx.wxAcceleratorEntry()->FromString(ksc);
+}
+
+function ide::IsWindowShown(win) {
+  while( win ) {
+    if( ! win->IsShown() ) { return false; }
+    win = win->GetParent();
+  }
+  return true;
+}
+
+function ide::RestorePanelByLabel(name) {
+  if( ! panels[name] ) { return; }
+  return this->AddPanel(unpack(panels[name]));
+}
+
+var function tool2id(name) { return ID("tools.exec."..name); }
+
+function ide::AddTool(name, command, updateui) {
+  var toolMenu = this->FindTopMenu('&Tools');
+  if( ! toolMenu ) {
+    var helpMenu, helpindex = this->FindTopMenu('&Help');
+    if( ! helpMenu ) { helpindex = this->GetMenuBar()->GetMenuCount(); }
+
+    toolMenu = this->MakeMenu ({});
+    this->GetMenuBar()->Insert(helpindex, toolMenu, TR("&Tools"));
+  }
+  var id = tool2id(name);
+  toolMenu->Append(id, name);
+  if( command ) {
+    toolMenu->Connect(id, wx.wxEVT_COMMAND_MENU_SELECTED,
+      function (event) {
+        var editor = this->GetEditor();
+        if( ! editor ) { return; }
+
+        command(this->GetDocument(editor)->GetFilePath(), this->GetProject());
+        return true;
+      });
+    toolMenu->Connect(id, wx.wxEVT_UPDATE_UI,
+      updateui || function(event) { event->Enable(this->GetEditor() != null); });
+  }
+  return id, toolMenu;
+}
+
+function ide::RemoveTool(name) {
+  this->RemoveMenuItem(tool2id(name));
+  var toolMenu, toolindex = this->FindTopMenu('&Tools');
+  if( toolMenu && toolMenu->GetMenuItemCount() == 0 ) { this->GetMenuBar()->Remove(toolindex); }
+}
+
+var lexers = {};
+function ide::AddLexer(name, lexer) {
+  lexers[name] = lexer;
+}
+function ide::RemoveLexer(name) {
+  lexers[name] = null;
+}
+function ide::GetLexer(name) {
+  return lexers[name];
+}
+
+var timers = {};
+var function evhandler(event) {
+  var callback = timers[event->GetId()];
+  if( callback ) { callback(event); }
+}
+function ide::AddTimer(ctrl, callback) {
+  table.insert(timers, callback || function() { });
+  ctrl->Connect(wx.wxEVT_TIMER, evhandler);
+  return wx.wxTimer(ctrl, #timers);
+}
+
+var function setAcceleratorTable(accelerators) {
+  var at = {};
+  for( id, ksc in pairs(accelerators) ) {
+    var ae = wx.wxAcceleratorEntry(); ae->FromString(ksc);
+    table.insert(at, wx.wxAcceleratorEntry(ae->GetFlags(), ae->GetKeyCode(), id));
+  }
+  ide->GetMainFrame()->SetAcceleratorTable(#at > 0 && wx.wxAcceleratorTable(at) || wx.wxNullAcceleratorTable);
+}
+var at = {};
+function ide::SetAccelerator(id, ksc) {
+  if( (! id) || (ksc && ! this->IsValidHotKey(ksc)) ) { return false; }
+  at[id] = ksc;
+  setAcceleratorTable(at);
+  return true;
+}
+function ide::GetAccelerator(id) { return at[id]; }
+function ide::GetAccelerators() { return at; }
+
+function ide::GetHotKey(idOrKsc) {
+  if( ! idOrKsc ) { return null, "GetHotKey requires id or key shortcut."; }
+
+  var id, ksc = idOrKsc;
+  if( type(idOrKsc) == type("") ) { id, ksc = ksc, id; }
+
+  var accelerators = ide->GetAccelerators();
+  var keymap = this.config.keymap;
+  if( id ) {
+    ksc = keymap[id] || accelerators[id];
+  } else { // ksc is provided
+    // search the keymap for the match
+    var kscpat = "^"..(ksc->gsub("[+-]", "[+-]")->lower()).."$";
+    for( gid, ksc in pairs(keymap) ) {
+      if( ksc->lower()->find(kscpat) ) {
+        id = gid;
+        break;
+      }
+    }
+
+    // if `SetHotKey` is used, there shouldn't be any conflict between keymap and accelerators,
+    // but accelerators can be set directly and will take precedence, so search them as well.
+    // this will overwrite the value from the keymap
+    for( gid, ksc in pairs(accelerators) ) {
+      if( ksc->lower()->find(kscpat) ) {
+        id = gid;
+        break;
+      }
+    }
+  }
+  if( id && ksc ) { return id, ksc; }
+  return; // couldn't find the match
+}
+
+function ide::SetHotKey(id, ksc) {
+  if( ksc && ! this->IsValidHotKey(ksc) ) {
+    this->Print(("Can't set invalid hotkey value: '%s'.")->format(ksc));
+    return;
+  }
+
+  // this function handles several cases
+  // 1. shortcut is assigned to an ID listed in keymap
+  // 2. shortcut is assigned to an ID used in a menu item
+  // 3. shortcut is assigned to an ID linked to an item (but not present in keymap or menu)
+  // 4. shortcut is assigned to a function (passed instead of ID)
+  var keymap = this.config.keymap;
+
+  if( ksc ) {
+    // remove any potential conflict with this hotkey
+    // since the hotkey can be written as `Ctrl+A` and `Ctrl-A`, account for both
+    // this doesn't take into account different order in `Ctrl-Shift-F1` and `Shift-Ctrl-F1`.
+    var kscpat = "^"..(ksc->gsub("[+-]", "[+-]")->lower()).."$";
+    for( gid, ksc in pairs(keymap) ) {
+      // if the same hotkey is used elsewhere (not one of IDs being checked)
+      if( ksc->lower()->find(kscpat) ) {
+        keymap[gid] = "";
+        // try to find a menu item with this ID (if any) to remove the hotkey
+        var item = this->FindMenuItem(gid);
+        if( item ) { item->SetText(item->GetText()->gsub("\t.+","")..""); }
+      }
+      // continue with the loop as there may be multiple associations with the same hotkey
+    }
+
+    // remove an existing accelerator (if any)
+    var acid = this->GetHotKey(ksc);
+    if( acid ) { this->SetAccelerator(acid); }
+
+    // if the hotkey is associated with a function, handle it first
+    if( type(id) == "function" ) {
+      var fakeid = NewID();
+      this->GetMainFrame()->Connect(fakeid, wx.wxEVT_COMMAND_MENU_SELECTED, function() { id(); });
+      this->SetAccelerator(fakeid, ksc);
+      return fakeid, ksc;
+    }
+  }
+
+  // if the keymap is already asigned, then reassign it
+  // if not, then it may need an accelerator, which will be set later
+  if( keymap[id] ) { keymap[id] = ksc; }
+
+  var item = this->FindMenuItem(id);
+  if( item ) {
+    // get the item text and replace the shortcut
+    // since it also needs to keep the accelerator (if any), so can't use `GetLabel`
+    item->SetText(item->GetText()->gsub("\t.+","")..KSC(null, ksc));
+  }
+
+  // if there is no keymap or menu item, then use the accelerator
+  if( ! keymap[id] && ! item ) { this->SetAccelerator(id, ksc); }
+  return id, ksc;
+}
+
+function ide::IsProjectSubDirectory(dir) {
+  var projdir = this->GetProject();
+  if( ! projdir ) { return; }
+  // normalize and check if directory when cut is the same as the project directory;
+  // this relies on the project directory ending in a path separator.
+  var path = wx.wxFileName(dir->sub(1, #projdir));
+  path->Normalize();
+  return path->SameAs(wx.wxFileName(projdir));
+}
+
+function ide::SetCommandLineParameters(params) {
+  if( ! params ) { return; }
+  this->SetConfig("arg.any", #params > 0 && params || null, this->GetProject());
+  if( #params > 0 ) { this->GetPackage("core.project")->AddCmdLine(params); }
+  var interpreter = this->GetInterpreter();
+  if( interpreter ) { interpreter->UpdateStatus(); }
+}
+
+function ide::ActivateFile(filename) {
+  if( wx.wxDirExists(filename) ) {
+    this->SetProject(filename);
+    return true;
+  }
+
+  var name, suffix, value = filename->match('(.+):([lLpP]?)(%d+)$');
+  if( name && ! wx.wxFileExists(filename) ) { filename = name; }
+
+  // check if non-existing file can be loaded from the project folder;
+  // this is to handle: "project file" used on the command line
+  if( ! wx.wxFileExists(filename) && ! wx.wxIsAbsolutePath(filename) ) {
+    filename = GetFullPathIfExists(this->GetProject(), filename) || filename;
+  }
+
+  var opened = LoadFile(filename, null, true);
+  if( opened && value ) {
+    if( suffix->upper() == 'P' ) { opened->GotoPosDelayed(tonumber(value));
+    } else { opened->GotoPosDelayed(opened->PositionFromLine(value-1));
+    }
+  }
+
+  if( ! opened ) {
+    this->Print(TR("Can't open file '%s': %s")->format(filename, wx.wxSysErrorMsg()));
+  }
+  return opened;
+}
+
+function ide::MergePath(...) { return MergeFullPath(...); }
+
+function ide::GetFileList(...) { return FileSysGetRecursive(...); }
+
+function ide::AnalyzeString(...) { return AnalyzeString(...); }
+
+function ide::AnalyzeFile(...) { return AnalyzeFile(...); }
+
+/* format placeholders
+    - %f -- full project name (project path)
+    - %s -- short project name (directory name)
+    - %i -- interpreter name
+    - %S -- file name
+    - %F -- file path
+    - %n -- line number
+    - %c -- line content
+    - %T -- application title
+    - %v -- application version
+    - %t -- current tab name
+--*/
+function ide::ExpandPlaceholders(msg, ph) {
+  ph = ph || {};
+  if( type(msg) == 'function' ) { return msg(ph); }
+  var editor = this->GetEditor();
+  var proj = this->GetProject() || "";
+  var dirs = wx.wxFileName(proj)->GetDirs();
+  var doc = editor && this->GetDocument(editor);
+  var nb = this->GetEditorNotebook();
+  var def = {
+    f = proj,
+    s = dirs[#dirs] || "",
+    i = this->GetInterpreter()->GetName() || "",
+    S = doc && doc->GetFileName() || "",
+    F = doc && doc->GetFilePath() || "",
+    n = editor && editor->GetCurrentLine()+1 || 0,
+    c = editor && editor->GetLineDyn(editor->GetCurrentLine()) || "",
+    T = this->GetProperty("editor") || "",
+    v = this.VERSION,
+    t = editor && nb->GetPageText(nb->GetPageIndex(editor)) || "",
+  };
+  return(msg->gsub('%%(%w)', function(p) { return ph[p] || def[p] || '?'; }));
+}
+
+{
+  var codepage;
+  function ide::GetCodePage() {
+    if( this.osname != "Windows" ) { return; }
+    if( codepage == null ) {
+      codepage = tonumber(this.config.codepage) || this.config.codepage;
+      if( codepage == true ) {
+        // auto-detect the codepage;
+        // this is done asynchronously, so the current method may still return `nil`
+        this->ExecuteCommand("cmd /C chcp", null, function(s) { codepage = s->match(":%s*(%d+)"); });
+      }
+    }
+    return tonumber(codepage);
+  }
+}
+
+{
+  var beforeFullScreenPerspective;
+  var statusbarShown;
+
+  function ide::ShowFullScreen(setFullScreen) {
+    var uimgr = this->GetUIManager();
+    var frame = this->GetMainFrame();
+    if( setFullScreen ) {
+      beforeFullScreenPerspective = uimgr->SavePerspective();
+
+      var panes = uimgr->GetAllPanes();
+      for( index = 0, panes->GetCount()-1 ) {
+        var name = panes->Item(index).name;
+        if( name != "notebook" ) { uimgr->GetPane(name)->Hide(); }
+      }
+      uimgr->Update();
+      SetEditorSelection(); // make sure the focus is on the editor
+    }
+
+    // On OSX, status bar is not hidden when switched to
+    // full screen: http://trac.wxwidgets.org/ticket/14259; do manually.
+    // need to turn off before showing full screen and turn on after,
+    // otherwise the window is restored incorrectly and is reduced in size.
+    if( this.osname == 'Macintosh' && setFullScreen ) {
+      statusbarShown = frame->GetStatusBar()->IsShown();
+      frame->GetStatusBar()->Hide();
+    }
+
+    // protect from systems that don't have ShowFullScreen (GTK on linux?)
+    pcall(function() { frame->ShowFullScreen(setFullScreen); });
+
+    if( ! setFullScreen && beforeFullScreenPerspective ) {
+      uimgr->LoadPerspective(beforeFullScreenPerspective, true);
+      beforeFullScreenPerspective = null;
+    }
+
+    if( this.osname == 'Macintosh' && ! setFullScreen ) {
+      if( statusbarShown ) {
+        frame->GetStatusBar()->Show();
+        // refresh AuiManager as the statusbar may be shown below the border
+        uimgr->Update();
+      }
+    }
+
+    // accelerator table gets removed on Linux when setting full screen mode, so put it back;
+    // see wxwidgets ticket https://trac.wxwidgets.org/ticket/18053
+    if( this.osname == 'Unix' && setFullScreen ) {
+      this->SetAccelerator(-1); // only refresh the accelerator table after setting full screen
+    }
+  }
+}

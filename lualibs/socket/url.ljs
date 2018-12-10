@@ -1,0 +1,307 @@
+//---------------------------------------------------------------------------
+// URI parsing, composition and relative URL resolution
+// LuaSocket toolkit.
+// Author: Diego Nehab
+//---------------------------------------------------------------------------
+
+//---------------------------------------------------------------------------
+// Declare module
+//---------------------------------------------------------------------------
+var string = require("string");
+var base = _G;
+var table = require("table");
+var socket = require("socket");
+
+socket.url = {};
+var _M = socket.url;
+
+//---------------------------------------------------------------------------
+// Module version
+//---------------------------------------------------------------------------
+_M._VERSION = "URL 1.0.3";
+
+//---------------------------------------------------------------------------
+// Encodes a string into its escaped hexadecimal representation
+// Input
+//   s: binary string to be encoded
+// Returns
+//   escaped representation of string binary
+//---------------------------------------------------------------------------
+function _M.escape(s) {
+    return (string.gsub(s, "([^A-Za-z0-9_])", function(c) {
+        return string.format("%%%02x", string.byte(c));
+    }));
+}
+
+//---------------------------------------------------------------------------
+// Protects a path segment, to prevent it from interfering with the
+// url parsing.
+// Input
+//   s: binary string to be encoded
+// Returns
+//   escaped representation of string binary
+//---------------------------------------------------------------------------
+var function make_set(t) {
+    var s = {};
+    for( i,v in base.ipairs(t) ) {
+        s[t[i]] = 1;
+    }
+    return s;
+}
+
+// these are allowed withing a path segment, along with alphanum
+// other characters must be escaped
+var segment_set = make_set ({
+    "-", "_", ".", "!", "~", "*", "'", "(",
+    ")", ":", "@", "&", "=", "+", "$", ",",
+});
+
+var function protect_segment(s) {
+    return string.gsub(s, "([^A-Za-z0-9_])", function (c) {
+        if( segment_set[c] ) { return c;
+        } else { return string.format("%%%02x", string.byte(c)); }
+    });
+}
+
+//---------------------------------------------------------------------------
+// Encodes a string into its escaped hexadecimal representation
+// Input
+//   s: binary string to be encoded
+// Returns
+//   escaped representation of string binary
+//---------------------------------------------------------------------------
+function _M.unescape(s) {
+    return (string.gsub(s, "%%(%x%x)", function(hex) {
+        return string.char(base.tonumber(hex, 16));
+    }));
+}
+
+//---------------------------------------------------------------------------
+// Builds a path from a base path and a relative path
+// Input
+//   base_path
+//   relative_path
+// Returns
+//   corresponding absolute path
+//---------------------------------------------------------------------------
+var function absolute_path(base_path, relative_path) {
+    if( string.sub(relative_path, 1, 1) == "/" ) { return relative_path; }
+    var path = string.gsub(base_path, "[^/]*$", "");
+    path = path .. relative_path;
+    path = string.gsub(path, "([^/]*%./)", function (s) {
+        if( s != "./" ) { return s; } else { return ""; }
+    });
+    path = string.gsub(path, "/%.$", "/");
+    var reduced;
+    while( reduced != path ) {
+        reduced = path;
+        path = string.gsub(reduced, "([^/]*/%.%./)", function (s) {
+            if( s != "../../" ) { return ""; } else { return s; }
+        });
+    }
+    path = string.gsub(reduced, "([^/]*/%.%.)$", function (s) {
+        if( s != "../.." ) { return ""; } else { return s; }
+    });
+    return path;
+}
+
+//---------------------------------------------------------------------------
+// Parses a url and returns a table with all its parts according to RFC 2396
+// The following grammar describes the names given to the URL parts
+// <url> ::= <scheme>://<authority>/<path>;<params>?<query>#<fragment>
+// <authority> ::= <userinfo>@<host>:<port>
+// <userinfo> ::= <user>[:<password>]
+// <path> :: = {<segment>/}<segment>
+// Input
+//   url: uniform resource locator of request
+//   default: table with default values for each field
+// Returns
+//   table with the following fields, where RFC naming conventions have
+//   been preserved:
+//     scheme, authority, userinfo, user, password, host, port,
+//     path, params, query, fragment
+// Obs:
+//   the leading '/' in {/<path>} is considered part of <path>
+//---------------------------------------------------------------------------
+function _M.parse(url, default) {
+    // initialize default parameters
+    var parsed = {};
+    for( i,v in base.pairs(default || parsed) ) { parsed[i] = v; }
+    // empty url is parsed to nil
+    if( ! url || url == "" ) { return null, "invalid url"; }
+    // remove whitespace
+    // url = string.gsub(url, "%s", "")
+    // get fragment
+    url = string.gsub(url, "#(.*)$", function(f) {
+        parsed.fragment = f;
+        return "";
+    });
+    // get scheme
+    url = string.gsub(url, "^([%w][%w%+%-%.]*)%:",
+        function(s) { parsed.scheme = s; return ""; });
+    // get authority
+    url = string.gsub(url, "^//([^/]*)", function(n) {
+        parsed.authority = n;
+        return "";
+    });
+    // get query string
+    url = string.gsub(url, "%?(.*)", function(q) {
+        parsed.query = q;
+        return "";
+    });
+    // get params
+    url = string.gsub(url, "%;(.*)", function(p) {
+        parsed.params = p;
+        return "";
+    });
+    // path is whatever was left
+    if( url != "" ) { parsed.path = url; }
+    var authority = parsed.authority;
+    if( ! authority ) { return parsed; }
+    authority = string.gsub(authority,"^([^@]*)@",
+        function(u) { parsed.userinfo = u; return ""; });
+    authority = string.gsub(authority, ":([^:%]]*)$",
+        function(p) { parsed.port = p; return ""; });
+    if( authority != "" ) { 
+        // IPv6?
+        parsed.host = string.match(authority, "^%[(.+)%]$") || authority; 
+    }
+    var userinfo = parsed.userinfo;
+    if( ! userinfo ) { return parsed; }
+    userinfo = string.gsub(userinfo, ":([^:]*)$",
+        function(p) { parsed.password = p; return ""; });
+    parsed.user = userinfo;
+    return parsed;
+}
+
+//---------------------------------------------------------------------------
+// Rebuilds a parsed URL from its components.
+// Components are protected if any reserved or unallowed characters are found
+// Input
+//   parsed: parsed URL, as returned by parse
+// Returns
+//   a stringing with the corresponding URL
+//---------------------------------------------------------------------------
+function _M.build(parsed) {
+    var ppath = _M.parse_path(parsed.path || "");
+    var url = _M.build_path(ppath);
+    if( parsed.params ) { url = url .. ";" .. parsed.params; }
+    if( parsed.query ) { url = url .. "?" .. parsed.query; }
+    var authority = parsed.authority;
+    if( parsed.host ) {
+        authority = parsed.host;
+        if( string.find(authority, ":") ) { // IPv6?
+            authority = "[" .. authority .. "]";
+        }
+        if( parsed.port ) { authority = authority .. ":" .. parsed.port; }
+        var userinfo = parsed.userinfo;
+        if( parsed.user ) {
+            userinfo = parsed.user;
+            if( parsed.password ) {
+                userinfo = userinfo .. ":" .. parsed.password;
+            }
+        }
+        if( userinfo ) { authority = userinfo .. "@" .. authority; }
+    }
+    if( authority ) { url = "//" .. authority .. url; }
+    if( parsed.scheme ) { url = parsed.scheme .. ":" .. url; }
+    if( parsed.fragment ) { url = url .. "#" .. parsed.fragment; }
+    // url = string.gsub(url, "%s", "")
+    return url;
+}
+
+//---------------------------------------------------------------------------
+// Builds a absolute URL from a base and a relative URL according to RFC 2396
+// Input
+//   base_url
+//   relative_url
+// Returns
+//   corresponding absolute url
+//---------------------------------------------------------------------------
+function _M.absolute(base_url, relative_url) {
+    if( base.type(base_url) == "table" ) {
+        base_parsed = base_url;
+        base_url = _M.build(base_parsed);
+    } else {
+        base_parsed = _M.parse(base_url);
+    }
+    var relative_parsed = _M.parse(relative_url);
+    if( ! base_parsed ) { return relative_url;
+    } else if( ! relative_parsed ) { return base_url;
+    } else if( relative_parsed.scheme ) { return relative_url;
+    } else {
+        relative_parsed.scheme = base_parsed.scheme;
+        if( ! relative_parsed.authority ) {
+            relative_parsed.authority = base_parsed.authority;
+            if( ! relative_parsed.path ) {
+                relative_parsed.path = base_parsed.path;
+                if( ! relative_parsed.params ) {
+                    relative_parsed.params = base_parsed.params;
+                    if( ! relative_parsed.query ) {
+                        relative_parsed.query = base_parsed.query;
+                    }
+                }
+            } else {    
+                relative_parsed.path = absolute_path(base_parsed.path || "",
+                    relative_parsed.path);
+            }
+        }
+        return _M.build(relative_parsed);
+    }
+}
+
+//---------------------------------------------------------------------------
+// Breaks a path into its segments, unescaping the segments
+// Input
+//   path
+// Returns
+//   segment: a table with one entry per segment
+//---------------------------------------------------------------------------
+function _M.parse_path(path) {
+    var parsed = {};
+    path = path || "";
+    //path = string.gsub(path, "%s", "")
+    string.gsub(path, "([^/]+)", function (s) { table.insert(parsed, s); });
+    for( i = 1, #parsed ) {
+        parsed[i] = _M.unescape(parsed[i]);
+    }
+    if( string.sub(path, 1, 1) == "/" ) { parsed.is_absolute = 1; }
+    if( string.sub(path, -1, -1) == "/" ) { parsed.is_directory = 1; }
+    return parsed;
+}
+
+//---------------------------------------------------------------------------
+// Builds a path component from its segments, escaping protected characters.
+// Input
+//   parsed: path segments
+//   unsafe: if true, segments are not protected before path is built
+// Returns
+//   path: corresponding path stringing
+//---------------------------------------------------------------------------
+function _M.build_path(parsed, unsafe) {
+    var path = "";
+    var n = #parsed;
+    if( unsafe ) {
+        for( i = 1, n-1 ) {
+            path = path .. parsed[i];
+            path = path .. "/";
+        }
+        if( n > 0 ) {
+            path = path .. parsed[n];
+            if( parsed.is_directory ) { path = path .. "/"; }
+        }
+    } else {
+        for( i = 1, n-1 ) {
+            path = path .. protect_segment(parsed[i]);
+            path = path .. "/";
+        }
+        if( n > 0 ) {
+            path = path .. protect_segment(parsed[n]);
+            if( parsed.is_directory ) { path = path .. "/"; }
+        }
+    }
+    if( parsed.is_absolute ) { path = "/" .. path; }
+    return path;
+}
+
+return _M;

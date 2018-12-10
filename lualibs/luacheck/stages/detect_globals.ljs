@@ -1,0 +1,252 @@
+var utils = require ("luacheck.utils");
+
+var stage = {};
+
+var function prefix_if_indirect(message) {
+   return function(warning) {
+      if( warning.indirect ) {
+         return "indirectly " .. message;
+      } else {
+         return message;
+      }
+   };
+}
+
+var function setting_global_format_message(warning) {
+   // `module` field is set during filtering.
+   if( warning.module ) {
+      return "setting non-module global variable {name!}";
+   } else {
+      return "setting non-standard global variable {name!}";
+   }
+}
+var global_warning_fields = {"name", "indexing", "previous_indexing_len", "top", "indirect"};
+
+stage.warnings = {
+   ["111"] = {message_format = setting_global_format_message, fields = global_warning_fields},
+   ["112"] = {message_format = "mutating non-standard global variable {name!}", fields = global_warning_fields},
+   ["113"] = {message_format = "accessing undefined variable {name!}", fields = global_warning_fields},
+   // The following warnings are added during filtering.
+   ["121"] = {message_format = "setting read-only global variable {name!}", fields = {}},
+   ["122"] = {message_format = prefix_if_indirect("setting read-only field {field!} of global {name!}"), fields = {}},
+   ["131"] = {message_format = "unused global variable {name!}", fields = {}},
+   ["142"] = {message_format = prefix_if_indirect("setting undefined field {field!} of global {name!}"), fields = {}},
+   ["143"] = {message_format = prefix_if_indirect("accessing undefined field {field!} of global {name!}"), fields = {}}
+};
+
+var action_codes = {
+   set = "1",
+   mutate = "2",
+   access = "3"
+};
+
+// `index` describes an indexing, where `index[1]` is a global node
+// and other items describe keys: each one is a string node, "not_string",
+// or "unknown". `node` is literal base node that's indexed.
+// E.g. in `local a = table.a; a.b = "c"` `node` is `a` node of the second
+// statement and `index` describes `table.a.b`.
+// `index.previous_indexing_len` is optional length of prefix of `index` array representing last assignment
+// in the aliasing chain, e.g. `2` in the previous example (because last indexing is `table.a`).
+var function warn_global(chstate, node, index, is_lhs, is_top_line) {
+   var global = index[1];
+   var action = is_lhs && (#index == 1 && "set" || "mutate") || "access";
+
+   var indexing;
+
+   if( #index > 1 ) {
+      indexing = {};
+
+      for( i, field in ipairs(index) ) {
+         if( i > 1 ) {
+            if( field == "unknown" ) {
+               indexing[i - 1] = true;
+            } else if( field == "not_string" ) {
+               indexing[i - 1] = false;
+            } else {
+               indexing[i - 1] = field[1];
+            }
+         }
+      }
+   }
+
+   chstate->warn_range("11" .. action_codes[action], node, {
+      name = global[1],
+      indexing = indexing,
+      previous_indexing_len = index.previous_indexing_len,
+      top = is_top_line && action == "set" || null,
+      indirect = node != global || null
+   });
+}
+
+var function resolved_to_index(resolution) {
+   return resolution != "unknown" && resolution != "not_string" && resolution.tag != "String";
+}
+
+var literal_tags = utils.array_to_set({"Nil", "True", "False", "Number", "String", "Table", "Function"});
+
+var deep_resolve; // Forward declaration.
+
+var function resolve_node(node, item) {
+   if( node.tag == "Id" || node.tag == "Index" ) {
+      deep_resolve(node, item);
+      return node.resolution;
+   } else if( literal_tags[node.tag] ) {
+      return node.tag == "String" && node || "not_string";
+   } else {
+      return "unknown";
+   }
+}
+
+// Resolves value of an identifier or index node, tracking through simple
+// assignments like `local foo = bar.baz`.
+// Can be given an `Invoke` node to resolve the method field.
+// Sets `node.resolution` to "unknown", "not_string", `string node`, or
+// {previous_indexing_len = index, global_node, key...}.
+// Each key can be "unknown", "not_string" or `string_node`.
+function deep_resolve(node, item) {
+   if( node.resolution ) {
+      return;
+   }
+
+   // Common case.
+   // Also protects against infinite recursion, if it's even possible.
+   node.resolution = "unknown";
+
+   var base = node;
+   var base_tag = node.tag == "Id" && "Id" || "Index";
+   var keys = {};
+
+   while( base_tag == "Index" ) {
+      table.insert(keys, 1, base[2]);
+      base = base[1];
+      base_tag = base.tag;
+   }
+
+   if( base_tag != "Id" ) {
+      return;
+   }
+
+   var _v_var = base._v_var;
+   var base_resolution;
+   var previous_indexing_len;
+
+   if( _v_var ) {
+      if( ! item.used_values[_v_var] || #item.used_values[_v_var] != 1 ) {
+         // Do not know where the value for the base local came from.
+         return;
+      }
+
+      var value = item.used_values[_v_var][1];
+
+      if( ! value.node ) {
+         return;
+      }
+
+      base_resolution = resolve_node(value.node, value.item);
+
+      if( resolved_to_index(base_resolution) ) {
+         previous_indexing_len = #base_resolution;
+      }
+   } else {
+      base_resolution = {base};
+   }
+
+   if( #keys == 0 ) {
+      node.resolution = base_resolution;
+   } else if( ! resolved_to_index(base_resolution) ) {
+      // Indexing something unknown or indexing a literal.
+      node.resolution = "unknown";
+   } else {
+      var resolution = utils.update({}, base_resolution);
+      resolution.previous_indexing_len = previous_indexing_len;
+
+      for( _, key in ipairs(keys) ) {
+         var key_resolution = resolve_node(key, item);
+
+         if( resolved_to_index(key_resolution) ) {
+            key_resolution = "unknown";
+         }
+
+         table.insert(resolution, key_resolution);
+      }
+
+      // Assign resolution only after all the recursive calls.
+      node.resolution = resolution;
+   }
+}
+
+var function detect_in_node(chstate, item, node, is_top_line, is_lhs) {
+   if( node.tag == "Index" || node.tag == "Invoke" || node.tag == "Id" ) {
+      if( node.tag == "Id" && node._v_var ) {
+         // Do not warn about assignments to and accesses of local variables
+         // that resolve to globals or their fields.
+         return;
+      }
+
+      deep_resolve(node, item);
+      var resolution = node.resolution;
+
+      // Still need to recurse into base and key nodes.
+      // E.g. don't miss a global in `(global1())[global2()].
+
+      if( node.tag == "Invoke" ) {
+         for( i = 3, #node ) {
+            detect_in_node(chstate, item, node[i], is_top_line);
+         }
+      }
+
+      if( node.tag != "Id" ) {
+         do {
+            detect_in_node(chstate, item, node[2], is_top_line);
+            node = node[1];
+         } while(!( node.tag != "Index") );
+
+         if( node.tag != "Id" ) {
+            detect_in_node(chstate, item, node, is_top_line);
+         }
+      }
+
+      if( resolved_to_index(resolution) ) {
+         warn_global(chstate, node, resolution, is_lhs, is_top_line);
+      }
+   } else if( node.tag != "Function" ) {
+      for( _, nested_node in ipairs(node) ) {
+         if( type(nested_node) == "table" ) {
+            detect_in_node(chstate, item, nested_node, is_top_line);
+         }
+      }
+   }
+}
+
+var function detect_in_nodes(chstate, item, nodes, is_top_line, is_lhs) {
+   for( _, node in ipairs(nodes) ) {
+      detect_in_node(chstate, item, node, is_top_line, is_lhs);
+   }
+}
+
+var function detect_globals_in_line(chstate, line) {
+   var is_top_line = line == chstate.top_line;
+
+   for( _, item in ipairs(line.items) ) {
+      if( item.tag == "Eval" ) {
+         detect_in_node(chstate, item, item.node, is_top_line);
+      } else if( item.tag == "Local" ) {
+         if( item.rhs ) {
+            detect_in_nodes(chstate, item, item.rhs, is_top_line);
+         }
+      } else if( item.tag == "Set" ) {
+         detect_in_nodes(chstate, item, item.lhs, is_top_line, true);
+         detect_in_nodes(chstate, item, item.rhs, is_top_line);
+      }
+   }
+}
+
+// Warns about assignments, field accesses, and mutations of global variables,
+// tracing through localizing assignments such as `local t = table`.
+function stage.run(chstate) {
+   for( _, line in ipairs(chstate.lines) ) {
+      detect_globals_in_line(chstate, line);
+   }
+}
+
+return stage;

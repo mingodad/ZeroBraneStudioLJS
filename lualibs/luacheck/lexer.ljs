@@ -1,0 +1,749 @@
+var utils = require ("luacheck.utils");
+
+// Lexer should support syntax of Lua 5.1, Lua 5.2, Lua 5.3 and LuaJIT(64bit and complex cdata literals).
+var lexer = {};
+
+var sbyte = string.byte;
+var schar = string.char;
+var sreverse = string.reverse;
+var tconcat = table.concat;
+var mfloor = math.floor;
+
+// No point in inlining these, fetching a constant ~= fetching a local.
+var BYTE_0, BYTE_9, BYTE_f, BYTE_F = sbyte("0"), sbyte("9"), sbyte("f"), sbyte("F");
+var BYTE_x, BYTE_X, BYTE_i, BYTE_I = sbyte("x"), sbyte("X"), sbyte("i"), sbyte("I");
+var BYTE_l, BYTE_L, BYTE_u, BYTE_U = sbyte("l"), sbyte("L"), sbyte("u"), sbyte("U");
+var BYTE_e, BYTE_E, BYTE_p, BYTE_P = sbyte("e"), sbyte("E"), sbyte("p"), sbyte("P");
+var BYTE_a, BYTE_z, BYTE_A, BYTE_Z = sbyte("a"), sbyte("z"), sbyte("A"), sbyte("Z");
+var BYTE_DOT, BYTE_COLON = sbyte("."), sbyte(":");
+var BYTE_OBRACK, BYTE_CBRACK = sbyte("["), sbyte("]");
+var BYTE_OBRACE, BYTE_CBRACE = sbyte("{"), sbyte("}");
+var BYTE_QUOTE, BYTE_DQUOTE = sbyte("'"), sbyte('"');
+var BYTE_PLUS, BYTE_DASH, BYTE_LDASH = sbyte("+"), sbyte("-"), sbyte("_");
+var BYTE_SLASH, BYTE_BSLASH = sbyte("/"), sbyte("\\");
+var BYTE_EQ, BYTE_NE = sbyte("="), sbyte("~");
+var BYTE_LT, BYTE_GT = sbyte("<"), sbyte(">");
+var BYTE_LF, BYTE_CR = sbyte("\n"), sbyte("\r");
+var BYTE_SPACE, BYTE_FF, BYTE_TAB, BYTE_VTAB = sbyte(" "), sbyte("\f"), sbyte("\t"), sbyte("\v");
+
+var function to_hex(b) {
+   if( BYTE_0 <= b && b <= BYTE_9 ) {
+      return b-BYTE_0;
+   } else if( BYTE_a <= b && b <= BYTE_f ) {
+      return 10+b-BYTE_a;
+   } else if( BYTE_A <= b && b <= BYTE_F ) {
+      return 10+b-BYTE_A;
+   } else {
+      return null;
+   }
+}
+
+var function to_dec(b) {
+   if( BYTE_0 <= b && b <= BYTE_9 ) {
+      return b-BYTE_0;
+   } else {
+      return null;
+   }
+}
+
+var function to_utf(codepoint) {
+   if( codepoint < 0x80 ) {  // ASCII?
+      return schar(codepoint);
+   }
+
+   var buf = {};
+   var mfb = 0x3F;
+
+   do {
+      buf[#buf+1] = schar(codepoint % 0x40 + 0x80);
+      codepoint = mfloor(codepoint / 0x40);
+      mfb = mfloor(mfb / 2);
+   } while(!( codepoint <= mfb) );
+
+   buf[#buf+1] = schar(0xFE - mfb*2 + codepoint);
+   return sreverse(tconcat(buf));
+}
+
+var function is_alpha(b) {
+   return (BYTE_a <= b && b <= BYTE_z) ||
+      (BYTE_A <= b && b <= BYTE_Z) || b == BYTE_LDASH;
+}
+
+var function is_newline(b) {
+   return (b == BYTE_LF) || (b == BYTE_CR);
+}
+
+var function is_space(b) {
+   return (b == BYTE_SPACE) || (b == BYTE_FF) ||
+      (b == BYTE_TAB) || (b == BYTE_VTAB);
+}
+
+var keywords = utils.array_to_set({
+   "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "goto", "if", "in",
+   "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while"});
+
+var simple_escapes = {
+   [sbyte("a")] = sbyte("\a"),
+   [sbyte("b")] = sbyte("\b"),
+   [sbyte("f")] = sbyte("\f"),
+   [sbyte("n")] = sbyte("\n"),
+   [sbyte("r")] = sbyte("\r"),
+   [sbyte("t")] = sbyte("\t"),
+   [sbyte("v")] = sbyte("\v"),
+   [BYTE_BSLASH] = BYTE_BSLASH,
+   [BYTE_QUOTE] = BYTE_QUOTE,
+   [BYTE_DQUOTE] = BYTE_DQUOTE
+};
+
+var function next_byte(state) {
+   var offset = state.offset + 1;
+   state.offset = offset;
+   return state.src->get_codepoint(offset);
+}
+
+// Skipping helpers.
+// Take the current character, skip something, return next character.
+
+var function skip_newline(state, newline) {
+   var first_newline_offset = state.offset;
+   var b = next_byte(state);
+
+   if( b != newline && is_newline(b) ) {
+      b = next_byte(state);
+   }
+
+   var line = state.line;
+   var line_offsets = state.line_offsets;
+   state.line_lengths[line] = first_newline_offset - line_offsets[line];
+   line +=   1;
+   state.line = line;
+   line_offsets[line] = state.offset;
+   return b;
+}
+
+var function skip_to_newline(state, b) {
+   while( ! is_newline(b) && b ) {
+      b = next_byte(state);
+   }
+
+   return b;
+}
+
+var function skip_space(state, b) {
+   while( is_space(b) || is_newline(b) ) {
+      if( is_newline(b) ) {
+         b = skip_newline(state, b);
+      } else {
+         b = next_byte(state);
+      }
+   }
+
+   return b;
+}
+
+// Skips "[=*" or "]=*". Returns next character and number of "="s.
+var function skip_long_bracket(state) {
+   var start = state.offset;
+   var b = next_byte(state);
+
+   while( b == BYTE_EQ ) {
+      b = next_byte(state);
+   }
+
+   return b, state.offset-start-1;
+}
+
+// Token handlers.
+
+// Called after the opening "[=*" has been skipped.
+// Takes number of "=" in the opening bracket and token type(comment or string).
+var function lex_long_string(state, opening_long_bracket, token) {
+   var b = next_byte(state);
+
+   if( is_newline(b) ) {
+      b = skip_newline(state, b);
+   }
+
+   var lines = {};
+   var line_start = state.offset;
+
+   while( true ) {
+      if( is_newline(b) ) {
+         // Add the finished line.
+         lines[#lines+1] = state.src->get_substring(line_start, state.offset-1);
+
+         b = skip_newline(state, b);
+         line_start = state.offset;
+      } else if( b == BYTE_CBRACK ) {
+         var long_bracket;
+         b, long_bracket = skip_long_bracket(state);
+
+         if( b == BYTE_CBRACK && long_bracket == opening_long_bracket ) {
+            break;
+         }
+      } else if( b == null ) {
+         return null, token == "string" && "unfinished long string" || "unfinished long comment";
+      } else {
+         b = next_byte(state);
+      }
+   }
+
+   // Add last line.
+   lines[#lines+1] = state.src->get_substring(line_start, state.offset-opening_long_bracket-2);
+   state.offset = state.offset + 1;
+   return token, tconcat(lines, "\n");
+}
+
+var function lex_short_string(state, quote) {
+   var b = next_byte(state);
+   var chunks;  // Buffer is only required when there are escape sequences.
+   var chunk_start = state.offset;
+
+   while( b != quote ) {
+      if( b == BYTE_BSLASH ) {
+         // Escape sequence.
+
+         if( ! chunks ) {
+            // This is the first escape sequence, init buffer.
+            chunks = {};
+         }
+
+         // Put previous chunk into buffer.
+         if( chunk_start != state.offset ) {
+            chunks[#chunks+1] = state.src->get_substring(chunk_start, state.offset-1);
+         }
+
+         b = next_byte(state);
+
+         // The final string escape sequence evaluates to.
+         var s;
+
+         var escape_byte = simple_escapes[b];
+
+         if( escape_byte ) {  // Is it a simple escape sequence?
+            b = next_byte(state);
+            s = schar(escape_byte);
+         } else if( is_newline(b) ) {
+            b = skip_newline(state, b);
+            s = "\n";
+         } else if( b == BYTE_x ) {
+            // Hexadecimal escape.
+            b = next_byte(state);  // Skip "x".
+            // Exactly two hexadecimal digits.
+            var c1, c2;
+
+            if( b ) {
+               c1 = to_hex(b);
+            }
+
+            if( ! c1 ) {
+               return null, "invalid hexadecimal escape sequence", -2;
+            }
+
+            b = next_byte(state);
+
+            if( b ) {
+               c2 = to_hex(b);
+            }
+
+            if( ! c2 ) {
+               return null, "invalid hexadecimal escape sequence", -3;
+            }
+
+            b = next_byte(state);
+            s = schar(c1*16 + c2);
+         } else if( b == BYTE_u ) {
+            b = next_byte(state);  // Skip "u".
+
+            if( b != BYTE_OBRACE ) {
+               return null, "invalid UTF-8 escape sequence", -2;
+            }
+
+            b = next_byte(state);  // Skip "{".
+
+            var codepoint;  // There should be at least one digit.
+
+            if( b ) {
+               codepoint = to_hex(b);
+            }
+
+            if( ! codepoint ) {
+               return null, "invalid UTF-8 escape sequence", -3;
+            }
+
+            var hexdigits = 0;
+
+            while( true ) {
+               b = next_byte(state);
+               var hex;
+
+               if( b ) {
+                  hex = to_hex(b);
+               }
+
+               if( hex ) {
+                  hexdigits +=   1;
+                  codepoint = codepoint*16 + hex;
+
+                  if( codepoint > 0x10FFFF ) {
+                     // UTF-8 value too large.
+                     return null, "invalid UTF-8 escape sequence", -hexdigits-3;
+                  }
+               } else {
+                  break;
+               }
+            }
+
+            if( b != BYTE_CBRACE ) {
+               return null, "invalid UTF-8 escape sequence", -hexdigits-4;
+            }
+
+            b = next_byte(state);  // Skip "}".
+            s = to_utf(codepoint);
+         } else if( b == BYTE_z ) {
+            // Zap following span of spaces.
+            b = skip_space(state, next_byte(state));
+         } else {
+            // Must be a decimal escape.
+            var cb;
+
+            if( b ) {
+               cb = to_dec(b);
+            }
+
+            if( ! cb ) {
+               return null, "invalid escape sequence", -1;
+            }
+
+            // Up to three decimal digits.
+            b = next_byte(state);
+
+            if( b ) {
+               var c2 = to_dec(b);
+
+               if( c2 ) {
+                  cb = 10*cb + c2;
+                  b = next_byte(state);
+
+                  if( b ) {
+                     var c3 = to_dec(b);
+
+                     if( c3 ) {
+                        cb = 10*cb + c3;
+
+                        if( cb > 255 ) {
+                           return null, "invalid decimal escape sequence", -3;
+                        }
+
+                        b = next_byte(state);
+                     }
+                  }
+               }
+            }
+
+            s = schar(cb);
+         }
+
+         if( s ) {
+            chunks[#chunks+1] = s;
+         }
+
+         // Next chunk starts after escape sequence.
+         chunk_start = state.offset;
+      } else if( b == null || is_newline(b) ) {
+         return null, "unfinished string";
+      } else {
+         b = next_byte(state);
+      }
+   }
+
+   // Offset now points at the closing quote.
+   var string_value;
+
+   if( chunks ) {
+      // Put last chunk into buffer.
+      if( chunk_start != state.offset ) {
+         chunks[#chunks+1] = state.src->get_substring(chunk_start, state.offset-1);
+      }
+
+      string_value = tconcat(chunks);
+   } else {
+      // There were no escape sequences.
+      string_value = state.src->get_substring(chunk_start, state.offset-1);
+   }
+
+   // Skip the closing quote.
+   state.offset = state.offset + 1;
+   return "string", string_value;
+}
+
+// Payload for a number is simply a substring.
+// Luacheck is supposed to be forward-compatible with Lua 5.3 and LuaJIT syntax, so
+//    parsing it into actual number may be problematic.
+// It is not needed currently anyway as Luacheck does not do static evaluation yet.
+var function lex_number(state, b) {
+   var start = state.offset;
+
+   var exp_lower, exp_upper = BYTE_e, BYTE_E;
+   var is_digit = to_dec;
+   var has_digits = false;
+   var is_float = false;
+
+   if( b == BYTE_0 ) {
+      b = next_byte(state);
+
+      if( b == BYTE_x || b == BYTE_X ) {
+         exp_lower, exp_upper = BYTE_p, BYTE_P;
+         is_digit = to_hex;
+         b = next_byte(state);
+      } else {
+         has_digits = true;
+      }
+   }
+
+   while( b != null && is_digit(b) ) {
+      b = next_byte(state);
+      has_digits = true;
+   }
+
+   if( b == BYTE_DOT ) {
+      // Fractional part.
+      is_float = true;
+      b = next_byte(state);  // Skip dot.
+
+      while( b != null && is_digit(b) ) {
+         b = next_byte(state);
+         has_digits = true;
+      }
+   }
+
+   if( b == exp_lower || b == exp_upper ) {
+      // Exponent part.
+      is_float = true;
+      b = next_byte(state);
+
+      // Skip optional sign.
+      if( b == BYTE_PLUS || b == BYTE_DASH ) {
+         b = next_byte(state);
+      }
+
+      // Exponent consists of one or more decimal digits.
+      if( b == null || ! to_dec(b) ) {
+         return null, "malformed number";
+      }
+
+      do {
+         b = next_byte(state);
+      } while(!( b == null || ! to_dec(b)) );
+   }
+
+   if( ! has_digits ) {
+      return null, "malformed number";
+   }
+
+   // Is it cdata literal?
+   if( b == BYTE_i || b == BYTE_I ) {
+      // It is complex literal. Skip "i" or "I".
+      state.offset = state.offset + 1;
+   } else {
+      // uint64_t and int64_t literals can not be fractional.
+      if( ! is_float ) {
+         if( b == BYTE_u || b == BYTE_U ) {
+            // It may be uint64_t literal.
+            var b1 = state.src->get_codepoint(state.offset+1);
+
+            if( b1 == BYTE_l || b1 == BYTE_L ) {
+               var b2 = state.src->get_codepoint(state.offset+2);
+
+               if( b2 == BYTE_l || b2 == BYTE_L ) {
+                  // It is uint64_t literal.
+                  state.offset = state.offset + 3;
+               }
+            }
+         } else if( b == BYTE_l || b == BYTE_L ) {
+            // It may be uint64_t or int64_t literal.
+            var b1 = state.src->get_codepoint(state.offset+1);
+
+            if( b1 == BYTE_l || b1 == BYTE_L ) {
+               var b2 = state.src->get_codepoint(state.offset+2);
+
+               if( b2 == BYTE_u || b2 == BYTE_U ) {
+                  // It is uint64_t literal.
+                  state.offset = state.offset + 3;
+               } else {
+                  // It is int64_t literal.
+                  state.offset = state.offset + 2;
+               }
+            }
+         }
+      }
+   }
+
+   return "number", state.src->get_substring(start, state.offset-1);
+}
+
+var function lex_ident(state) {
+   var start = state.offset;
+   var b = next_byte(state);
+
+   while( (b != null) && (is_alpha(b) || to_dec(b)) ) {
+      b = next_byte(state);
+   }
+
+   var ident = state.src->get_substring(start, state.offset-1);
+
+   if( keywords[ident] ) {
+      return ident;
+   } else {
+      return "name", ident;
+   }
+}
+
+var function lex_dash(state) {
+   var b = next_byte(state);
+
+   // Is it "-" or comment?
+   if( b != BYTE_DASH ) {
+      return "-";
+   }
+
+   // It is a comment.
+   b = next_byte(state);
+   var start = state.offset;
+
+   // Is it a long comment?
+   if( b == BYTE_OBRACK ) {
+      var long_bracket;
+      b, long_bracket = skip_long_bracket(state);
+
+      if( b == BYTE_OBRACK ) {
+         return lex_long_string(state, long_bracket, "long_comment");
+      }
+   }
+
+   // Short comment.
+   skip_to_newline(state, b);
+   var comment_value = state.src->get_substring(start, state.offset - 1);
+   return "short_comment", comment_value;
+}
+
+var function lex_bracket(state) {
+   // Is it "[" or long string?
+   var b, long_bracket = skip_long_bracket(state);
+
+   if( b == BYTE_OBRACK ) {
+      return lex_long_string(state, long_bracket, "string");
+   } else if( long_bracket == 0 ) {
+      return "[";
+   } else {
+      return null, "invalid long string delimiter";
+   }
+}
+
+var function lex_eq(state) {
+   var b = next_byte(state);
+
+   if( b == BYTE_EQ ) {
+      state.offset = state.offset + 1;
+      return "==";
+   } else {
+      return "=";
+   }
+}
+
+var function lex_lt(state) {
+   var b = next_byte(state);
+
+   if( b == BYTE_EQ ) {
+      state.offset = state.offset + 1;
+      return "<=";
+   } else if( b == BYTE_LT ) {
+      state.offset = state.offset + 1;
+      return "<<";
+   } else {
+      return "<";
+   }
+}
+
+var function lex_gt(state) {
+   var b = next_byte(state);
+
+   if( b == BYTE_EQ ) {
+      state.offset = state.offset + 1;
+      return ">=";
+   } else if( b == BYTE_GT ) {
+      state.offset = state.offset + 1;
+      return ">>";
+   } else {
+      return ">";
+   }
+}
+
+var function lex_div(state) {
+   var b = next_byte(state);
+
+   if( b == BYTE_SLASH ) {
+      state.offset = state.offset + 1;
+      return "//";
+   } else {
+      return "/";
+   }
+}
+
+var function lex_ne(state) {
+   var b = next_byte(state);
+
+   if( b == BYTE_EQ ) {
+      state.offset = state.offset + 1;
+      return "~=";
+   } else {
+      return "~";
+   }
+}
+
+var function lex_colon(state) {
+   var b = next_byte(state);
+
+   if( b == BYTE_COLON ) {
+      state.offset = state.offset + 1;
+      return "::";
+   } else {
+      return ":";
+   }
+}
+
+var function lex_dot(state) {
+   var b = next_byte(state);
+
+   if( b == BYTE_DOT ) {
+      b = next_byte(state);
+
+      if( b == BYTE_DOT ) {
+         state.offset = state.offset + 1;
+         return "...", "...";
+      } else {
+         return "..";
+      }
+   } else if( b && to_dec(b) ) {
+      // Backtrack to dot.
+      state.offset = state.offset - 2;
+      return lex_number(state, next_byte(state));
+   } else {
+      return ".";
+   }
+}
+
+var function lex_any(state, b) {
+   state.offset = state.offset + 1;
+
+   if( b > 255 ) {
+      b = 255;
+   }
+
+   return schar(b);
+}
+
+// Maps first bytes of tokens to functions that handle them.
+// Each handler takes the first byte as an argument.
+// Each handler stops at the character after the token and returns the token and,
+//    optionally, a value associated with the token.
+// On error handler returns nil, error message and, optionally, start of reported location as negative offset.
+var byte_handlers = {
+   [BYTE_DOT] = lex_dot,
+   [BYTE_COLON] = lex_colon,
+   [BYTE_OBRACK] = lex_bracket,
+   [BYTE_QUOTE] = lex_short_string,
+   [BYTE_DQUOTE] = lex_short_string,
+   [BYTE_DASH] = lex_dash,
+   [BYTE_SLASH] = lex_div,
+   [BYTE_EQ] = lex_eq,
+   [BYTE_NE] = lex_ne,
+   [BYTE_LT] = lex_lt,
+   [BYTE_GT] = lex_gt,
+   [BYTE_LDASH] = lex_ident
+};
+
+for( b=BYTE_0, BYTE_9 ) {
+   byte_handlers[b] = lex_number;
+}
+
+for( b=BYTE_a, BYTE_z ) {
+   byte_handlers[b] = lex_ident;
+}
+
+for( b=BYTE_A, BYTE_Z ) {
+   byte_handlers[b] = lex_ident;
+}
+
+// Creates and returns lexer state for source.
+function lexer.new_state(src, line_offsets, line_lengths) {
+   var state = {
+      src = src,
+      line = 1,
+      line_offsets = line_offsets || {},
+      line_lengths = line_lengths || {},
+      offset = 1
+   };
+
+   state.line_offsets[1] = 1;
+
+   if( src->get_length() >= 2 && src->get_substring(1, 2) == "#!" ) {
+      // Skip shebang line.
+      state.offset = 2;
+      skip_to_newline(state, next_byte(state));
+   }
+
+   return state;
+}
+
+function lexer.get_quoted_substring_or_line(state, line, offset, end_offset) {
+   var line_length = state.line_lengths[line];
+
+   if( line_length ) {
+      var line_end_offset = state.line_offsets[line] + line_length - 1;
+
+      if( line_end_offset < end_offset ) {
+         end_offset = line_end_offset;
+      }
+   }
+
+   return "'" .. state.src->get_printable_substring(offset, end_offset) .. "'";
+}
+
+// Looks for next token starting from state.line, state.offset.
+// Returns next token, its value and its location (line, offset).
+// Sets state.line, state.offset to token end location + 1.
+// Fills state.line_offsets and state.line_lengths.
+// On error returns nil, error message, error location (line, offset), error end offset.
+function lexer.next_token(state) {
+   var line_offsets = state.line_offsets;
+   var b = skip_space(state, state.src->get_codepoint(state.offset));
+
+   // Save location of token start.
+   var token_line = state.line;
+   var line_offset = line_offsets[token_line];
+   var token_offset = state.offset;
+
+   if( ! b ) {
+      // EOF token has length 1.
+      state.offset = state.offset + 1;
+      state.line_lengths[token_line] = token_offset - line_offset;
+      return "eof", null, token_line, token_offset;
+   }
+
+   var token, token_value, relative_error_offset = (byte_handlers[b] || lex_any)(state, b);
+
+   if( relative_error_offset ) {
+      // Error relative to current offset.
+      var error_offset = state.offset + relative_error_offset;
+      var error_end_offset = math.min(state.offset, state.src->get_length());
+      var error_message = token_value .. " " .. lexer.get_quoted_substring_or_line(state,
+         state.line, error_offset, error_end_offset);
+      return null, error_message, state.line, error_offset, error_end_offset;
+   }
+
+   // Single character errors fall through here.
+   return token, token_value, token_line, token_offset, ! token && token_offset;
+}
+
+return lexer;

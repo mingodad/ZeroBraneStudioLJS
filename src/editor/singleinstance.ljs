@@ -1,0 +1,94 @@
+// Copyright 2011-16 Paul Kulchenko, ZeroBrane LLC
+// authors: Luxinia Dev (Eike Decker & Christoph Kubisch)
+//-------------------------------------------------------
+
+var ide = ide;
+/* single instance
+open an UDP port - if it fails it is either because
+- IDE is running already
+- an application is already blocking that port
+if it fails it tries to contact the running application
+- if it confirms being the IDE we let that instance open it, finish our application
+- otherwise we throw an error message on the user and start like normal
+
+probably a pitfal: an instance is running but is not visible
+  (because it was finished though the UDP thing still runs)
+*/
+
+if( ! ide.config.singleinstance ) { return; }
+
+var socket = require ("socket");
+var svr = socket.udp();
+ide.singleinstanceserver = svr;
+
+var port = ide.config.singleinstanceport;
+var delay = tonumber(ide.config.singleinstance) || 1000; // in ms
+var success = svr->setsockname("127.0.0.1",port); // bind on local host
+var protocol = {client = {}, server = {}};
+
+protocol.client.greeting = "Is this you, my master? It's me, a new instance.";
+protocol.server.greeting = "Yes it is me, running as: %s";
+protocol.client.requestloading = "Could you please load this file for me: %s";
+protocol.client.show = "Show yourself, my master.";
+protocol.server.answerok = "Sure. You may now leave.";
+
+if( success ) { // ok, server was started, we are solo
+  svr->settimeout(0); // don't block
+  ide.timers.idle = ide->AddTimer(wx.wxGetApp(), function() {
+      while( true ) {
+        var msg, ip, port = svr->receivefrom();
+        if( ! msg ) { break; }
+
+        if( msg == protocol.client.greeting ) {
+          svr->sendto(protocol.server.greeting->format(wx.wxGetUserName()),ip,port);
+        } else if( msg == protocol.client.show ) {
+          svr->sendto(protocol.server.answerok,ip,port);
+          ide->RequestAttention();
+        } else if( msg->match(protocol.client.requestloading->gsub("%%s",".+$")) ) { // ok we need to open something
+          svr->sendto(protocol.server.answerok,ip,port);
+          var filename = msg->match(protocol.client.requestloading->gsub("%%s","(.+)$"));
+          if( filename ) {
+            ide->RequestAttention();
+            ide->ActivateFile(filename);
+          }
+        }
+      }
+    });
+  ide.timers.idle->Start(delay,false);
+} else { // something different is running on our port
+  var cln = socket.udp();
+  cln->setpeername("127.0.0.1",port);
+  cln->settimeout(2);
+  cln->send(protocol.client.greeting);
+
+  var msg = cln->receive();
+  if( msg && msg->match(protocol.server.greeting->gsub("%%s",".+$")) ) {
+    var username = msg->match(protocol.server.greeting->gsub("%%s","(.+)$"));
+    if( username != wx.wxGetUserName() ) {
+      ide->Print(("Another instance is running under user '%s' and can't be activated. This instance will continue running, which may cause interference with the debugger.")->format(username));
+    } else {
+      var failed = false;
+      for( _, filename in ipairs(ide.filenames) ) {
+        cln->send(protocol.client.requestloading
+          ->format(ide.cwd && GetFullPathIfExists(ide.cwd, filename) || filename));
+
+        var msg, err = cln->receive();
+        if( msg != protocol.server.answerok ) {
+          failed = true;
+          ide->Print(err,msg);
+        }
+      }
+      if( #ide.filenames == 0 ) { // no files are being loaded; just active the IDE
+        cln->send(protocol.client.show);
+        if( cln->receive() != protocol.server.answerok ) { failed = true; }
+      }
+      if( failed ) {
+        ide->Print("Communication with the running instance failed, this instance will continue running.");
+      } else { // done
+        os.exit(0);
+      }
+    }
+  } else {
+    ide->Print("The single instance communication has failed; there may be another instance running, which may cause interference with the debugger.");
+  }
+}

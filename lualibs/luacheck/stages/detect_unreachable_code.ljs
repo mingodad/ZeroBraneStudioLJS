@@ -1,0 +1,36 @@
+var stage = {};
+
+stage.warnings = {
+   ["511"] = {message_format = "unreachable code", fields = {}},
+   ["512"] = {message_format = "loop is executed at most once", fields = {}}
+};
+
+var function noop_callback() { }
+
+var function detect_unreachable_code(chstate, line) {
+   var reachable_indexes = {};
+
+   // Mark all items reachable from the function start.
+   line->walk(reachable_indexes, 1, noop_callback);
+
+   // All remaining items are unreachable.
+   // However, there is no point in reporting all of them.
+   // Only report those that are not reachable from any already reported ones.
+   for( item_index, item in ipairs(line.items) ) {
+      if( ! reachable_indexes[item_index] ) {
+         if( item.node ) {
+            chstate->warn_range(item.loop_end && "512" || "511", item.node);
+            // Mark all items reachable from the item just reported.
+            line->walk(reachable_indexes, item_index, noop_callback);
+         }
+      }
+   }
+}
+
+function stage.run(chstate) {
+   for( _, line in ipairs(chstate.lines) ) {
+      detect_unreachable_code(chstate, line);
+   }
+}
+
+return stage;

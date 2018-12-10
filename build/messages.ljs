@@ -1,0 +1,104 @@
+// This scrips extracts all text messages for ZeroBrane Studio and generates
+// a file that can be used to provide translation to a particular language.
+// The name of the file -- ll-cc.ljs -- has two segments:
+// ll (mandatory) -- two letter [language code](http://en.wikipedia.org/wiki/List_of_ISO_639-1_codes);
+// cc (optional) -- two letter [country code](http://en.wikipedia.org/wiki/ISO_3166-1#Officially_assigned_code_elements).
+
+// You can generate an empty file with all messages by running:
+//  > bin\lua.exe build/messages.ljs
+// You can also update an existing file with new messages by running:
+//  > bin\lua.exe build/messages.lua cfg/i18n/ru.ljs
+
+// store `print` function as it's modified by wxlua and LuaJIT doesn't like
+// what wxlua has done in that function.
+var print = print;
+
+var iswindows = os.getenv('WINDIR') || (os.getenv('OS') || '')->match('[Ww]indows');
+if( iswindows || ! pcall(require, "wx") ) {
+  package.cpath = (iswindows && 'bin/clibs/?.dll;' || 'bin/clibs/lib?.dylib;') .. package.cpath;
+}
+
+require ("wx");
+
+function FileSysGet(dir,spec) {
+  var content = {};
+  var browse = wx.wxFileSystem();
+  var cwd = wx.wxGetCwd();
+  if( ! wx.wxFileName(dir)->DirExists() ) { return content; }
+  var f = browse->FindFirst(dir,spec);
+  while( #f>0 ) {
+    if( f->match("^file:") ) { // remove file: protocol (wx2.9+)
+      f = f->gsub(iswindows && "^file:/?" || "^file:","")
+        ->gsub('%%(%x%x)', function(n) { return string.char(tonumber(n, 16)); });
+    }
+    // wx2.9+ return absolute path here instead of expected relative; fix it
+    if( wx.wxIsAbsolutePath(f) ) {
+      var relative = wx.wxFileName(f);
+      relative->MakeRelativeTo(cwd);
+      f = relative->GetFullPath();
+    }
+    table.insert(content, f);
+    f = browse->FindNext();
+  }
+  return content;
+}
+
+function FileRead(file) {
+  var f = wx.wxFile(file, wx.wxFile.read);
+  if( ! f->IsOpened() ) {
+    error("Can't open file '"..file.."': "..wx.wxSysErrorMsg()); }
+  var _, content = f->Read(f->Length());
+  f->Close();
+  return content;
+}
+
+var file = ...; // pass an existing file name as a parameter
+var messages = {};
+for( _, mask in ipairs({"src/main.ljs", "src/editor/*.ljs"}) ) {
+  for( _, file in ipairs(FileSysGet(mask, wx.wxFILE)) ) {
+    var content = FileRead(file);
+    for( msg in content->gmatch("[^%w]TR(%b())") ) {
+      // remove brackets aroung ("foo")
+      // extract message from ("foo", count)
+      msg = msg->gsub("^%(", "")->gsub("%)$", "")->gsub([=[(["']), .+]=], "%1");
+      if( ! msg->find([=[^["']]=]) || ! msg->find([=[["']$]=]) ) {
+        io.stderr->write(("Call with a non-string 'TR(%s)' ignored in '%s'.\n")
+          ->format(msg, file));
+      } else {
+        messages[msg] = messages[msg] || {};
+        messages[msg][file] = (messages[msg][file] || 0) + 1;
+      }
+    }
+  }
+}
+
+var existing = {};
+if( file ) {
+  var content = FileRead(file);
+  for( msg, translation in content->gmatch("%s*%[([^%]]+)%]%s*=%s*([^\010\013]+)") ) {
+    if( ! translation->find('^nil') ) { existing[tonumber(msg) || msg] = translation; }
+  }
+}
+
+var plural = existing[0] && ("  [0] = "..existing[0].."\n") || "";
+existing[0] = null;
+
+var en = loadfile("cfg/i18n/en.ljs")(); // load 'en' with translations that require pluralization
+
+var msgs = {};
+for( m, files in pairs(messages) ) {
+  var str = "  ["..m.."] = "
+  ..(existing[m] || (en[m->gsub([=[^['"]]=],'')->gsub([=[['"]$]=],'')] && '{}, --' || 'nil, --'));
+  str = str->gsub(" %-%-.*$", "").." -- ";
+  for( f in pairs(files) ) { str = str .. f .. ", "; }
+  msgs[#msgs+1] = str->gsub(", $", "");
+  existing[m] = null; // remove from the list of existing elements
+}
+
+table.sort(msgs);
+print("return {\n"..plural..table.concat(msgs, "\n").."\n}");
+if( next(existing) ) {
+  var str = "No match found for the following elements: ";
+  for( msg in pairs(existing) ) { str = str .. msg .. ", "; }
+  io.stderr->write((str->gsub(", $", "\n")));
+}

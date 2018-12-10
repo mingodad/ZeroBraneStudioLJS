@@ -1,0 +1,2 @@
+dofile ('interpreters/luabase.ljs');
+return MakeLuaInterpreter(5.2, ' 5.2');

@@ -1,0 +1,57 @@
+// Copyright 2011-13 Paul Kulchenko, ZeroBrane LLC
+
+var pathcache;
+var win = ide.osname == "Windows";
+
+return {
+  name = "Busted",
+  description = "Busted Lua testing",
+  api = {"baselib"},
+  frun = function(this,wfilename,rundebug) {
+    var busted = ide.config.path.busted || pathcache; // check if the path is configured
+    if( ! busted ) {
+      var sep = win && ';' || ':';
+      var default =
+           win && GenerateProgramFilesPath('LuaRocks\\systree\\bin', sep)..sep
+        || '';
+      var path = default
+                 ..(os.getenv('PATH') || '')..sep
+                 ..(os.getenv('HOME') && os.getenv('HOME') .. '/bin' || '');
+      var paths = {};
+      for( p in path->gmatch("[^"..sep.."]+") ) {
+        busted = busted || GetFullPathIfExists(p, win && 'busted.bat' || 'busted');
+        table.insert(paths, p);
+      }
+      if( ! busted ) {
+        ide->Print("Can't find busted executable in any of the folders in PATH: "
+          ..table.concat(paths, ", "));
+        return;
+      }
+      pathcache = busted;
+    }
+
+    var file = wfilename->GetFullPath();
+    var helper;
+    if( rundebug ) {
+      // start running the application right away
+      ide->GetDebugger()->SetOptions({runstart = ide.config.debugger.runonstart != false});
+      var tmpfile = wx.wxFileName();
+      tmpfile->AssignTempFileName(".");
+      helper = tmpfile->GetFullPath()..".ljs"; // busted likes .ljs files more than .tmp files
+      var f = io.open(helper, "w");
+      if( ! f ) {
+        ide->Print("Can't open temporary file '"..helper.."' for writing.");
+        return; 
+      }
+      f->write("require('mobdebug').start()");
+      f->close();
+    }
+
+    var options = ide.config.busted && ide.config.busted.options || "--output=TAP";
+    var cmd = ('"%s" %s %s "%s"')->format(busted, helper && "--helper="..helper || "", options, file);
+     // CommandLineRun(cmd,wdir,tooutput,nohide,stringcallback,uid,endcallback)
+    return CommandLineRun(cmd,this->fworkdir(wfilename),true,false,null,null,
+      function() { if( helper ) { wx.wxRemoveFile(helper); } });
+  },
+  hasdebugger = true,
+};

@@ -1,0 +1,833 @@
+//------------------------------------------------------------------------------
+// Copyright (c) 2006-2013 Fabien Fleutot and others.
+//
+// All rights reserved.
+//
+// This program and the accompanying materials are made available
+// under the terms of the Eclipse Public License v1.0 which
+// accompanies this distribution, and is available at
+// http://www.eclipse.org/legal/epl-v10.html
+//
+// This program and the accompanying materials are also made available
+// under the terms of the MIT public license which accompanies this
+// distribution, and is available at http://www.lua.org/license.html
+//
+// Contributors:
+//     Fabien Fleutot - API and implementation
+//
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+//
+// Summary: parser generator. Collection of higher order functors,
+//   which allow to build and combine parsers. Relies on a lexer
+//   that supports the same API as the one exposed in mll.lua.
+//
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+//
+// Exported API:
+//
+// Parser generators:
+// * [gg.sequence()]
+// * [gg.multisequence()]
+// * [gg.expr()]
+// * [gg.list()]
+// * [gg.onkeyword()]
+// * [gg.optkeyword()]
+//
+// Other functions:
+// * [gg.parse_error()]
+// * [gg.make_parser()]
+// * [gg.is_parser()]
+//
+//------------------------------------------------------------------------------
+
+var M = { };
+
+var pp    = require ('metalua.pprint');
+var lexer = require ('metalua.grammar.lexer');
+
+//------------------------------------------------------------------------------
+// Symbol generator: [gensym()] returns a guaranteed-to-be-unique identifier.
+// The main purpose is to avoid variable capture in macros.
+//
+// If a string is passed as an argument, theis string will be part of the
+// id name (helpful for macro debugging)
+//------------------------------------------------------------------------------
+var gensymidx = 0;
+
+function M.gensym (arg) {
+   gensymidx +=   1;
+   return { tag="Id", string.format(".%i.%s", gensymidx, arg || "")};
+}
+
+
+//-----------------------------------------------------------------------------
+// parser metatable, which maps __call to method parse, and adds some
+// error tracing boilerplate.
+//-----------------------------------------------------------------------------
+var parser_metatable = { };
+
+function parser_metatable ::__call (lx, ...) {
+    return this ->parse (lx, ...);
+}
+
+//-----------------------------------------------------------------------------
+// Turn a table into a parser, mainly by setting the metatable.
+//-----------------------------------------------------------------------------
+function M.make_parser(kind, p) {
+   p.kind = kind;
+   if( ! p.transformers ) { p.transformers = { }; }
+   function p.transformers::add (x) {
+      table.insert (this, x);
+   }
+   setmetatable (p, parser_metatable);
+   return p;
+}
+
+//-----------------------------------------------------------------------------
+// Return true iff [x] is a parser.
+// If it's a gg-generated parser, return the name of its kind.
+//-----------------------------------------------------------------------------
+function M.is_parser (x) {
+   return type(x)=="function" || getmetatable(x)==parser_metatable && x.kind;
+}
+
+//-----------------------------------------------------------------------------
+// Parse a sequence, without applying builder nor transformers.
+//-----------------------------------------------------------------------------
+var function raw_parse_sequence (lx, p) {
+    var r = { };
+    for( i=1, #p ) {
+        var e=p[i];
+        if( type(e) == "string" ) {
+            var kw = lx ->next();
+            if( ! lx ->is_keyword (kw, e) ) {
+                M.parse_error(
+                    lx, "A keyword was expected, probably `%s'.", e);
+            }
+        } else if( M.is_parser (e) ) {
+            table.insert (r, e(lx));
+        } else { // Invalid parser definition, this is *not* a parsing error
+            error(string.format(
+                      "Sequence `%s': element #%i is neither a string nor a parser: %s",
+                      p.name, i, pp.tostring(e)));
+        }
+    }
+    return r;
+}
+
+//-----------------------------------------------------------------------------
+// Parse a multisequence, without applying multisequence transformers.
+// The sequences are completely parsed.
+//-----------------------------------------------------------------------------
+var function raw_parse_multisequence (lx, sequence_table, default) {
+   var seq_parser = sequence_table[lx->is_keyword(lx->peek())];
+   if( seq_parser  ) { return seq_parser (lx);
+   } else if( default ) { return default (lx);
+   } else { return false; }
+}
+
+//-----------------------------------------------------------------------------
+// Applies all transformers listed in parser on ast.
+//-----------------------------------------------------------------------------
+var function transform (ast, parser, fli, lli) {
+   if( parser.transformers ) {
+      for( _, t in ipairs (parser.transformers) ) { ast = t(ast) || ast; }
+   }
+   if( type(ast) == 'table' ) {
+      var ali = ast.lineinfo;
+      if( ! ali || ali.first!=fli || ali.last!=lli ) {
+         ast.lineinfo = lexer.new_lineinfo(fli, lli);
+      }
+   }
+   return ast;
+}
+
+//-----------------------------------------------------------------------------
+// Generate a tracable parsing error (not implemented yet)
+//-----------------------------------------------------------------------------
+function M.parse_error(lx, fmt, ...) {
+   var li = lx->lineinfo_left();
+   var file, line, column, offset, positions;
+   if( li ) {
+      file, line, column, offset = li.source, li.line, li.column, li.offset;
+      positions = { first = li, last = li };
+   } else {
+      line, column, offset = -1, -1, -1;
+   }
+
+   var msg  = string.format("line %i, char %i: "..fmt, line, column, ...);
+   if( file && file!='?' ) { msg = "file "..file..", "..msg; }
+
+   var src = lx.src;
+   if( offset>0 && src ) {
+      var i, j = offset, offset;
+      while( src->sub(i,i) != '\n' && i>=0    ) { i-=1; }
+      while( src->sub(j,j) != '\n' && j<=#src ) { j+=1; }
+      var srcline = src->sub (i+1, j-1);
+      var idx  = string.rep (" ", column).."^";
+      msg = string.format("%s\n>>> %s\n>>> %s", msg, srcline, idx);
+   }
+   //lx :kill()
+   error(msg);
+}
+
+//-----------------------------------------------------------------------------
+//
+// Sequence parser generator
+//
+//-----------------------------------------------------------------------------
+// Input fields:
+//
+// * [builder]: how to build an AST out of sequence parts. let [x] be the list
+//   of subparser results (keywords are simply omitted). [builder] can be:
+//    - [nil], in which case the result of parsing is simply [x]
+//    - a string, which is then put as a tag on [x]
+//    - a function, which takes [x] as a parameter and returns an AST.
+//
+// * [name]: the name of the parser. Used for debug messages
+//
+// * [transformers]: a list of AST->AST functions, applied in order on ASTs
+//   returned by the parser.
+//
+// * Table-part entries corresponds to keywords (strings) and subparsers
+//   (function and callable objects).
+//
+// After creation, the following fields are added:
+// * [parse] the parsing function lexer->AST
+// * [kind] == "sequence"
+// * [name] is set, if it wasn't in the input.
+//
+//-----------------------------------------------------------------------------
+function M.sequence (p) {
+   M.make_parser ("sequence", p);
+
+   //-----------------------------------------------------------------
+   // Parsing method
+   //-----------------------------------------------------------------
+   function p::parse (lx) {
+
+      // Raw parsing:
+      var fli = lx->lineinfo_right();
+      var seq = raw_parse_sequence (lx, this);
+      var lli = lx->lineinfo_left();
+
+      // Builder application:
+      var builder, tb = this.builder, type (this.builder);
+      if( tb == "string" ) { seq.tag = builder;
+      } else if( tb == "function" || builder && builder.__call ) { seq = builder(seq);
+      } else if( builder == null ) { // nothing
+      } else { error ("Invalid builder of type "..tb.." in sequence"); }
+      seq = transform (seq, this, fli, lli);
+      assert (! seq || seq.lineinfo);
+      return seq;
+   }
+
+   //-----------------------------------------------------------------
+   // Construction
+   //-----------------------------------------------------------------
+   // Try to build a proper name
+   if( p.name ) {
+      // don't touch existing name
+   } else if( type(p[1])=="string" ) { // find name based on 1st keyword
+      if( #p==1 ) { p.name=p[1];
+      } else if( type(p[#p])=="string" ) {
+         p.name = p[1] .. " ... " .. p[#p];
+      } else { p.name = p[1] .. " ..."; }
+   } else { // can't find a decent name
+      p.name = "unnamed_sequence";
+   }
+
+   return p;
+} //</sequence>
+
+
+//-----------------------------------------------------------------------------
+//
+// Multiple, keyword-driven, sequence parser generator
+//
+//-----------------------------------------------------------------------------
+// in [p], useful fields are:
+//
+// * [transformers]: as usual
+//
+// * [name]: as usual
+//
+// * Table-part entries must be sequence parsers, or tables which can
+//   be turned into a sequence parser by [gg.sequence]. These
+//   sequences must start with a keyword, and this initial keyword
+//   must be different for each sequence.  The table-part entries will
+//   be removed after [gg.multisequence] returns.
+//
+// * [default]: the parser to run if the next keyword in the lexer is
+//   none of the registered initial keywords. If there's no default
+//   parser and no suitable initial keyword, the multisequence parser
+//   simply returns [false].
+//
+// After creation, the following fields are added:
+//
+// * [parse] the parsing function lexer->AST
+//
+// * [sequences] the table of sequences, indexed by initial keywords.
+//
+// * [add] method takes a sequence parser or a config table for
+//   [gg.sequence], and adds/replaces the corresponding sequence
+//   parser. If the keyword was already used, the former sequence is
+//   removed and a warning is issued.
+//
+// * [get] method returns a sequence by its initial keyword
+//
+// * [kind] == "multisequence"
+//
+//-----------------------------------------------------------------------------
+function M.multisequence (p) {
+   M.make_parser ("multisequence", p);
+
+   //-----------------------------------------------------------------
+   // Add a sequence (might be just a config table for [gg.sequence])
+   //-----------------------------------------------------------------
+   function p ::add (s) {
+      // compile if necessary:
+      var keyword = type(s)=='table' && s[1];
+      if( type(s)=='table' && ! M.is_parser(s) ) { M.sequence(s); }
+      if( M.is_parser(s)!='sequence' || type(keyword)!='string' ) {
+         if( this.default ) { // two defaults
+            error ("In a multisequence parser, all but one sequences "..
+                   "must start with a keyword");
+         } else { this.default = s; } // first default
+     } else {
+         if( this.sequences[keyword] ) { // duplicate keyword
+             // TODO: warn that initial keyword `keyword` is overloaded in multiseq
+         }
+         this.sequences[keyword] = s;
+     }
+   } // </multisequence.add>
+
+   //-----------------------------------------------------------------
+   // Get the sequence starting with this keyword. [kw :: string]
+   //-----------------------------------------------------------------
+   function p ::get (kw) { return this.sequences [kw]; }
+
+   //-----------------------------------------------------------------
+   // Remove the sequence starting with keyword [kw :: string]
+   //-----------------------------------------------------------------
+   function p ::del (kw) {
+      if( ! this.sequences[kw] ) {
+          // TODO: warn that we try to delete a non-existent entry
+      }
+      var removed = this.sequences[kw];
+      this.sequences[kw] = null;
+      return removed;
+   }
+
+   //-----------------------------------------------------------------
+   // Parsing method
+   //-----------------------------------------------------------------
+   function p ::parse (lx) {
+      var fli = lx->lineinfo_right();
+      var x = raw_parse_multisequence (lx, this.sequences, this.default);
+      var lli = lx->lineinfo_left();
+      return transform (x, this, fli, lli);
+   }
+
+   //-----------------------------------------------------------------
+   // Construction
+   //-----------------------------------------------------------------
+   // Register the sequences passed to the constructor. They're going
+   // from the array part of the parser to the hash part of field
+   // [sequences]
+   p.sequences = { };
+   for( i=1, #p ) { p ->add (p[i]); p[i] = null; }
+
+   // FIXME: why is this commented out?
+   //if p.default and not is_parser(p.default) then sequence(p.default) end
+   return p;
+} //</multisequence>
+
+
+//-----------------------------------------------------------------------------
+//
+// Expression parser generator
+//
+//-----------------------------------------------------------------------------
+//
+// Expression configuration relies on three tables: [prefix], [infix]
+// and [suffix]. Moreover, the primary parser can be replaced by a
+// table: in this case the [primary] table will be passed to
+// [gg.multisequence] to create a parser.
+//
+// Each of these tables is a modified multisequence parser: the
+// differences with respect to regular multisequence config tables are:
+//
+// * the builder takes specific parameters:
+//   - for [prefix], it takes the result of the prefix sequence parser,
+//     and the prefixed expression
+//   - for [infix], it takes the left-hand-side expression, the results
+//     of the infix sequence parser, and the right-hand-side expression.
+//   - for [suffix], it takes the suffixed expression, and the result
+//     of the suffix sequence parser.
+//
+// * the default field is a list, with parameters:
+//   - [parser] the raw parsing function
+//   - [transformers], as usual
+//   - [prec], the operator's precedence
+//   - [assoc] for [infix] table, the operator's associativity, which
+//     can be "left", "right" or "flat" (default to left)
+//
+// In [p], useful fields are:
+// * [transformers]: as usual
+// * [name]: as usual
+// * [primary]: the atomic expression parser, or a multisequence config
+//   table (mandatory)
+// * [prefix]:  prefix  operators config table, see above.
+// * [infix]:   infix   operators config table, see above.
+// * [suffix]: suffix operators config table, see above.
+//
+// After creation, these fields are added:
+// * [kind] == "expr"
+// * [parse] as usual
+// * each table is turned into a multisequence, and therefore has an
+//   [add] method
+//
+//-----------------------------------------------------------------------------
+function M.expr (p) {
+   M.make_parser ("expr", p);
+
+   //-----------------------------------------------------------------
+   // parser method.
+   // In addition to the lexer, it takes an optional precedence:
+   // it won't read expressions whose precedence is lower or equal
+   // to [prec].
+   //-----------------------------------------------------------------
+   function p ::parse (lx, prec) {
+      prec = prec || 0;
+
+      //----------------------------------------------------
+      // Extract the right parser and the corresponding
+      // options table, for (pre|in|suff)fix operators.
+      // Options include prec, assoc, transformers.
+      //----------------------------------------------------
+      var function get_parser_info (tab) {
+         var p2 = tab ->get (lx ->is_keyword (lx ->peek()));
+         if( p2 ) { // keyword-based sequence found
+            var function parser(lx) { return raw_parse_sequence(lx, p2); }
+            return parser, p2;
+         } else { // Got to use the default parser
+            var d = tab.default;
+            if( d ) { return d.parse || d.parser, d;
+            } else { return false, false; }
+         }
+      }
+
+      //----------------------------------------------------
+      // Look for a prefix sequence. Multiple prefixes are
+      // handled through the recursive [p.parse] call.
+      // Notice the double-transform: one for the primary
+      // expr, and one for the one with the prefix op.
+      //----------------------------------------------------
+      var function handle_prefix () {
+         var fli = lx ->lineinfo_right();
+         var p2_func, p2 = get_parser_info (this.prefix);
+         var op = p2_func && p2_func (lx);
+         if( op ) { // Keyword-based sequence found
+            var ili = lx ->lineinfo_right(); // Intermediate LineInfo
+            var e = p2.builder (op, this ->parse (lx, p2.prec));
+            var lli = lx ->lineinfo_left();
+            return transform (transform (e, p2, ili, lli), this, fli, lli);
+         } else { // No prefix found, get a primary expression
+            var e = this.primary(lx);
+            var lli = lx ->lineinfo_left();
+            return transform (e, this, fli, lli);
+         }
+      } //</expr.parse.handle_prefix>
+
+      //----------------------------------------------------
+      // Look for an infix sequence+right-hand-side operand.
+      // Return the whole binary expression result,
+      // or false if no operator was found.
+      //----------------------------------------------------
+      var function handle_infix (e) {
+         var p2_func, p2 = get_parser_info (this.infix);
+         if( ! p2 ) { return false; }
+
+         //---------------------------------------
+         // Handle flattening operators: gather all operands
+         // of the series in [list]; when a different operator
+         // is found, stop, build from [list], [transform] and
+         // return.
+         //---------------------------------------
+         if( (! p2.prec || p2.prec>prec) && p2.assoc=="flat" ) {
+            var fli = lx->lineinfo_right();
+            var pflat, list = p2, { e };
+            do {
+               var op = p2_func(lx);
+               if( ! op ) { break; }
+               table.insert (list, this->parse (lx, p2.prec));
+               var _; // We only care about checking that p2==pflat
+               _, p2 = get_parser_info (this.infix);
+            } while(!( p2 != pflat) );
+            var e2 = pflat.builder (list);
+            var lli = lx->lineinfo_left();
+            return transform (transform (e2, pflat, fli, lli), this, fli, lli);
+
+         //---------------------------------------
+         // Handle regular infix operators: [e] the LHS is known,
+         // just gather the operator and [e2] the RHS.
+         // Result goes in [e3].
+         //---------------------------------------
+         } else if( p2.prec && p2.prec>prec ||
+                p2.prec==prec && p2.assoc=="right" ) {
+            var fli = e.lineinfo.first; // lx:lineinfo_right()
+            var op = p2_func(lx);
+            if( ! op ) { return false; }
+            var e2 = this->parse (lx, p2.prec);
+            var e3 = p2.builder (e, op, e2);
+            var lli = lx->lineinfo_left();
+            return transform (transform (e3, p2, fli, lli), this, fli, lli);
+
+         //---------------------------------------
+         // Check for non-associative operators, and complain if applicable.
+         //---------------------------------------
+         } else if( p2.assoc=="none" && p2.prec==prec ) {
+            M.parse_error (lx, "non-associative operator!");
+
+         //---------------------------------------
+         // No infix operator suitable at that precedence
+         //---------------------------------------
+         } else { return false; }
+
+      } //</expr.parse.handle_infix>
+
+      //----------------------------------------------------
+      // Look for a suffix sequence.
+      // Return the result of suffix operator on [e],
+      // or false if no operator was found.
+      //----------------------------------------------------
+      var function handle_suffix (e) {
+         // FIXME bad fli, must take e.lineinfo.first
+         var p2_func, p2 = get_parser_info (this.suffix);
+         if( ! p2 ) { return false; }
+         if( ! p2.prec || p2.prec>=prec ) {
+            //local fli = lx:lineinfo_right()
+            var fli = e.lineinfo.first;
+            var op = p2_func(lx);
+            if( ! op ) { return false; }
+            var lli = lx->lineinfo_left();
+            e = p2.builder (e, op);
+            e = transform (transform (e, p2, fli, lli), this, fli, lli);
+            return e;
+         }
+         return false;
+      } //</expr.parse.handle_suffix>
+
+      //----------------------------------------------------
+      // Parser body: read suffix and (infix+operand)
+      // extensions as long as we're able to fetch more at
+      // this precedence level.
+      //----------------------------------------------------
+      var e = handle_prefix();
+      do {
+         var x = handle_suffix (e); e = x || e;
+         var y = handle_infix   (e); e = y || e;
+      } while(!( ! (x || y)) );
+
+      // No transform: it already happened in operators handling
+      return e;
+   } //</expr.parse>
+
+   //-----------------------------------------------------------------
+   // Construction
+   //-----------------------------------------------------------------
+   if( ! p.primary ) { p.primary=p[1]; p[1]=null; }
+   for( _, t in ipairs({ "primary", "prefix", "infix", "suffix" }) ) {
+      if( ! p[t] ) { p[t] = { }; }
+      if( ! M.is_parser(p[t]) ) { M.multisequence(p[t]); }
+   }
+   function p::add(...) { return this.primary->add(...); }
+   return p;
+} //</expr>
+
+
+//-----------------------------------------------------------------------------
+//
+// List parser generator
+//
+//-----------------------------------------------------------------------------
+// In [p], the following fields can be provided in input:
+//
+// * [builder]: takes list of subparser results, returns AST
+// * [transformers]: as usual
+// * [name]: as usual
+//
+// * [terminators]: list of strings representing the keywords which
+//   might mark the end of the list. When non-empty, the list is
+//   allowed to be empty. A string is treated as a single-element
+//   table, whose element is that string, e.g. ["do"] is the same as
+//   [{"do"}].
+//
+// * [separators]: list of strings representing the keywords which can
+//   separate elements of the list. When non-empty, one of these
+//   keyword has to be found between each element. Lack of a separator
+//   indicates the end of the list. A string is treated as a
+//   single-element table, whose element is that string, e.g. ["do"]
+//   is the same as [{"do"}]. If [terminators] is empty/nil, then
+//   [separators] has to be non-empty.
+//
+// After creation, the following fields are added:
+// * [parse] the parsing function lexer->AST
+// * [kind] == "list"
+//
+//-----------------------------------------------------------------------------
+function M.list (p) {
+   M.make_parser ("list", p);
+
+   //-----------------------------------------------------------------
+   // Parsing method
+   //-----------------------------------------------------------------
+   function p ::parse (lx) {
+
+      //----------------------------------------------------
+      // Used to quickly check whether there's a terminator
+      // or a separator immediately ahead
+      //----------------------------------------------------
+      var function peek_is_in (keywords) {
+         return keywords && lx->is_keyword(lx->peek(), unpack(keywords)); }
+
+      var x = { };
+      var fli = lx ->lineinfo_right();
+
+      // if there's a terminator to start with, don't bother trying
+      var is_empty_list = this.terminators && (peek_is_in (this.terminators) || lx->peek().tag=="Eof");
+      if( ! is_empty_list ) {
+         do {
+             var item = this.primary(lx);
+             table.insert (x, item); // read one element
+         } while(!(
+            // There's a separator list specified, and next token isn't in it.
+            // Otherwise, consume it with [lx:next()]
+            this.separators && !(peek_is_in (this.separators) && lx->next()) ||
+            // Terminator token ahead
+            peek_is_in (this.terminators) ||
+            // Last reason: end of file reached
+            lx->peek().tag=="Eof") );
+      }
+
+      var lli = lx->lineinfo_left();
+
+      // Apply the builder. It can be a string, or a callable value,
+      // or simply nothing.
+      var b = this.builder;
+      if( b ) {
+         if( type(b)=="string" ) { x.tag = b; // b is a string, use it as a tag
+         } else if( type(b)=="function" ) { x=b(x);
+         } else {
+            var bmt = getmetatable(b);
+            if( bmt && bmt.__call ) { x=b(x); }
+         }
+      }
+      return transform (x, this, fli, lli);
+   } //</list.parse>
+
+   //-----------------------------------------------------------------
+   // Construction
+   //-----------------------------------------------------------------
+   if( ! p.primary ) { p.primary = p[1]; p[1] = null; }
+   if( type(p.terminators) == "string" ) { p.terminators = { p.terminators };
+   } else if( p.terminators && #p.terminators == 0 ) { p.terminators = null; }
+   if( type(p.separators) == "string" ) { p.separators = { p.separators };
+   } else if( p.separators && #p.separators == 0 ) { p.separators = null; }
+
+   return p;
+} //</list>
+
+
+//-----------------------------------------------------------------------------
+//
+// Keyword-conditioned parser generator
+//
+//-----------------------------------------------------------------------------
+//
+// Only apply a parser if a given keyword is found. The result of
+// [gg.onkeyword] parser is the result of the subparser (modulo
+// [transformers] applications).
+//
+// lineinfo: the keyword is *not* included in the boundaries of the
+// resulting lineinfo. A review of all usages of gg.onkeyword() in the
+// implementation of metalua has shown that it was the appropriate choice
+// in every case.
+//
+// Input fields:
+//
+// * [name]: as usual
+//
+// * [transformers]: as usual
+//
+// * [peek]: if non-nil, the conditioning keyword is left in the lexeme
+//   stream instead of being consumed.
+//
+// * [primary]: the subparser.
+//
+// * [keywords]: list of strings representing triggering keywords.
+//
+// * Table-part entries can contain strings, and/or exactly one parser.
+//   Strings are put in [keywords], and the parser is put in [primary].
+//
+// After the call, the following fields will be set:
+//
+// * [parse] the parsing method
+// * [kind] == "onkeyword"
+// * [primary]
+// * [keywords]
+//
+//-----------------------------------------------------------------------------
+function M.onkeyword (p) {
+   M.make_parser ("onkeyword", p);
+
+   //-----------------------------------------------------------------
+   // Parsing method
+   //-----------------------------------------------------------------
+   function p ::parse (lx) {
+      if( lx ->is_keyword (lx->peek(), unpack(this.keywords)) ) {
+         var fli = lx->lineinfo_right();
+         if( ! this.peek ) { lx->next(); }
+         var content = this.primary (lx);
+         var lli = lx->lineinfo_left();
+         var li = content.lineinfo || { };
+         fli, lli = li.first || fli, li.last || lli;
+         return transform (content, p, fli, lli);
+      } else { return false; }
+   }
+
+   //-----------------------------------------------------------------
+   // Construction
+   //-----------------------------------------------------------------
+   if( ! p.keywords ) { p.keywords = { }; }
+   for( _, x in ipairs(p) ) {
+      if( type(x)=="string" ) { table.insert (p.keywords, x);
+      } else { assert (! p.primary && M.is_parser (x)); p.primary = x; }
+   }
+   assert (next (p.keywords), "Missing trigger keyword in gg.onkeyword");
+   assert (p.primary, 'no primary parser in gg.onkeyword');
+   return p;
+} //</onkeyword>
+
+
+//-----------------------------------------------------------------------------
+//
+// Optional keyword consummer pseudo-parser generator
+//
+//-----------------------------------------------------------------------------
+//
+// This doesn't return a real parser, just a function. That function parses
+// one of the keywords passed as parameters, and returns it. It returns
+// [false] if no matching keyword is found.
+//
+// Notice that tokens returned by lexer already carry lineinfo, therefore
+// there's no need to add them, as done usually through transform() calls.
+//-----------------------------------------------------------------------------
+function M.optkeyword (...) {
+   var args = {...};
+   if( type (args[1]) == "table" ) {
+      assert (#args == 1);
+      args = args[1];
+   }
+   for( _, v in ipairs(args) ) { assert (type(v)=="string"); }
+   return function (lx) {
+      var x = lx->is_keyword (lx->peek(), unpack (args));
+      if( x ) { lx->next(); return x;
+      } else { return false; }
+   };
+}
+
+
+//-----------------------------------------------------------------------------
+//
+// Run a parser with a special lexer
+//
+//-----------------------------------------------------------------------------
+//
+// This doesn't return a real parser, just a function.
+// First argument is the lexer class to be used with the parser,
+// 2nd is the parser itself.
+// The resulting parser returns whatever the argument parser does.
+//
+//-----------------------------------------------------------------------------
+function M.with_lexer(new_lexer, parser) {
+
+   //-----------------------------------------------------------------
+   // Most gg functions take their parameters in a table, so it's
+   // better to silently accept when with_lexer{ } is called with
+   // its arguments in a list:
+   //-----------------------------------------------------------------
+   if( ! parser && #new_lexer==2 && type(new_lexer[1])=='table' ) {
+      return M.with_lexer(unpack(new_lexer));
+   }
+
+   //-----------------------------------------------------------------
+   // Save the current lexer, switch it for the new one, run the parser,
+   // restore the previous lexer, even if the parser caused an error.
+   //-----------------------------------------------------------------
+   return function (lx) {
+      var old_lexer = getmetatable(lx);
+      lx->sync();
+      setmetatable(lx, new_lexer);
+      var status, result = pcall(parser, lx);
+      lx->sync();
+      setmetatable(lx, old_lexer);
+      if( status ) { return result; } else { error(result); }
+   };
+}
+
+//------------------------------------------------------------------------------
+//
+// Make sure a parser is used and returns successfully.
+//
+//------------------------------------------------------------------------------
+function M.nonempty(primary) {
+    var p = M.make_parser('non-empty list', { primary = primary, name=primary.name });
+    function p ::parse (lx) {
+         var fli = lx->lineinfo_right();
+         var content = this.primary (lx);
+         var lli = lx->lineinfo_left();
+         var li = content.lineinfo || { };
+         fli, lli = li.first || fli, li.last || lli;
+         if( #content == 0 ) {
+           M.parse_error (lx, "`%s' must not be empty.", this.name || "list");
+       } else {
+           return transform (content, this, fli, lli);
+       }
+    }
+    return p;
+}
+
+var FUTURE_MT = { };
+function FUTURE_MT::__tostring() { return "<Proxy parser module>"; }
+function FUTURE_MT::__newindex(key, value) { error ("don't write in futures"); }
+function FUTURE_MT ::__index (parser_name) {
+    return function(...) {
+        var p, m = rawget(this, '__path'), this.__module;
+        if( p ) { for( _, name in ipairs(p) ) {
+            m=rawget(m, name);
+            if( ! m ) { error ("Submodule '"..name.."' undefined"); }
+        } }
+        var f = rawget(m, parser_name);
+        if( ! f ) { error ("Parser '"..parser_name.."' undefined"); }
+        return f(...);
+    };
+}
+
+function M.future(module, ...) {
+    checks('table');
+    var path = ... && {...};
+    if( path ) { for( _, x in ipairs(path) ) { 
+        assert(type(x)=='string', "Bad future arg");
+    } }
+    var this = { __module = module,
+                   __path   = path };
+    return setmetatable(this, FUTURE_MT);
+}
+
+return M;

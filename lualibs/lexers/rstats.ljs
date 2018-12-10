@@ -1,0 +1,53 @@
+// Copyright 2006-2016 Mitchell mitchell.att.foicica.com. See LICENSE.
+// R LPeg lexer.
+
+var l = require('lexer');
+var token, word_match = l.token, l.word_match;
+var P, R, S = lpeg.P, lpeg.R, lpeg.S;
+
+var M = {_NAME = 'rstats'};
+
+// Whitespace.
+var ws = token(l.WHITESPACE, l.space**1);
+
+// Comments.
+var comment = token(l.COMMENT, '#' * l.nonnewline**0);
+
+// Strings.
+var sq_str = l.delimited_range("'", true);
+var dq_str = l.delimited_range('"', true);
+var string = token(l.STRING, sq_str + dq_str);
+
+// Numbers.
+var number = token(l.NUMBER, (l.float + l.integer) * P('i')**-1);
+
+// Keywords.
+var keyword = token(l.KEYWORD, word_match({
+  'break', 'else', 'for', 'if', 'in', 'next', 'repeat', 'return', 'switch',
+  'try', 'while', 'Inf', 'NA', 'NaN', 'NULL', 'FALSE', 'TRUE'
+}));
+
+// Types.
+var type = token(l.TYPE, word_match({
+  'array', 'character', 'complex', 'data.frame', 'double', 'factor', 'function',
+  'integer', 'list', 'logical', 'matrix', 'numeric', 'vector'
+}));
+
+// Identifiers.
+var identifier = token(l.IDENTIFIER, l.word);
+
+// Operators.
+var operator = token(l.OPERATOR, S('<->+*/^=.,:;|$()[]{}'));
+
+M._rules = {
+  {'whitespace', ws},
+  {'keyword', keyword},
+  {'type', type},
+  {'identifier', identifier},
+  {'string', string},
+  {'comment', comment},
+  {'number', number},
+  {'operator', operator},
+};
+
+return M;

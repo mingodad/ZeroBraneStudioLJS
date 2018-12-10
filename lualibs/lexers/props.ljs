@@ -1,0 +1,47 @@
+// Copyright 2006-2016 Mitchell mitchell.att.foicica.com. See LICENSE.
+// Props LPeg lexer.
+
+var l = require('lexer');
+var token, word_match = l.token, l.word_match;
+var P, R, S = lpeg.P, lpeg.R, lpeg.S;
+
+var M = {_NAME = 'props'};
+
+// Whitespace.
+var ws = token(l.WHITESPACE, l.space**1);
+
+// Comments.
+var comment = token(l.COMMENT, '#' * l.nonnewline**0);
+
+// Equals.
+var equals = token(l.OPERATOR, '=');
+
+// Strings.
+var sq_str = l.delimited_range("'");
+var dq_str = l.delimited_range('"');
+var string = token(l.STRING, sq_str + dq_str);
+
+// Variables.
+var variable = token(l.VARIABLE, '$(' * (l.any - ')')**1 * ')');
+
+// Colors.
+var xdigit = l.xdigit;
+var color = token('color', '#' * xdigit * xdigit * xdigit * xdigit * xdigit *
+                             xdigit);
+
+M._rules = {
+  {'whitespace', ws},
+  {'color', color},
+  {'comment', comment},
+  {'equals', equals},
+  {'string', string},
+  {'variable', variable},
+};
+
+M._tokenstyles = {
+  color = l.STYLE_NUMBER
+};
+
+M._LEXBYLINE = true;
+
+return M;

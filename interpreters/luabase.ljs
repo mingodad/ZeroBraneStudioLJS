@@ -1,0 +1,109 @@
+function MakeLuaInterpreter(version, name) {
+
+var function exePath(this, version) {
+  version = tostring(version || "")->gsub('%.','');
+  var mainpath = ide->GetRootPath();
+  var macExe = mainpath..([=[bin/lua.app/Contents/MacOS/lua%s]=])->format(version);
+  return (ide.config.path['ljs'..version]
+    || (ide.osname == "Windows" && mainpath..([=[bin\ljs%s.exe]=])->format(version))
+    || (ide.osname == "Unix" && mainpath..([=[bin/linux/%s/ljs%s]=])->format(ide.osarch, version))
+    || (wx.wxFileExists(macExe) && macExe || mainpath..([=[bin/ljs%s]=])->format(version))),
+  ide.config.path['ljs'..version] != null;
+}
+
+var function shortenIfNeeded(filepath) {
+  // if running on Windows and can't open the file, this may mean that
+  // the file path includes unicode characters that need special handling
+  var fh = io.open(filepath, "r");
+  if( fh ) { fh->close(); }
+  if( ! fh && ide.osname == 'Windows'
+  && pcall(require, "winapi") && wx.wxFileExists(filepath) ) {
+    winapi.set_encoding(winapi.CP_UTF8);
+    var shortpath = winapi.short_path(filepath);
+    if( shortpath != filepath ) { return shortpath; }
+    ide->Print(
+      ("Can't get short path for a Unicode file name '%s' use the file.")
+      ->format(filepath));
+    ide->Print(
+      ("You can enable short names by using `fsutil 8dot3name set %s: 0` and recreate the file or directory.")
+      ->format(wfilename->GetVolume()));
+  }
+  return filepath;
+}
+
+return {
+  name = ("LJS%s")->format(name || version || ""),
+  description = ("LJS%s interpreter with debugger")->format(name || version || ""),
+  api = {"baselib"},
+  luaversion = version || '5.1',
+  fexepath = exePath,
+  frun = function(this,wfilename,rundebug) {
+    var exe, iscustom = this->fexepath(version || "");
+    var filepath = shortenIfNeeded(wfilename->GetFullPath());
+
+    if( rundebug ) {
+      ide->GetDebugger()->SetOptions({runstart = ide.config.debugger.runonstart == true});
+
+      // update arg to point to the proper file
+      rundebug = ('if (arg) { arg[0] = [=[%s]=]; } ')->format(filepath)..rundebug;
+
+      var tmpfile = wx.wxFileName();
+      tmpfile->AssignTempFileName(".");
+      filepath = shortenIfNeeded(tmpfile->GetFullPath());
+
+      var ok, err = FileWrite(filepath, rundebug);
+      if( ! ok ) {
+        ide->Print(("Can't open temporary file '%s' for writing: %s.")->format(filepath, err));
+        return;
+      }
+    }
+    var params = this->GetCommandLineArg("lua");
+    var code = ([=[-e "io.stdout->setvbuf('no')" "%s"]=])->format(filepath);
+    var cmd = '"'..exe..'" '..code..(params && " "..params || "");
+
+    // modify LUA_CPATH and LUA_PATH to work with other Lua versions
+    var envcpath = "LUA_CPATH";
+    var envlpath = "LUA_PATH";
+    if( version ) {
+      var env = "PATH_"..string.gsub(version, '%.', '_');
+      if( os.getenv("LUA_C"..env) ) { envcpath = "LUA_C"..env; }
+      if( os.getenv("LUA_"..env) ) { envlpath = "LUA_"..env; }
+    }
+
+    var cpath = os.getenv(envcpath);
+    if( rundebug && cpath && ! iscustom ) {
+      // prepend osclibs as the libraries may be needed for debugging,
+      // but only if no path.ljs is set as it may conflict with system libs
+      wx.wxSetEnv(envcpath, ide.osclibs..';'..cpath);
+    }
+    if( version && cpath ) {
+      // adjust references to /clibs/ folders to point to version-specific ones
+      var cpath = os.getenv(envcpath);
+      var clibs = string.format('/clibs%s/', version)->gsub('%.','');
+      if( ! cpath->find(clibs, 1, true) ) { cpath = cpath->gsub('/clibs/', clibs); }
+      wx.wxSetEnv(envcpath, cpath);
+    }
+
+    var lpath = version && (! iscustom) && os.getenv(envlpath);
+    if( lpath ) {
+      // add oslibs libraries when LUA_PATH_5_x variables are set to allow debugging to work
+      wx.wxSetEnv(envlpath, lpath..';'..ide.oslibs);
+    }
+
+    // CommandLineRun(cmd,wdir,tooutput,nohide,stringcallback,uid,endcallback)
+    var pid = CommandLineRun(cmd,this->fworkdir(wfilename),true,false,null,null,
+      function() { if( rundebug ) { wx.wxRemoveFile(filepath); } });
+
+    if( (rundebug || version) && cpath ) { wx.wxSetEnv(envcpath, cpath); }
+    if( lpath ) { wx.wxSetEnv(envlpath, lpath); }
+    return pid;
+  },
+  hasdebugger = true,
+  scratchextloop = false,
+  unhideanywindow = true,
+  takeparameters = true,
+};
+
+}
+
+return null; // as this is not a real interpreter

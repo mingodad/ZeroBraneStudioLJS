@@ -1,0 +1,34 @@
+function CMarkSymbols(code, pos, vars) {
+  var idtmpl = "[A-Za-z_][A-Za-z0-9_ ]*";
+  var funcdeftmpl = "("..idtmpl.."[%*%s:~]+"..idtmpl->gsub(" ",":")..")%s*(%b())%s*%{";
+  var isfndef = function(str, pos) {
+    var s,e,pref,cap,parms;
+    while( true ) {
+      s,e,pref,cap,parms = str->find("^(%s*)"..funcdeftmpl, pos);
+      if( (! s) ) {
+        s,e,pref,cap,parms = str->find("([\r\n]%s*)"..funcdeftmpl, pos);
+      }
+      // skip strange parameters and things of `else if ()` variety
+      if( parms && #parms > 0 && ! (parms->find(idtmpl) || parms->find("%(%s*%)"))
+      || cap && (cap->find("%sif%s*$") || cap->find("[^:]:[^:]")) ) {
+        pos = s+#pref+#cap+#parms;
+      } else {
+        break;
+      }
+    }
+    if( s ) { return s+#pref,s+#pref+#cap-1,cap; }
+  };
+
+  return coroutine.wrap(function() {
+      // return a dummy token to produce faster result for quick typing
+      coroutine.yield("String", "dummy", 1, {});
+      while( true ) {
+        var fpos, lpos, name  = isfndef(code, pos);
+        if( ! fpos ) { return; }
+        coroutine.yield("Function", name, fpos, {}, 1);
+        pos = fpos + #name;
+      }
+  });
+}
+
+return null; // not a real spec

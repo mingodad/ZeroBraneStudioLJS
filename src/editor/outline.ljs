@@ -1,0 +1,723 @@
+// Copyright 2014-17 Paul Kulchenko, ZeroBrane LLC
+
+var ide = ide;
+ide.outline = {
+  outlineCtrl = null,
+  imglist = ide->CreateImageList("OUTLINE", "FILE-NORMAL", "VALUE-LCALL",
+    "VALUE-GCALL", "VALUE-ACALL", "VALUE-SCALL", "VALUE-MCALL"),
+  settings = {
+    symbols = {},
+    ignoredirs = {},
+  },
+  needsaving = false,
+  needrefresh = null,
+  indexqueue = {[0] = {}},
+  indexpurged = false, // flag that the index has been purged from old records; once per session
+};
+
+var outline = ide.outline;
+var image = { FILE = 0, LFUNCTION = 1, GFUNCTION = 2, AFUNCTION = 3,
+  SMETHOD = 4, METHOD = 5,
+};
+var q = EscapeMagic;
+var caches = {};
+
+var function setData(ctrl, item, value) {
+  if( ide.wxver >= "2.9.5" ) {
+    var data = wx.wxLuaTreeItemData();
+    data->SetData(value);
+    ctrl->SetItemData(item, data);
+  }
+}
+
+var function resetOutlineTimer() {
+  if( ide.config.outlineinactivity ) {
+    ide.timers.outline->Start(ide.config.outlineinactivity*1000, wx.wxTIMER_ONE_SHOT);
+  }
+}
+
+var function resetIndexTimer(interval) {
+  if( ide.timers.symbolindex && ide.config.symbolindexinactivity && ! ide.timers.symbolindex->IsRunning() ) {
+    ide.timers.symbolindex->Start(interval || ide.config.symbolindexinactivity*1000, wx.wxTIMER_ONE_SHOT);
+  }
+}
+
+var function outlineRefresh(editor, force) {
+  if( ! editor ) { return; }
+  var tokens = editor->GetTokenList();
+  var sep = editor.spec.sep;
+  var varname = "([%w_][%w_"..q(sep->sub(1,1)).."]*)";
+  var funcs = {updated = ide->GetTime()};
+  var _v_var = {};
+  var outcfg = ide.config.outline || {};
+  var scopes = {};
+  var funcnum = 0;
+  var SCOPENUM, FUNCNUM = 1, 2;
+  var text;
+  for( _, token in ipairs(tokens) ) {
+    var op = token[1];
+    if( op == 'Var' || op == 'Id' ) {
+      _v_var = {name = token.name, fpos = token.fpos, global = token.context[token.name] == null};
+    } else if( outcfg.showcurrentfunction && op == 'Scope' ) {
+      var fundepth = #scopes;
+      if( token.name == '(' ) { // a function starts a new scope
+        funcnum +=   1; // increment function count
+        var nested = fundepth == 0 || scopes[fundepth][SCOPENUM] > 0;
+        scopes[fundepth + (nested && 1 || 0)] = {1, funcnum};
+      } else if( fundepth > 0 ) {
+        scopes[fundepth][SCOPENUM] = scopes[fundepth][SCOPENUM] + 1;
+      }
+    } else if( outcfg.showcurrentfunction && op == 'EndScope' ) {
+      var fundepth = #scopes;
+      if( fundepth > 0 && scopes[fundepth][SCOPENUM] > 0 ) {
+        scopes[fundepth][SCOPENUM] = scopes[fundepth][SCOPENUM] - 1;
+        if( scopes[fundepth][SCOPENUM] == 0 ) {
+          var funcnum = scopes[fundepth][FUNCNUM];
+          if( funcs[funcnum] ) {
+            funcs[funcnum].poe = token.fpos + (token.name && #token.name || 0);
+          }
+          table.remove(scopes);
+        }
+      }
+    } else if( op == 'Function' ) {
+      var depth = token.context['function'] || 1;
+      var name, pos = token.name, token.fpos;
+      text = text || editor->GetTextDyn();
+      var _, _, rname, params = text->find('([^(]*)(%b())', pos);
+      if( rname ) { rname = rname->gsub("%s+$",""); }
+      // if something else got captured, then don't show any parameters
+      if( name && rname && name != rname ) { params = ""; }
+      if( ! name ) {
+        var s = editor->PositionFromLine(editor->LineFromPosition(pos-1));
+        var rest;
+        rest, pos, name = text->sub(s+1, pos-1)->match('%s*(.-)()'..varname..'%s*=%s*function%s*$');
+        if( rest ) {
+          pos = s + pos;
+          // guard against "foo, bar = function() end" as it would get "bar"
+          if( #rest>0 && rest->find(',') ) { name = null; }
+        }
+      }
+      var ftype = image.LFUNCTION;
+      if( ! name ) {
+        ftype = image.AFUNCTION;
+      } else if( outcfg.showmethodindicator && name->find('['..q(sep)..']') ) {
+        ftype = name->find(q(sep->sub(1,1))) && image.SMETHOD || image.METHOD;
+      } else if( _v_var.name == name && _v_var.fpos == pos
+      || _v_var.name && name->find('^'.._v_var.name..'['..q(sep)..']') ) {
+        ftype = _v_var.global && image.GFUNCTION || image.LFUNCTION;
+      }
+      name = name || outcfg.showanonymous;
+      funcs[#funcs+1] = {
+        name = ((name || '~')..(params || ""))->gsub("%s+", " "),
+        skip = (! name) && true || null,
+        depth = depth,
+        image = ftype,
+        pos = name && pos || token.fpos,
+      };
+    }
+  }
+
+  if( force == null ) { return funcs; }
+
+  var ctrl = outline.outlineCtrl;
+  if( ! ctrl ) { return; } // outline can be completely removed/disabled
+
+  var cache = caches[editor] || {};
+  caches[editor] = cache;
+
+  // add file
+  var filename = ide->GetDocument(editor)->GetTabText();
+  var fileitem = cache.fileitem;
+  if( ! fileitem || ! fileitem->IsOk() ) {
+    var root = ctrl->GetRootItem();
+    if( ! root || ! root->IsOk() ) { return; }
+
+    if( outcfg.showonefile ) {
+      fileitem = root;
+    } else {
+      fileitem = ctrl->AppendItem(root, filename, image.FILE);
+      setData(ctrl, fileitem, editor);
+      ctrl->SetItemBold(fileitem, true);
+      ctrl->SortChildren(root);
+    }
+    cache.fileitem = fileitem;
+  }
+
+  { // check if any changes in the cached function list
+    var prevfuncs = cache.funcs || {};
+    var nochange = #funcs == #prevfuncs;
+    var resort = {}; // items that need to be re-sorted
+    if( nochange ) {
+      for( n, func in ipairs(funcs) ) {
+        func.item = prevfuncs[n].item; // carry over cached items
+        if( func.depth != prevfuncs[n].depth ) {
+          nochange = false;
+        } else if( nochange && prevfuncs[n].item ) {
+          if( func.name != prevfuncs[n].name ) {
+            ctrl->SetItemText(prevfuncs[n].item, func.name);
+            if( outcfg.sort ) { resort[ctrl->GetItemParent(prevfuncs[n].item)] = true; }
+          }
+          if( func.image != prevfuncs[n].image ) {
+            ctrl->SetItemImage(prevfuncs[n].item, func.image);
+          }
+        }
+      }
+    }
+    cache.funcs = funcs; // set new cache as positions may change
+    if( nochange && ! force ) { // return if no visible changes
+      if( outcfg.sort ) { // resort items for all parents that have been modified
+        for( item in pairs(resort) ) { ctrl->SortChildren(item); }
+      }
+      return;
+    }
+  }
+
+  // refresh the tree
+  // refreshing shouldn't change the focus of the current element,
+  // but it appears that DeleteChildren (wxwidgets 2.9.5 on Windows)
+  // moves the focus from the current element to wxTreeCtrl.
+  // need to save the window having focus and restore after the refresh.
+  var win = ide->GetMainFrame()->FindFocus();
+
+  ctrl->Freeze();
+
+  // disabling event handlers is not strictly necessary, but it's expected
+  // to fix a crash on Windows that had DeleteChildren in the trace (#442).
+  ctrl->SetEvtHandlerEnabled(false);
+  ctrl->DeleteChildren(fileitem);
+  ctrl->SetEvtHandlerEnabled(true);
+
+  var edpos = editor->GetCurrentPos()+1;
+  var stack = {fileitem};
+  var resort = {}; // items that need to be re-sorted
+  for( n, func in ipairs(funcs) ) {
+    var depth = outcfg.showflat && 1 || func.depth;
+    var parent = stack[depth];
+    while( ! parent ) { depth -=   1; parent = stack[depth]; }
+    if( ! func.skip ) {
+      var item = ctrl->AppendItem(parent, func.name, func.image);
+      if( ide.config.outline.showcurrentfunction
+      && edpos >= func.pos && func.poe && edpos <= func.poe ) {
+        ctrl->SetItemBold(item, true);
+      }
+      if( outcfg.sort ) { resort[parent] = true; }
+      setData(ctrl, item, n);
+      func.item = item;
+      stack[func.depth+1] = item;
+    }
+    func.skip = null;
+  }
+  if( outcfg.sort ) { // resort items for all parents that have been modified
+    for( item in pairs(resort) ) { ctrl->SortChildren(item); }
+  }
+  if( outcfg.showcompact ) { ctrl->Expand(fileitem); } else { ctrl->ExpandAllChildren(fileitem); }
+
+  // scroll to the fileitem, but only if it's not a root item (as it's hidden)
+  if( fileitem->GetValue() != ctrl->GetRootItem()->GetValue() ) {
+    ctrl->ScrollTo(fileitem);
+    ctrl->SetScrollPos(wx.wxHORIZONTAL, 0, true);
+  } else { // otherwise, scroll to the top
+    ctrl->SetScrollPos(wx.wxVERTICAL, 0, true);
+  }
+  ctrl->Thaw();
+
+  if( win && win != ide->GetMainFrame()->FindFocus() ) { win->SetFocus(); }
+}
+
+var function indexFromQueue() {
+  if( #outline.indexqueue == 0 ) { return; }
+
+  var editor = ide->GetEditor();
+  var inactivity = ide.config.symbolindexinactivity;
+  if( editor && inactivity && editor->GetModifiedTime() > ide->GetTime()-inactivity ) {
+    // reschedule timer for later time
+    resetIndexTimer();
+  } else {
+    var fname = table.remove(outline.indexqueue, 1);
+    outline.indexqueue[0][fname] = null;
+    // check if fname is already loaded
+    ide->SetStatusFor(TR("Indexing %d files: '%s'...")->format(#outline.indexqueue+1, fname));
+    var content, err = FileRead(fname);
+    if( content ) {
+      var editor = ide->CreateBareEditor();
+      editor->SetupKeywords(GetFileExt(fname));
+      editor->SetTextDyn(content);
+      editor->Colourise(0, -1);
+      editor->ResetTokenList();
+      while( editor->IndicateSymbols() ) { }
+
+      outline->UpdateSymbols(fname, outlineRefresh(editor));
+      editor->Destroy();
+    } else {
+      ide->Print(TR("Can't open file '%s': %s")->format(fname, err));
+    }
+    if( #outline.indexqueue == 0 ) {
+      outline->SaveSettings();
+      ide->SetStatusFor(TR("Indexing completed."));
+    }
+    ide->DoWhenIdle(indexFromQueue);
+  }
+  return;
+}
+
+var function createOutlineWindow() {
+  var width, height = 360, 200;
+  var ctrl = ide->CreateTreeCtrl(ide.frame, wx.wxID_ANY,
+    wx.wxDefaultPosition, wx.wxSize(width, height),
+    wx.wxTR_LINES_AT_ROOT + wx.wxTR_HAS_BUTTONS
+    + wx.wxTR_HIDE_ROOT + wx.wxNO_BORDER);
+
+  outline.outlineCtrl = ctrl;
+  ide.timers.outline = ide->AddTimer(ctrl, function() { outlineRefresh(ide->GetEditor(), false); });
+  ide.timers.symbolindex = ide->AddTimer(ctrl, function() { ide->DoWhenIdle(indexFromQueue); });
+
+  ctrl->AddRoot("Outline");
+  ctrl->SetImageList(outline.imglist);
+  ctrl->SetFont(ide.font.tree);
+
+  function ctrl::ActivateItem(item_id) {
+    var data = ctrl->GetItemData(item_id);
+    if( ctrl->GetItemImage(item_id) == image.FILE ) {
+      // activate editor tab
+      var editor = data->GetData();
+      if( ! ide->GetEditorWithFocus(editor) ) { ide->GetDocument(editor)->SetActive(); }
+    } else {
+      // activate tab and move cursor based on stored pos
+      // get file parent
+      var onefile = (ide.config.outline || {}).showonefile;
+      var parent = ctrl->GetItemParent(item_id);
+      if( ! onefile ) { // find the proper parent
+        while( parent->IsOk() && ctrl->GetItemImage(parent) != image.FILE ) {
+          parent = ctrl->GetItemParent(parent);
+        }
+        if( ! parent->IsOk() ) { return; }
+      }
+      // activate editor tab
+      var editor = onefile && ide->GetEditor() || ctrl->GetItemData(parent)->GetData();
+      var cache = caches[editor];
+      if( editor && cache ) {
+        // move to position in the file
+        editor->GotoPosEnforcePolicy(cache.funcs[data->GetData()].pos-1);
+        // only set editor active after positioning as this may change focus,
+        // which may regenerate the outline, which may invalidate `data` value
+        if( ! ide->GetEditorWithFocus(editor) ) { ide->GetDocument(editor)->SetActive(); }
+      }
+    }
+  }
+
+  var function activateByPosition(event) {
+    var mask = (wx.wxTREE_HITTEST_ONITEMINDENT + wx.wxTREE_HITTEST_ONITEMLABEL
+      + wx.wxTREE_HITTEST_ONITEMICON + wx.wxTREE_HITTEST_ONITEMRIGHT);
+    var item_id, flags = ctrl->HitTest(event->GetPosition());
+
+    if( item_id && item_id->IsOk() && bit.band(flags, mask) > 0 ) {
+      ctrl->ActivateItem(item_id);
+    } else {
+      event->Skip();
+    }
+    return true;
+  }
+
+  if( (ide.config.outline || {}).activateonclick ) {
+    ctrl->Connect(wx.wxEVT_LEFT_DOWN, activateByPosition);
+  }
+  ctrl->Connect(wx.wxEVT_LEFT_DCLICK, activateByPosition);
+  ctrl->Connect(wx.wxEVT_COMMAND_TREE_ITEM_ACTIVATED, function(event) {
+      ctrl->ActivateItem(event->GetItem());
+    });
+
+  ctrl->Connect(ID.OUTLINESORT, wx.wxEVT_COMMAND_MENU_SELECTED,
+    function() {
+      ide.config.outline.sort = ! ide.config.outline.sort;
+      var ed = ide->GetEditor();
+      if( ! ed ) { return; }
+      // when showing one file only refresh outline for the current editor
+      for( editor, cache in pairs((ide.config.outline || {}).showonefile && {[ed] = caches[ed]} || caches) ) {
+        ide->SetStatus(("Refreshing '%s'...")->format(ide->GetDocument(editor)->GetFileName()));
+        var isexpanded = ctrl->IsExpanded(cache.fileitem);
+        outlineRefresh(editor, true);
+        if( ! isexpanded ) { ctrl->Collapse(cache.fileitem); }
+      }
+      ide->SetStatus('');
+    });
+
+  ctrl->Connect(wx.wxEVT_COMMAND_TREE_ITEM_MENU,
+    function (event) {
+      var menu = ide->MakeMenu ({
+        { ID.OUTLINESORT, TR("Sort By Name"), "", wx.wxITEM_CHECK },
+      });
+      menu->Check(ID.OUTLINESORT, ide.config.outline.sort);
+
+      PackageEventHandle("onMenuOutline", menu, ctrl, event);
+
+      ctrl->PopupMenu(menu);
+    });
+
+
+  var function reconfigure(pane) {
+    pane->TopDockable(false)->BottomDockable(false)
+        ->MinSize(150,-1)->BestSize(300,-1)->FloatingSize(200,300);
+  }
+
+  var layout = ide->GetSetting("/view", "uimgrlayout");
+  if( ! layout || ! layout->find("outlinepanel") ) {
+    ide->AddPanelDocked(ide->GetProjectNotebook(), ctrl, "outlinepanel", TR("Outline"), reconfigure, false);
+  } else {
+    ide->AddPanel(ctrl, "outlinepanel", TR("Outline"), reconfigure);
+  }
+}
+
+var function eachNode(eachFunc, root, recursive) {
+  var ctrl = outline.outlineCtrl;
+  if( ! ctrl ) { return; }
+  root = root || ctrl->GetRootItem();
+  if( ! (root && root->IsOk()) ) { return; }
+  var item = ctrl->GetFirstChild(root);
+  while( true ) {
+    if( ! item->IsOk() ) { break; }
+    if( eachFunc && eachFunc(ctrl, item) ) { break; }
+    if( recursive && ctrl->ItemHasChildren(item) ) { eachNode(eachFunc, item, recursive); }
+    item = ctrl->GetNextSibling(item);
+  }
+}
+
+var pathsep = GetPathSeparator();
+var function isInSubDir(name, path) {
+  return #name > #path && path..pathsep == name->sub(1, #path+#pathsep);
+}
+
+var function isIgnoredInIndex(name) {
+  var ignoredirs = outline.settings.ignoredirs;
+  if( ignoredirs[name] ) { return true; }
+
+  // check through ignored dirs to see if any of them match the file;
+  // skip those that are outside of the current project tree to allow
+  // scanning of the projects that may be inside ignored directories.
+  var proj = ide->GetProject(); // `nil` when not set
+  for( path in pairs(ignoredirs) ) {
+    if( (! proj || isInSubDir(path, proj)) && isInSubDir(name, path) ) { return true; }
+  }
+
+  return false;
+}
+
+var function purgeIndex(path) {
+  var symbols = outline.settings.symbols;
+  for( name in pairs(symbols) ) {
+    if( isInSubDir(name, path) ) { outline->UpdateSymbols(name, null); }
+  }
+}
+
+var function purgeQueue(path) {
+  var curqueue = outline.indexqueue;
+  var newqueue = {[0] = {}};
+  for( _, name in ipairs(curqueue) ) {
+    if( ! isInSubDir(name, path) ) {
+      table.insert(newqueue, name);
+      newqueue[0][name] = true;
+    }
+  }
+  outline.indexqueue = newqueue;
+}
+
+var function disableIndex(path) {
+  outline.settings.ignoredirs[path] = true;
+  outline->SaveSettings(true);
+
+  // purge the path from the index and the (current) queue
+  purgeIndex(path);
+  purgeQueue(path);
+}
+
+var function enableIndex(path) {
+  outline.settings.ignoredirs[path] = null;
+  outline->SaveSettings(true);
+  outline->RefreshSymbols(path);
+}
+
+var lastfocus;
+var package = ide->AddPackage('core.outline', {
+    onRegister = function(this) {
+      if( ! ide.config.outlineinactivity ) { return; }
+
+      createOutlineWindow();
+    },
+
+    // remove the editor from the list
+    onEditorClose = function(this, editor) {
+      var cache = caches[editor];
+      var fileitem = cache && cache.fileitem;
+      caches[editor] = null; // remove from cache
+
+      if( fileitem && fileitem->IsOk() ) {
+        var ctrl = outline.outlineCtrl;
+        if( (ide.config.outline || {}).showonefile ) {
+          ctrl->DeleteChildren(fileitem);
+        } else {
+          ctrl->Delete(fileitem);
+        }
+      }
+    },
+
+    // handle rename of the file in the current editor
+    onEditorSave = function(this, editor) {
+      if( (ide.config.outline || {}).showonefile ) { return; }
+      var cache = caches[editor];
+      var fileitem = cache && cache.fileitem;
+      var doc = ide->GetDocument(editor);
+      var ctrl = outline.outlineCtrl;
+      if( doc && fileitem && ctrl->GetItemText(fileitem) != doc->GetTabText() ) {
+        ctrl->SetItemText(fileitem, doc->GetTabText());
+      }
+      var path = doc && doc->GetFilePath();
+      if( path && cache && cache.funcs ) {
+        outline->UpdateSymbols(path, cache.funcs.updated > editor->GetModifiedTime() && cache.funcs || null);
+        outline->SaveSettings();
+      }
+    },
+
+    // go over the file items to turn bold on/off or collapse/expand
+    onEditorFocusSet = function(this, editor) {
+      var cache = caches[editor];
+
+      // if the editor is not in the cache, which may happen if the user
+      // quickly switches between tabs that don't have outline generated,
+      // regenerate it manually
+      if( ! cache ) { resetOutlineTimer(); }
+      resetIndexTimer();
+
+      if( (ide.config.outline || {}).showonefile && ide.config.outlineinactivity ) {
+        // this needs to be done when editor gets focus, but during active auto-complete
+        // the focus shifts between the editor and the popup after each character;
+        // the refresh is not necessary in this case, so only refresh when the editor changes
+        if( ! lastfocus || editor->GetId() != lastfocus ) {
+          outlineRefresh(editor, true);
+          lastfocus = editor->GetId();
+        }
+        return;
+      }
+
+      var fileitem = cache && cache.fileitem;
+      var ctrl = outline.outlineCtrl;
+      var itemname = ide->GetDocument(editor)->GetTabText();
+
+      // update file name if it changed in the editor
+      if( fileitem && ctrl->GetItemText(fileitem) != itemname ) {
+        ctrl->SetItemText(fileitem, itemname);
+      }
+
+      eachNode(function(ctrl, item) {
+          var found = fileitem && item->GetValue() == fileitem->GetValue();
+          if( ! found && ctrl->IsBold(item) ) {
+            ctrl->SetItemBold(item, false);
+            ctrl->CollapseAllChildren(item);
+          }
+        });
+
+      if( fileitem && ! ctrl->IsBold(fileitem) ) {
+        // run the following changes on idle as doing them inline is causing a strange
+        // issue on OSX when clicking on a tab may skip several tabs (#546);
+        // this is somehow caused by `ExpandAllChildren` triggered from `SetFocus` inside
+        // `PAGE_CHANGED` handler for the notebook.
+        ide->DoWhenIdle(function() {
+            // check if this editor is still in the cache,
+            // as it may be closed before this handler is executed
+            if( ! caches[editor] ) { return; }
+            ctrl->SetItemBold(fileitem, true);
+            if( (ide.config.outline || {}).showcompact ) {
+              ctrl->Expand(fileitem);
+            } else {
+              ctrl->ExpandAllChildren(fileitem);
+            }
+            ctrl->ScrollTo(fileitem);
+            ctrl->SetScrollPos(wx.wxHORIZONTAL, 0, true);
+          });
+      }
+    },
+
+    onMenuFiletree = function(this, menu, tree, event) {
+      var item_id = event->GetItem();
+      var name = tree->GetItemFullName(item_id);
+      var symboldirmenu = ide->MakeMenu ({
+        {ID.SYMBOLDIRREFRESH, TR("Refresh Index"), TR("Refresh indexed symbols from files in the selected directory")},
+        {ID.SYMBOLDIRDISABLE, TR("Disable Indexing For '%s'")->format(name), TR("Ignore and don't index symbols from files in the selected directory")},
+      });
+      var _, _, projdirpos = ide->FindMenuItem(ID.PROJECTDIR, menu);
+      if( projdirpos ) {
+        var ignored = isIgnoredInIndex(name);
+        var enabledirmenu = ide->MakeMenu ({});
+        var paths = {};
+        for( path in pairs(outline.settings.ignoredirs) ) { table.insert(paths, path); }
+        table.sort(paths);
+        for( i, path in ipairs(paths) ) {
+          var id = ID("file.enablesymboldir."..i);
+          enabledirmenu->Append(id, path, "");
+          tree->Connect(id, wx.wxEVT_COMMAND_MENU_SELECTED, function() { enableIndex(path); });
+        }
+
+        symboldirmenu->Append(wx.wxMenuItem(symboldirmenu, ID.SYMBOLDIRENABLE,
+          TR("Enable Indexing"), "", wx.wxITEM_NORMAL, enabledirmenu));
+        menu->Insert(projdirpos+1, wx.wxMenuItem(menu, ID.SYMBOLDIRINDEX,
+          TR("Symbol Index"), "", wx.wxITEM_NORMAL, symboldirmenu));
+
+        // disable "enable" if it's empty
+        menu->Enable(ID.SYMBOLDIRENABLE, #paths > 0);
+        // disable "refresh" and "disable" if the directory is ignored
+        // or if any of the directories above it are ignored
+        menu->Enable(ID.SYMBOLDIRREFRESH, tree->IsDirectory(item_id) && ! ignored);
+        menu->Enable(ID.SYMBOLDIRDISABLE, tree->IsDirectory(item_id) && ! ignored);
+
+        tree->Connect(ID.SYMBOLDIRREFRESH, wx.wxEVT_COMMAND_MENU_SELECTED, function() {
+            // purge files in this directory as some might have been removed;
+            // files will be purged based on time, but this is a good time to clean.
+            purgeIndex(name);
+            outline->RefreshSymbols(name);
+            resetIndexTimer(1); // start after 1ms
+          });
+        tree->Connect(ID.SYMBOLDIRDISABLE, wx.wxEVT_COMMAND_MENU_SELECTED, function() {
+            disableIndex(name);
+          });
+       }
+    },
+
+    onEditorUpdateUI = function(this, editor, event) {
+      // only update when content or selection changes; ignore scrolling events
+      if( bit.band(event->GetUpdated(), wxstc.wxSTC_UPDATE_CONTENT + wxstc.wxSTC_UPDATE_SELECTION) > 0 ) {
+        ide.outline.needrefresh = editor;
+      }
+    },
+
+    onIdle = function(this) {
+      var editor = ide.outline.needrefresh;
+      if( ! editor ) { return; }
+
+      ide.outline.needrefresh = null;
+
+      var ctrl = ide.outline.outlineCtrl;
+      if( ! ide->IsWindowShown(ctrl) ) { return; }
+
+      var cache = ide->IsValidCtrl(editor) && caches[editor];
+      if( ! cache || ! ide.config.outline.showcurrentfunction ) { return; }
+
+      var edpos = editor->GetCurrentPos()+1;
+      var edline = editor->LineFromPosition(edpos-1)+1;
+      if( cache.pos && cache.pos == edpos ) { return; }
+      if( cache.line && cache.line == edline ) { return; }
+
+      cache.pos = edpos;
+      cache.line = edline;
+
+      var n = 0;
+      var MIN, MAX = 1, 2;
+      var visible = {[MIN] = math.huge, [MAX] = 0};
+      var needshown = {[MIN] = math.huge, [MAX] = 0};
+
+      ctrl->Unselect();
+      // scan all items recursively starting from the current file
+      eachNode(function(ctrl, item) {
+          var func = cache.funcs[ctrl->GetItemData(item)->GetData()];
+          if( ! func ) { return; }
+          var val = edpos >= func.pos && func.poe && edpos <= func.poe;
+          if( edline == editor->LineFromPosition(func.pos)+1
+          || (func.poe && edline == editor->LineFromPosition(func.poe)+1) ) {
+            cache.line = null;
+          }
+          ctrl->SetItemBold(item, val);
+          if( val ) { ctrl->SelectItem(item, val); }
+
+          if( ! ide.config.outline.jumptocurrentfunction ) { return; }
+          n +=   1;
+          // check that this and the items around it are all visible;
+          // this is to avoid the situation when the current item is only partially visible
+          var isvisible = ctrl->IsVisible(item) && ctrl->GetNextVisible(item)->IsOk() && ctrl->GetPrevVisible(item)->IsOk();
+          if( val && ! isvisible ) {
+            needshown[MIN] = math.min(needshown[MIN], n);
+            needshown[MAX] = math.max(needshown[MAX], n);
+          } else if( isvisible ) {
+            visible[MIN] = math.min(visible[MIN], n);
+            visible[MAX] = math.max(visible[MAX], n);
+          }
+        }, cache.fileitem, true);
+
+      if( ! ide.config.outline.jumptocurrentfunction ) { return; }
+      if( needshown[MAX] > visible[MAX] ) {
+        ctrl->ScrollLines(needshown[MAX]-visible[MAX]); // scroll forward to the last hidden line
+      } else if( needshown[MIN] < visible[MIN] ) {
+        ctrl->ScrollLines(needshown[MIN]-visible[MIN]); // scroll backward to the first hidden line
+      }
+    },
+  });
+
+var function queuePath(path) {
+  // only queue if symbols inactivity is set, so files will be indexed
+  if( ide.config.symbolindexinactivity && ! outline.indexqueue[0][path] ) {
+    outline.indexqueue[0][path] = true;
+    table.insert(outline.indexqueue, 1, path);
+  }
+}
+
+function outline::GetFileSymbols(path) {
+  var symbols = this.settings.symbols[path];
+  // queue path to process when appropriate
+  if( ! symbols ) { queuePath(path); }
+  return symbols;
+}
+
+function outline::GetEditorSymbols(editor) {
+  // force token refresh (as these may be not updated yet)
+  if( #editor->GetTokenList() == 0 ) {
+    while( editor->IndicateSymbols() ) { }
+  }
+
+  // only refresh the functions when none is present
+  if( ! caches[editor] || #(caches[editor].funcs || {}) == 0 ) { outlineRefresh(editor, true); }
+  return caches[editor] && caches[editor].funcs || {};
+}
+
+function outline::RefreshSymbols(path, callback) {
+  if( isIgnoredInIndex(path) ) { return; }
+
+  var exts = {};
+  for( _, ext in pairs(ide->GetKnownExtensions()) ) {
+    var spec = ide->FindSpec(ext);
+    if( spec && spec.marksymbols ) { table.insert(exts, ext); }
+  }
+
+  var opts = {sort = false, folder = false, skipbinary = true, yield = true,
+    // skip those directories that are on the "ignore" list
+    ondirectory = function(name) { return outline.settings.ignoredirs[name] == null; }
+  };
+  var nextfile = coroutine.wrap(function() { ide->GetFileList(path, true, table.concat(exts, ";"), opts); });
+  while( true ) {
+    var file = nextfile();
+    if( ! file ) { break; }
+    if( ! isIgnoredInIndex(file) ) { (callback || queuePath)(file); }
+  }
+}
+
+function outline::UpdateSymbols(fname, symb) {
+  var symbols = this.settings.symbols;
+  symbols[fname] = symb;
+
+  // purge outdated records
+  var threshold = ide->GetTime() - 60*60*24*7; // cache for 7 days
+  if( ! this.indexpurged ) {
+    for( k, v in pairs(symbols) ) {
+      if( v.updated < threshold ) { symbols[k] = null; }
+    }
+    this.indexpurged = true;
+  }
+
+  this.needsaving = true;
+}
+
+function outline::SaveSettings(force) {
+  if( this.needsaving || force ) {
+    ide->PushStatus(TR("Updating symbol index and settings..."));
+    package->SetSettings(this.settings, {keyignore = {depth = true, image = true, poe = true, item = true, skip = true}});
+    ide->PopStatus();
+    this.needsaving = false;
+  }
+}
+
+MergeSettings(outline.settings, package->GetSettings());

@@ -1,0 +1,984 @@
+var lexer = require ("luacheck.lexer");
+var utils = require ("luacheck.utils");
+
+var parser = {};
+
+// A table with range info, or simply range, has `line`, `offset`, and `end_offset` fields.
+// `line` is the line of the first character.
+// Parser state table has range info for the current token, and all AST
+// node tables have range info for themself, including parens around expressions
+// that are otherwise not reflected in the AST structure.
+
+parser.SyntaxError = utils.class();
+
+function parser.SyntaxError::__init(msg, range, prev_range) {
+   this.msg = msg;
+   this.line = range.line;
+   this.offset = range.offset;
+   this.end_offset = range.end_offset;
+
+   if( prev_range ) {
+      this.prev_line = prev_range.line;
+      this.prev_offset = prev_range.offset;
+      this.prev_end_offset = prev_range.end_offset;
+   }
+}
+
+function parser.syntax_error(msg, range, prev_range) {
+   error(parser.SyntaxError(msg, range, prev_range), 0);
+}
+
+var function mark_line_endings(state, token_type) {
+   for( line = state.line, state.lexer.line - 1 ) {
+      state.line_endings[line] = token_type;
+   }
+}
+
+var function skip_token(state) {
+   while( true ) {
+      var token, token_value, line, offset, error_end_offset = lexer.next_token(state.lexer);
+      state.token = token;
+      state.token_value = token_value;
+      state.line = line;
+      state.offset = offset;
+      state.end_offset = error_end_offset || (state.lexer.offset - 1);
+
+      if( ! token ) {
+         parser.syntax_error(token_value, state);
+      }
+
+      if( token == "short_comment" ) {
+         state.comments[#state.comments + 1] = {
+            contents = token_value,
+            line = line,
+            offset = offset,
+            end_offset = state.end_offset
+         };
+
+         state.line_endings[line] = "comment";
+      } else if( token == "long_comment" ) {
+         mark_line_endings(state, "comment");
+      } else {
+         if( token != "eof" ) {
+            mark_line_endings(state, "string");
+            state.code_lines[line] = true;
+            state.code_lines[state.lexer.line] = true;
+         }
+
+         return;
+      }
+   }
+}
+
+var function token_name(token) {
+   return token == "name" && "identifier" || (token == "eof" && "<eof>" || ("'" .. token .. "'"));
+}
+
+var function parse_error(state, msg, prev_range, token_prefix, message_suffix) {
+   var token_repr;
+
+   if( state.token == "eof" ) {
+      token_repr = "<eof>";
+   } else {
+      token_repr = lexer.get_quoted_substring_or_line(state.lexer, state.line, state.offset, state.end_offset);
+   }
+
+   if( token_prefix ) {
+      token_repr = token_prefix .. " " .. token_repr;
+   }
+
+   msg = msg .. " near " .. token_repr;
+
+   if( message_suffix ) {
+      msg = msg .. " " .. message_suffix;
+   }
+
+   parser.syntax_error(msg, state, prev_range);
+}
+
+var function check_token(state, token) {
+   if( state.token != token ) {
+      parse_error(state, "expected " .. token_name(token));
+   }
+}
+
+var function check_and_skip_token(state, token) {
+   check_token(state, token);
+   skip_token(state);
+}
+
+var function test_and_skip_token(state, token) {
+   if( state.token == token ) {
+      skip_token(state);
+      return true;
+   }
+}
+
+var function copy_range(range) {
+   return {
+      line = range.line,
+      offset = range.offset,
+      end_offset = range.end_offset
+   };
+}
+
+var new_state;
+var parse_block;
+var missing_closing_token_error;
+
+// Attempt to guess a better location for missing `end` and `until` errors (usually they uselessly point to eof).
+// Guessed error token should be selected in such a way that inserting previously missing closing token
+// in front of it should fix the error or at least move its opening token forward.
+// The idea is to track the stack of opening tokens and their indentations.
+// For the first statement or closing token with the same or smaller indentation than the opening token
+// on the top of the stack:
+// * If it has the same indentation but is not the appropriate closing token for the opening one, pick it
+//   as the guessed error location.
+// * If it has a lower indentation level, pick it as the guessed error location even it closes the opening token.
+// Example:
+// local function f()
+//    <code>
+//
+//    if cond then                   <- `if` is the guessed opening token
+//       <code>
+//
+//    <code not starting with `end`> <- first token on this line is the guessed error location
+// end
+// Another one:
+// local function g()
+//    <code>
+//
+//    if cond then  <- `if` is the guessed opening token
+//       <code>
+//
+// end              <- `end` is the guessed error location
+
+var opening_token_to_closing = {
+   ["("] = ")",
+   ["["] = "]",
+   ["{"] = "}",
+   ["do"] = "end",
+   ["if"] = "end",
+   ["else"] = "end",
+   ["elseif"] = "end",
+   ["while"] = "end",
+   ["repeat"] = "until",
+   ["for"] = "end",
+   ["function"] = "end"
+};
+
+var function get_indentation(state, line) {
+   var ws_start, ws_end = state.lexer.src->find("^[ \t\v\f]*", state.lexer.line_offsets[line]);
+   return ws_end - ws_start;
+}
+
+var UnpairedTokenGuesser = utils.class();
+
+function UnpairedTokenGuesser::__init(state, error_opening_range, error_closing_token) {
+   this.old_state = state;
+   this.error_offset = state.offset;
+   this.error_opening_range = error_opening_range;
+   this.error_closing_token = error_closing_token;
+   this.opening_tokens_stack = utils.Stack();
+}
+
+function UnpairedTokenGuesser::guess() {
+   // Need to reinitialize lexer (e.g. to skip shebang again).
+   this.state = new_state(this.old_state.lexer.src);
+   this.state.unpaired_token_guesser = this;
+   skip_token(this.state);
+   parse_block(this.state);
+   error("No syntax error in second parse", 0);
+}
+
+function UnpairedTokenGuesser::on_block_start(opening_token_range, opening_token) {
+   var token_wrapper = copy_range(opening_token_range);
+   token_wrapper.token = opening_token;
+   token_wrapper.closing_token = opening_token_to_closing[opening_token];
+   token_wrapper.eligible = token_wrapper.closing_token == this.error_closing_token;
+   token_wrapper.indentation = get_indentation(this.state, opening_token_range.line);
+   this.opening_tokens_stack->push(token_wrapper);
+}
+
+function UnpairedTokenGuesser::set_guessed() {
+   // Keep the first detected location.
+   if( this.guessed ) {
+      return;
+   }
+
+   this.guessed = this.opening_tokens_stack.top;
+   this.guessed.error_token = this.state.token;
+   this.guessed.error_range = copy_range(this.state);
+}
+
+function UnpairedTokenGuesser::check_token() {
+   var top = this.opening_tokens_stack.top;
+
+   if( top && top.eligible && this.state.line > top.line ) {
+      var token_indentation = get_indentation(this.state, this.state.line);
+
+      if( token_indentation < top.indentation ) {
+         this->set_guessed();
+      } else if( token_indentation == top.indentation ) {
+         var token = this.state.token;
+
+         if( token != top.closing_token &&
+               ((top.token != "if" && top.token != "elseif") || (token != "elseif" && token != "else")) ) {
+            this->set_guessed();
+         }
+      }
+   }
+
+   if( this.state.offset == this.error_offset ) {
+      if( this.guessed && this.guessed.error_range.offset != this.state.offset ) {
+         this.state.line = this.guessed.error_range.line;
+         this.state.offset = this.guessed.error_range.offset;
+         this.state.end_offset = this.guessed.error_range.end_offset;
+         this.state.token = this.guessed.error_token;
+         missing_closing_token_error(this.state, this.guessed, this.guessed.token, this.guessed.closing_token, true);
+      }
+   }
+}
+
+function UnpairedTokenGuesser::on_block_end() {
+   this->check_token();
+   this.opening_tokens_stack->pop();
+
+   if( ! this.opening_tokens_stack.top ) {
+      // Inserting an end token into a balanced sequence of tokens adds an error earlier than original one.
+      this.guessed = null;
+   }
+}
+
+function UnpairedTokenGuesser::on_statement() {
+   this->check_token();
+}
+
+function missing_closing_token_error(state, opening_range, opening_token, closing_token, is_guess) {
+   var msg = "expected " .. token_name(closing_token);
+
+   if( opening_range && opening_range.line != state.line ) {
+      msg = msg .. " (to close " .. token_name(opening_token) .. " on line " .. tostring(opening_range.line) .. ")";
+   }
+
+   var token_prefix;
+   var message_suffix;
+
+   if( is_guess ) {
+      if( state.token == closing_token ) {
+         // "expected 'end' near 'end'" seems confusing.
+         token_prefix = "less indented";
+      }
+
+      message_suffix = "(indentation-based guess)";
+   }
+
+   parse_error(state, msg, opening_range, token_prefix, message_suffix);
+}
+
+var function check_closing_token(state, opening_range, opening_token) {
+   var closing_token = opening_token_to_closing[opening_token] || "eof";
+
+   if( state.token == closing_token ) {
+      return;
+   }
+
+   if( (opening_token == "if" || opening_token == "elseif") && (state.token == "else" || state.token == "elseif") ) {
+      return;
+   }
+
+   if( closing_token == "end" || closing_token == "until" ) {
+      if( ! state.unpaired_token_guesser ) {
+         UnpairedTokenGuesser(state, opening_range, closing_token)->guess();
+      }
+   }
+
+   missing_closing_token_error(state, opening_range, opening_token, closing_token);
+}
+
+var function check_and_skip_closing_token(state, opening_range, opening_token) {
+   check_closing_token(state, opening_range, opening_token);
+   skip_token(state);
+}
+
+var function check_name(state) {
+   check_token(state, "name");
+   return state.token_value;
+}
+
+var function new_outer_node(range, tag, node) {
+   node = node || {};
+   node.line = range.line;
+   node.offset = range.offset;
+   node.end_offset = range.end_offset;
+   node.tag = tag;
+   return node;
+}
+
+var function new_inner_node(start_range, end_range, tag, node) {
+   node = node || {};
+   node.line = start_range.line;
+   node.offset = start_range.offset;
+   node.end_offset = end_range.end_offset;
+   node.tag = tag;
+   return node;
+}
+
+var parse_expression;
+
+var function parse_expression_list(state, list) {
+   list = list || {};
+
+   do {
+      list[#list + 1] = parse_expression(state);
+   } while(!( ! test_and_skip_token(state, ",")) );
+
+   return list;
+}
+
+var function parse_id(state, tag) {
+   var ast_node = new_outer_node(state, tag || "Id");
+   ast_node[1] = check_name(state);
+   // Skip name.
+   skip_token(state);
+   return ast_node;
+}
+
+var function atom(tag) {
+   return function(state) {
+      var ast_node = new_outer_node(state, tag);
+      ast_node[1] = state.token_value;
+      skip_token(state);
+      return ast_node;
+   };
+}
+
+var simple_expressions = {};
+
+simple_expressions.number = atom("Number");
+simple_expressions.string = atom("String");
+simple_expressions["nil"] = atom("Nil");
+simple_expressions["true"] = atom("True");
+simple_expressions["false"] = atom("False");
+simple_expressions["..."] = atom("Dots");
+
+simple_expressions["{"] = function(state) {
+   var start_range = copy_range(state);
+   var ast_node = {};
+   skip_token(state);
+
+   do {
+      if( state.token == "}" ) {
+         break;
+      }
+
+      var key_node, value_node;
+      var first_token_range = copy_range(state);
+
+      if( state.token == "name" ) {
+         var name = state.token_value;
+         skip_token(state);  // Skip name.
+
+         if( test_and_skip_token(state, "=") ) {
+            // `name` = `expr`.
+            key_node = new_outer_node(first_token_range, "String", {name});
+            value_node = parse_expression(state);
+         } else {
+            // `name` is beginning of an expression in array part.
+            // Backtrack lexer to before name.
+            state.lexer.line = first_token_range.line;
+            state.lexer.offset = first_token_range.offset;
+            skip_token(state);  // Load name again.
+            value_node = parse_expression(state);
+         }
+      } else if( state.token == "[" ) {
+         // [ `expr` ] = `expr`.
+         skip_token(state);
+         key_node = parse_expression(state);
+         check_and_skip_closing_token(state, first_token_range, "[");
+         check_and_skip_token(state, "=");
+         value_node = parse_expression(state);
+      } else {
+         // Expression in array part.
+         value_node = parse_expression(state);
+      }
+
+      if( key_node ) {
+         // Pair.
+         ast_node[#ast_node + 1] = new_inner_node(first_token_range, value_node, "Pair", {key_node, value_node});
+      } else {
+         // Array part item.
+         ast_node[#ast_node + 1] = value_node;
+      }
+   } while(!( ! (test_and_skip_token(state, ",") || test_and_skip_token(state, ";"))) );
+
+   new_inner_node(start_range, state, "Table", ast_node);
+   check_and_skip_closing_token(state, start_range, "{");
+   return ast_node;
+};
+
+// Parses argument list and the statements.
+var function parse_function(state, function_range) {
+   var paren_range = copy_range(state);
+   check_and_skip_token(state, "(");
+   var args = {};
+
+   // Are there arguments?
+   if( state.token != ")" ) {
+      do {
+         if( state.token == "name" ) {
+            args[#args + 1] = parse_id(state);
+         } else if( state.token == "..." ) {
+            args[#args + 1] = simple_expressions["..."](state);
+            break;
+         } else {
+            parse_error(state, "expected argument");
+         }
+      } while(!( ! test_and_skip_token(state, ",")) );
+   }
+
+   check_and_skip_closing_token(state, paren_range, "(");
+   var body = parse_block(state, function_range, "function");
+   var end_range = copy_range(state);
+   // Skip "function".
+   skip_token(state);
+   return new_inner_node(function_range, end_range, "Function", {args, body, end_range = end_range});
+}
+
+simple_expressions["function"] = function(state) {
+   var function_range = copy_range(state);
+   // Skip "function".
+   skip_token(state);
+   return parse_function(state, function_range);
+};
+
+// A call handler parses arguments of a call with given base node that determines resulting node start location,
+// given tag, and array to which the arguments should be appended.
+var call_handlers = {};
+
+call_handlers["("] = function(state, base_node, tag, node) {
+   var paren_range = copy_range(state);
+   // Skip "(".
+   skip_token(state);
+
+   if( state.token != ")" ) {
+      parse_expression_list(state, node);
+   }
+
+   new_inner_node(base_node, state, tag, node);
+   check_and_skip_closing_token(state, paren_range, "(");
+   return node;
+};
+
+call_handlers["{"] = function(state, base_node, tag, node) {
+   var arg_node = simple_expressions[state.token](state);
+   node[#node + 1] = arg_node;
+   return new_inner_node(base_node, arg_node, tag, node);
+};
+
+call_handlers.string = call_handlers["{"];
+
+var suffix_handlers = {};
+
+suffix_handlers["."] = function(state, base_node) {
+   // Skip ".".
+   skip_token(state);
+   var index_node = parse_id(state, "String");
+   return new_inner_node(base_node, index_node, "Index", {base_node, index_node});
+};
+
+suffix_handlers["["] = function(state, base_node) {
+   var bracket_range = copy_range(state);
+   // Skip "[".
+   skip_token(state);
+   var index_node = parse_expression(state);
+   var ast_node = new_inner_node(base_node, state, "Index", {base_node, index_node});
+   check_and_skip_closing_token(state, bracket_range, "[");
+   return ast_node;
+};
+
+suffix_handlers[":"] = function(state, base_node) {
+   // Skip ":".
+   skip_token(state);
+   var method_name = parse_id(state, "String");
+   var call_handler = call_handlers[state.token];
+
+   if( ! call_handler ) {
+      parse_error(state, "expected method arguments");
+   }
+
+   return call_handler(state, base_node, "Invoke", {base_node, method_name});
+};
+
+suffix_handlers["("] = function(state, base_node) {
+   return call_handlers[state.token](state, base_node, "Call", {base_node});
+};
+
+suffix_handlers["{"] = suffix_handlers["("];
+suffix_handlers.string = suffix_handlers["("];
+
+var function parse_simple_expression(state, kind, no_literals) {
+   var expression;
+
+   if( state.token == "(" ) {
+      var paren_range = copy_range(state);
+      skip_token(state);
+      var inner_expression = parse_expression(state);
+      expression = new_inner_node(paren_range, state, "Paren", {inner_expression});
+      check_and_skip_closing_token(state, paren_range, "(");
+   } else if( state.token == "name" ) {
+      expression = parse_id(state);
+   } else {
+      var literal_handler = simple_expressions[state.token];
+
+      if( ! literal_handler || no_literals ) {
+         parse_error(state, "expected " .. (kind || "expression"));
+      }
+
+      return literal_handler(state);
+   }
+
+   while( true ) {
+      var suffix_handler = suffix_handlers[state.token];
+
+      if( suffix_handler ) {
+         expression = suffix_handler(state, expression);
+      } else {
+         return expression;
+      }
+   }
+}
+
+var unary_operators = {
+   ["not"] = "not",
+   ["-"] = "unm",
+   ["~"] = "bnot",
+   ["#"] = "len"
+};
+
+var unary_priority = 12;
+
+var binary_operators = {
+   ["+"] = "add", ["-"] = "sub",
+   ["*"] = "mul", ["%"] = "mod",
+   ["^"] = "pow",
+   ["/"] = "div", ["//"] = "idiv",
+   ["&"] = "band", ["|"] = "bor", ["~"] = "bxor",
+   ["<<"] = "shl", [">>"] = "shr",
+   [".."] = "concat",
+   ["~="] = "ne", ["=="] = "eq",
+   ["<"] = "lt", ["<="] = "le",
+   [">"] = "gt", [">="] = "ge",
+   ["and"] = "and", ["or"] = "or"
+};
+
+var left_priorities = {
+   add = 10, sub = 10,
+   mul = 11, mod = 11,
+   pow = 14,
+   div = 11, idiv = 11,
+   band = 6, bor = 4, bxor = 5,
+   shl = 7, shr = 7,
+   concat = 9,
+   ne = 3, eq = 3,
+   lt = 3, le = 3,
+   gt = 3, ge = 3,
+   ["and"] = 2, ["or"] = 1
+};
+
+var right_priorities = {
+   add = 10, sub = 10,
+   mul = 11, mod = 11,
+   pow = 13,
+   div = 11, idiv = 11,
+   band = 6, bor = 4, bxor = 5,
+   shl = 7, shr = 7,
+   concat = 8,
+   ne = 3, eq = 3,
+   lt = 3, le = 3,
+   gt = 3, ge = 3,
+   ["and"] = 2, ["or"] = 1
+};
+
+var function parse_subexpression(state, limit, kind) {
+   var expression;
+   var unary_operator = unary_operators[state.token];
+
+   if( unary_operator ) {
+      var operator_range = copy_range(state);
+      // Skip operator.
+      skip_token(state);
+      var operand = parse_subexpression(state, unary_priority);
+      expression = new_inner_node(operator_range, operand, "Op", {unary_operator, operand});
+   } else {
+      expression = parse_simple_expression(state, kind);
+   }
+
+   // Expand while operators have priorities higher than `limit`.
+   while( true ) {
+      var binary_operator = binary_operators[state.token];
+
+      if( ! binary_operator || left_priorities[binary_operator] <= limit ) {
+         break;
+      }
+
+       // Skip operator.
+      skip_token(state);
+      // Read subexpression with higher priority.
+      var subexpression = parse_subexpression(state, right_priorities[binary_operator]);
+      expression = new_inner_node(expression, subexpression, "Op", {binary_operator, expression, subexpression});
+   }
+
+   return expression;
+}
+
+function parse_expression(state, kind) {
+   return parse_subexpression(state, 0, kind);
+}
+
+var statements = {};
+
+statements["if"] = function(state) {
+   var start_range = copy_range(state);
+   // Skip "if".
+   skip_token(state);
+   var ast_node = {};
+
+   // The loop is entered after skipping "if" or "elseif".
+   // Block start token info is set to the last skipped "if", "elseif", or "else" token.
+   var block_start_token = "if";
+   var block_start_range = start_range;
+
+   while( true ) {
+      ast_node[#ast_node + 1] = parse_expression(state, "condition");
+      // Add range of the "then" token to the block statement array.
+      var branch_range = copy_range(state);
+      check_and_skip_token(state, "then");
+      ast_node[#ast_node + 1] = parse_block(state, block_start_range, block_start_token, branch_range);
+
+      if( state.token == "else" ) {
+         branch_range = copy_range(state);
+         block_start_token = "else";
+         block_start_range = branch_range;
+         skip_token(state);
+         ast_node[#ast_node + 1] = parse_block(state, block_start_range, block_start_token, branch_range);
+         break;
+      } else if( state.token == "elseif" ) {
+         block_start_token = "elseif";
+         block_start_range = copy_range(state);
+         skip_token(state);
+      } else {
+         break;
+      }
+   }
+
+   new_inner_node(start_range, state, "If", ast_node);
+   // Skip "end".
+   skip_token(state);
+   return ast_node;
+};
+
+statements["while"] = function(state) {
+   var start_range = copy_range(state);
+   // Skip "while".
+   skip_token(state);
+   var condition = parse_expression(state, "condition");
+   check_and_skip_token(state, "do");
+   var block = parse_block(state, start_range, "while");
+   var ast_node = new_inner_node(start_range, state, "While", {condition, block});
+   // Skip "end".
+   skip_token(state);
+   return ast_node;
+};
+
+statements["do"] = function(state) {
+   var start_range = copy_range(state);
+   // Skip "do".
+   skip_token(state);
+   var block = parse_block(state, start_range, "do");
+   var ast_node = new_inner_node(start_range, state, "Do", block);
+   // Skip "end".
+   skip_token(state);
+   return ast_node;
+};
+
+statements["for"] = function(state) {
+   var start_range = copy_range(state);
+   // Skip "for".
+   skip_token(state);
+
+   var ast_node = {};
+   var tag;
+   var first_var = parse_id(state);
+
+   if( state.token == "=" ) {
+      // Numeric "for" loop.
+      tag = "Fornum";
+      // Skip "=".
+      skip_token(state);
+      ast_node[1] = first_var;
+      ast_node[2] = parse_expression(state);
+      check_and_skip_token(state, ",");
+      ast_node[3] = parse_expression(state);
+
+      if( test_and_skip_token(state, ",") ) {
+         ast_node[4] = parse_expression(state);
+      }
+
+      check_and_skip_token(state, "do");
+      ast_node[#ast_node + 1] = parse_block(state, start_range, "for");
+   } else if( state.token == "," || state.token == "in" ) {
+      // Generic "for" loop.
+      tag = "Forin";
+
+      var iter_vars = {first_var};
+      while( test_and_skip_token(state, ",") ) {
+         iter_vars[#iter_vars + 1] = parse_id(state);
+      }
+
+      ast_node[1] = iter_vars;
+      check_and_skip_token(state, "in");
+      ast_node[2] = parse_expression_list(state);
+      check_and_skip_token(state, "do");
+      ast_node[3] = parse_block(state, start_range, "for");
+   } else {
+      parse_error(state, "expected '=', ',' or 'in'");
+   }
+
+   new_inner_node(start_range, state, tag, ast_node);
+   // Skip "end".
+   skip_token(state);
+   return ast_node;
+};
+
+statements["repeat"] = function(state) {
+   var start_range = copy_range(state);
+   // Skip "repeat".
+   skip_token(state);
+   var block = parse_block(state, start_range, "repeat");
+   // Skip "until".
+   skip_token(state);
+   var condition = parse_expression(state, "condition");
+   return new_inner_node(start_range, condition, "Repeat", {block, condition});
+};
+
+statements["function"] = function(state) {
+   var start_range = copy_range(state);
+   // Skip "function".
+   skip_token(state);
+   var lhs = parse_id(state);
+   var implicit_self_range;
+
+   while( (! implicit_self_range) && (state.token == "." || state.token == ":") ) {
+      implicit_self_range = (state.token == ":") && copy_range(state);
+      // Skip "." or ":".
+      skip_token(state);
+      var index_node = parse_id(state, "String");
+      lhs = new_inner_node(lhs, index_node, "Index", {lhs, index_node});
+   }
+
+   var function_node = parse_function(state, start_range);
+
+   if( implicit_self_range ) {
+      // Insert implicit "self" argument.
+      var self_arg = new_outer_node(implicit_self_range, "Id", {"self", implicit = true});
+      table.insert(function_node[1], 1, self_arg);
+   }
+
+   return new_inner_node(start_range, function_node, "Set", {{lhs}, {function_node}});
+};
+
+statements["local"] = function(state) {
+   var start_range = copy_range(state);
+   // Skip "local".
+   skip_token(state);
+
+   if( state.token == "function" ) {
+      // Local function.
+      var function_range = copy_range(state);
+      // Skip "function".
+      skip_token(state);
+      var _v_var = parse_id(state);
+      var function_node = parse_function(state, function_range);
+      return new_inner_node(start_range, function_node, "Localrec", {{_v_var}, {function_node}});
+   }
+
+   // Local definition, potentially with assignment.
+   var lhs = {};
+   var rhs;
+
+   do {
+      lhs[#lhs + 1] = parse_id(state);
+   } while(!( ! test_and_skip_token(state, ",")) );
+
+   if( test_and_skip_token(state, "=") ) {
+      rhs = parse_expression_list(state);
+   }
+
+   return new_inner_node(start_range, rhs && rhs[#rhs] || lhs[#lhs], "Local", {lhs, rhs});
+};
+
+statements["::"] = function(state) {
+   var start_range = copy_range(state);
+   // Skip "::".
+   skip_token(state);
+   var name = check_name(state);
+   // Skip label name.
+   skip_token(state);
+   var ast_node = new_inner_node(start_range, state, "Label", {name});
+   check_and_skip_token(state, "::");
+   return ast_node;
+};
+
+var closing_tokens = utils.array_to_set({"end", "eof", "else", "elseif", "until"});
+
+statements["return"] = function(state) {
+   var start_range = copy_range(state);
+   // Skip "return".
+   skip_token(state);
+
+   if( closing_tokens[state.token] || state.token == ";" ) {
+      // No return values.
+      return new_outer_node(start_range, "Return");
+   } else {
+      var returns = parse_expression_list(state);
+      return new_inner_node(start_range, returns[#returns], "Return", returns);
+   }
+};
+
+statements["break"] = function(state) {
+   var ast_node = new_outer_node(state, "Break");
+   // Skip "break".
+   skip_token(state);
+   return ast_node;
+};
+
+statements["goto"] = function(state) {
+   var start_range = copy_range(state);
+   // Skip "goto".
+   skip_token(state);
+   var name = check_name(state);
+   var ast_node = new_outer_node(start_range, "Goto", {name});
+   // Skip label name.
+   skip_token(state);
+   return ast_node;
+};
+
+var function parse_expression_statement(state) {
+   var lhs;
+   var start_range = copy_range(state);
+
+   // Handle lhs of an assignment or a single expression.
+   do {
+      var item_start_range = lhs && copy_range(state) || start_range;
+      var expected = lhs && "identifier or field" || "statement";
+      var primary_expression = parse_simple_expression(state, expected, true);
+
+      if( primary_expression.tag == "Paren" ) {
+         // (expr) in lhs is invalid.
+         parser.syntax_error("expected " .. expected .. " near '('", item_start_range);
+      }
+
+      if( primary_expression.tag == "Call" || primary_expression.tag == "Invoke" ) {
+         if( lhs ) {
+            // The is an assingment, and a call is not valid in lhs.
+            parse_error(state, "expected call or indexing");
+         } else {
+            // This is a call.
+            return primary_expression;
+         }
+      }
+
+      // This is an assignment.
+      lhs = lhs || {};
+      lhs[#lhs + 1] = primary_expression;
+   } while(!( ! test_and_skip_token(state, ",")) );
+
+   check_and_skip_token(state, "=");
+   var rhs = parse_expression_list(state);
+   return new_inner_node(start_range, rhs[#rhs], "Set", {lhs, rhs});
+}
+
+var function parse_statement(state) {
+   return (statements[state.token] || parse_expression_statement)(state);
+}
+
+function parse_block(state, opening_token_range, opening_token, block) {
+   var unpaired_token_guesser = state.unpaired_token_guesser;
+
+   if( unpaired_token_guesser && opening_token ) {
+      unpaired_token_guesser->on_block_start(opening_token_range, opening_token);
+   }
+
+   block = block || {};
+   var after_statement = false;
+
+   while( ! closing_tokens[state.token] ) {
+      var first_token = state.token;
+
+      if( first_token == ";" ) {
+         if( ! after_statement ) {
+            table.insert(state.hanging_semicolons, copy_range(state));
+         }
+
+         // Skip ";".
+         skip_token(state);
+         // Further semicolons are considered hanging.
+         after_statement = false;
+      } else {
+         if( unpaired_token_guesser ) {
+            unpaired_token_guesser->on_statement();
+         }
+
+         var statement = parse_statement(state);
+         after_statement = true;
+         block[#block + 1] = statement;
+
+         if( statement.tag == "Return" ) {
+            // "return" must be the last statement.
+            // However, one ";" after it is allowed.
+            test_and_skip_token(state, ";");
+            break;
+         }
+      }
+   }
+
+   if( unpaired_token_guesser && opening_token ) {
+      unpaired_token_guesser->on_block_end();
+   }
+
+   check_closing_token(state, opening_token_range, opening_token);
+
+   return block;
+}
+
+function new_state(src, line_offsets, line_lengths) {
+   return {
+      lexer = lexer.new_state(src, line_offsets, line_lengths),
+      // Set of line numbers containing code.
+      code_lines = {},
+      // Maps line numbers to "comment", "string", or nil based on whether the line ending is within a token
+      line_endings = {},
+      // Array of {contents = string} with range info.
+      comments = {},
+       // Array of ranges of semicolons not following a statement.
+      hanging_semicolons = {}
+   };
+}
+
+// Parses source characters.
+// Returns AST (in almost MetaLua format), array of comments - tables {contents = string} with range info,
+// set of line numbers containing code, map of types of tokens wrapping line endings (nil, "string", or "comment"),
+// array of ranges of hanging semicolons (not after statements), array of line start offsets, array of line lengths.
+// The last two tables can be passed as arguments to be filled.
+// On error throws an instance of parser.SyntaxError: table {msg = msg, prev_range = prev_range?} with range info,
+// prev_range may refer to some extra relevant location.
+function parser.parse(src, line_offsets, line_lengths) {
+   var state = new_state(src, line_offsets, line_lengths);
+   skip_token(state);
+   var ast = parse_block(state);
+   return ast, state.comments, state.code_lines, state.line_endings, state.hanging_semicolons,
+      state.lexer.line_offsets, state.lexer.line_lengths;
+}
+
+return parser;

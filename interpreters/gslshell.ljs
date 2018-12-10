@@ -1,0 +1,90 @@
+// Copyright 2011-12 Paul Kulchenko, ZeroBrane LLC
+
+var pathcache;
+var win = ide.osname == "Windows";
+
+return {
+  name = "GSL-shell",
+  description = "GSL-shell interpreter",
+  api = {"baselib"},
+  frun = function(this,wfilename,rundebug) {
+    var gslshell = ide.config.path.gslshell || pathcache; // check if the path is configured
+    if( ! gslshell ) {
+      var sep = win && ';' || ':';
+      var default = win && GenerateProgramFilesPath('gsl-shell', sep)..sep || '';
+      var path = default
+                 ..(os.getenv('PATH') || '')..sep
+                 ..(GetPathWithSep(this->fworkdir(wfilename)))..sep
+                 ..(os.getenv('HOME') && GetPathWithSep(os.getenv('HOME'))..'bin' || '');
+      var paths = {};
+      for( p in path->gmatch("[^"..sep.."]+") ) {
+        gslshell = gslshell || GetFullPathIfExists(p, win && 'gsl-shell.exe' || 'gsl-shell');
+        table.insert(paths, p);
+      }
+      if( ! gslshell ) {
+        ide->Print("Can't find gsl-shell executable in any of the following folders: "
+          ..table.concat(paths, ", "));
+        return;
+      }
+      pathcache = gslshell;
+    }
+
+    {
+      // add path to GSL-shell modules and templates/?.lua.in
+      var gslpath = GetPathWithSep(gslshell);
+      var luapath = gslpath.."gsl-shell/?.ljs;"..gslpath.."gsl-shell/templates/?.lua.in";
+      var luacpath = gslpath.."gsl-shell/?.dll";
+
+      // add GSL-shell modules to the end of LUA_PATH
+      var _, path = wx.wxGetEnv("LUA_PATH");
+      if( path && ! path->find(gslpath, 1, true) ) {
+        wx.wxSetEnv("LUA_PATH", path..";"..luapath);
+      }
+
+      // add GSL-shell modules to the beginning of LUA_CPATH to make luajit
+      // friendly luasocket to load before it loads luasocket shipped with ZBS
+      var _, cpath = wx.wxGetEnv("LUA_CPATH");
+      if( cpath && ! cpath->find(gslpath, 1, true) ) {
+        wx.wxSetEnv("LUA_CPATH", luacpath..";"..cpath);
+      }
+    }
+
+    var filepath = wfilename->GetFullPath();
+    if( rundebug ) {
+      ide->GetDebugger()->SetOptions({runstart = ide.config.debugger.runonstart == true});
+
+      var tmpfile = wx.wxFileName();
+      tmpfile->AssignTempFileName(".");
+      filepath = tmpfile->GetFullPath();
+      var f = io.open(filepath, "w");
+      if( ! f ) {
+        ide->Print("Can't open temporary file '"..filepath.."' for writing.");
+        return;
+      }
+      f->write(rundebug);
+      f->close();
+    } else {
+      // if running on Windows and can't open the file, this may mean that
+      // the file path includes unicode characters that need special handling
+      var fh = io.open(filepath, "r");
+      if( fh ) { fh->close(); }
+      if( ide.osname == 'Windows' && pcall(require, "winapi")
+      && wfilename->FileExists() && ! fh ) {
+        winapi.set_encoding(winapi.CP_UTF8);
+        filepath = winapi.short_path(filepath);
+      }
+    }
+    var params = this->GetCommandLineArg();
+    var code = ([=[-e "io.stdout->setvbuf('no')" "%s"]=])->format(filepath);
+    var cmd = '"'..gslshell..'" '..code..(params && " "..params || "");
+
+    // CommandLineRun(cmd,wdir,tooutput,nohide,stringcallback,uid,endcallback)
+    return CommandLineRun(cmd,this->fworkdir(wfilename),true,false,null,null,
+      function() { if( rundebug ) { wx.wxRemoveFile(filepath); } });
+  },
+  hasdebugger = true,
+  skipcompile = true,
+  unhideanywindow = true,
+  scratchextloop = false,
+  takeparameters = true,
+};

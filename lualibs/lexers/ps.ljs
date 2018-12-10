@@ -1,0 +1,61 @@
+// Copyright 2006-2016 Mitchell mitchell.att.foicica.com. See LICENSE.
+// Postscript LPeg lexer.
+
+var l = require('lexer');
+var token, word_match = l.token, l.word_match;
+var P, R, S = lpeg.P, lpeg.R, lpeg.S;
+
+var M = {_NAME = 'ps'};
+
+// Whitespace.
+var ws = token(l.WHITESPACE, l.space**1);
+
+// Comments.
+var comment = token(l.COMMENT, '%' * l.nonnewline**0);
+
+// Strings.
+var arrow_string = l.delimited_range('<>');
+var nested_string = l.delimited_range('()', false, false, true);
+var string = token(l.STRING, arrow_string + nested_string);
+
+// Numbers.
+var number = token(l.NUMBER, l.float + l.integer);
+
+// Keywords.
+var keyword = token(l.KEYWORD, word_match({
+  'pop', 'exch', 'dup', 'copy', 'roll', 'clear', 'count', 'mark', 'cleartomark',
+  'counttomark', 'exec', 'if', 'ifelse', 'for', 'repeat', 'loop', 'exit',
+  'stop', 'stopped', 'countexecstack', 'execstack', 'quit', 'start',
+  'true', 'false', 'NULL'
+}));
+
+// Functions.
+var func = token(l.FUNCTION, word_match({
+  'add', 'div', 'idiv', 'mod', 'mul', 'sub', 'abs', 'ned', 'ceiling', 'floor',
+  'round', 'truncate', 'sqrt', 'atan', 'cos', 'sin', 'exp', 'ln', 'log', 'rand',
+  'srand', 'rrand'
+}));
+
+// Identifiers.
+var word = (l.alpha + '-') * (l.alnum + '-')**0;
+var identifier = token(l.IDENTIFIER, word);
+
+// Operators.
+var operator = token(l.OPERATOR, S('[]{}'));
+
+// Labels.
+var label = token(l.LABEL, '/' * word);
+
+M._rules = {
+  {'whitespace', ws},
+  {'keyword', keyword},
+  {'function', func},
+  {'identifier', identifier},
+  {'string', string},
+  {'comment', comment},
+  {'number', number},
+  {'label', label},
+  {'operator', operator},
+};
+
+return M;

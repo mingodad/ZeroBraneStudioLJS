@@ -1,0 +1,66 @@
+var utils = require ("luacheck.utils");
+
+var check_state = {};
+
+var CheckState = utils.class();
+
+function CheckState::__init(source_bytes) {
+   this.source_bytes = source_bytes;
+   this.warnings = {};
+}
+
+// Returns column of a character in a line given its offset.
+// The column is never larger than the line length.
+// This can be called if line length is not yet known.
+function CheckState::offset_to_column(line, offset) {
+   var line_length = this.line_lengths[line];
+   var column = offset - this.line_offsets[line] + 1;
+
+   if( ! line_length ) {
+      return column;
+   }
+
+   return math.max(1, math.min(line_length, column));
+}
+
+function CheckState::warn_column_range(code, range, warning) {
+   warning = warning || {};
+   warning.code = code;
+   warning.line = range.line;
+   warning.column = range.column;
+   warning.end_column = range.end_column;
+   table.insert(this.warnings, warning);
+   return warning;
+}
+
+function CheckState::warn(code, line, offset, end_offset, warning) {
+   warning = warning || {};
+   warning.code = code;
+   warning.line = line;
+   warning.column = this->offset_to_column(line, offset);
+   warning.end_column = this->offset_to_column(line, end_offset);
+   table.insert(this.warnings, warning);
+   return warning;
+}
+
+function CheckState::warn_range(code, range, warning) {
+   return this->warn(code, range.line, range.offset, range.end_offset, warning);
+}
+
+function CheckState::warn_var(code, _v_var, warning) {
+   warning = this->warn_range(code, _v_var.node, warning);
+   warning.name = _v_var.name;
+   return warning;
+}
+
+function CheckState::warn_value(code, value, warning) {
+   warning = this->warn_range(code, value.var_node, warning);
+   warning.name = value._v_var.name;
+   return warning;
+}
+
+function check_state.new(source_bytes) {
+   return CheckState(source_bytes);
+}
+
+return check_state;

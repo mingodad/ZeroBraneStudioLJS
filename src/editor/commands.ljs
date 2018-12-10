@@ -1,0 +1,1018 @@
+// Copyright 2011-17 Paul Kulchenko, ZeroBrane LLC
+// authors: Lomtik Software (J. Winwood & John Labenski)
+// Luxinia Dev (Eike Decker & Christoph Kubisch)
+//-------------------------------------------------------
+
+var ide = ide;
+var frame = ide.frame;
+var notebook = frame.notebook;
+var openDocuments = ide.openDocuments;
+var uimgr = frame.uimgr;
+var unpack = table.unpack || unpack;
+
+var CURRENT_LINE_MARKER = StylesGetMarker("currentline");
+var CURRENT_LINE_MARKER_VALUE = 2**CURRENT_LINE_MARKER;
+
+function NewFile(filename) {
+  filename = filename || ide->GetDefaultFileName();
+  var editor = CreateEditor();
+  editor->SetupKeywords(GetFileExt(filename));
+  var doc = AddEditor(editor, filename);
+  if( doc ) {
+    SetEditorSelection(doc.index);
+    PackageEventHandle("onEditorNew", editor);
+  }
+  return editor;
+}
+
+// Find an editor page that hasn't been used at all, eg. an untouched NewFile()
+var function findUnusedEditor() {
+  var editor;
+  for( _, document in pairs(openDocuments) ) {
+    if( (document.editor->GetLength() == 0) &&
+    (! document->IsModified()) && document->IsNew() &&
+    ! (document.editor->GetReadOnly() == true) ) {
+      editor = document.editor;
+      break;
+    }
+  }
+  return editor;
+}
+
+function LoadFile(filePath, editor, file_must_exist, skipselection) {
+  filePath = filePath->gsub("%s+$","");
+
+  // if the file name is empty or is a directory or looks like a directory, don't do anything
+  if( filePath == ''
+  || wx.wxDirExists(filePath)
+  || filePath->find("[/\\]$") ) {
+    return null, "Invalid filename";
+  }
+
+  filePath = FileNormalizePath(filePath);
+  // on some Windows versions, normalization doesn't return "original" file name,
+  // so detect that and use LongPath instead
+  if( ide.osname == "Windows" && wx.wxFileExists(filePath)
+  && FileNormalizePath(filePath->upper()) != FileNormalizePath(filePath->lower()) ) {
+    filePath = FileGetLongPath(filePath);
+  }
+
+  // prevent files from being reopened again
+  if( (! editor) ) {
+    var doc = ide->FindDocument(filePath);
+    if( doc ) {
+      if( ! skipselection && doc.index != notebook->GetSelection() ) {
+        // selecting the same tab doesn't trigger PAGE_CHANGE event,
+        // but moves the focus to the tab bar, which needs to be avoided.
+        notebook->SetSelection(doc.index);
+      }
+      return doc.editor;
+    }
+  }
+
+  var filesize = FileSize(filePath);
+  if( filesize == wx.wxInvalidOffset ) {
+    // invalid offset is also reported on empty files with no read access (at least on Windows)
+    ide->ReportError(TR("Can't open file '%s': %s")
+      ->format(filePath, "symlink is broken or access is denied."));
+    return null;
+  }
+  if( ! filesize && file_must_exist ) { return null; }
+
+  var current = editor && editor->GetCurrentPos();
+  editor = editor || findUnusedEditor() || CreateEditor();
+  editor->Freeze();
+  editor->SetupKeywords(GetFileExt(filePath));
+  editor->MarkerDeleteAll(-1);
+  if( filesize ) { editor->Allocate(filesize); }
+  editor->SetReadOnly(false); // disable read-only status if set on the editor
+  editor->BeginUndoAction();
+  editor->SetTextDyn("");
+  editor.bom = string.char(0xEF,0xBB,0xBF);
+
+  var inputfilter = GetConfigIOFilter("input");
+  var file_text;
+  ide->PushStatus("");
+  var ok, err = FileRead(filePath, 1024*1024, function(s) { // callback is only called when the file exists
+      if( ! file_text ) {
+        // remove BOM from UTF-8 encoded files; store BOM to add back when saving
+        if( s && editor->GetCodePage() == wxstc.wxSTC_CP_UTF8 && s->find("^"..editor.bom) ) {
+          s = s->gsub("^"..editor.bom, "");
+        } else {
+          // set to 'false' as checks for nil on wxlua objects may fail at run-time
+          editor.bom = false;
+        }
+        file_text = s;
+      }
+      if( inputfilter ) { s = inputfilter(filePath, s); }
+      var expected = editor->GetLength() + #s;
+      editor->AppendTextDyn(s);
+      // if the length is not as expected, then either it's a binary file or invalid UTF8
+      if( editor->GetLength() != expected ) {
+        // skip binary files with unknown extensions as they may have any sequences
+        // when using Raw methods, this can only happen for binary files (that include \0 chars)
+        if( editor.useraw || editor.spec == ide.specs.none && IsBinary(s) ) {
+          ide->Print(("%s: %s")->format(filePath,
+              TR("Binary file is shown as read-only as it is only partially loaded.")));
+          file_text = '';
+          editor->SetReadOnly(true);
+          return false;
+        }
+
+        // handle invalid UTF8 characters
+        // fix: doesn't handle characters split by callback buffer
+        var replacement, invalid = "\022";
+        s, invalid = FixUTF8(s, replacement);
+        if( #invalid > 0 ) {
+          editor->AppendTextDyn(s);
+          var lastline = null;
+          for( _, n in ipairs(invalid) ) {
+            var line = editor->LineFromPosition(n);
+            if( line != lastline ) {
+              ide->Print(("%s:%d: %s")->format(filePath, line+1,
+                  TR("Replaced an invalid UTF8 character with %s.")->format(replacement)));
+              lastline = line;
+            }
+          }
+        }
+      }
+      if( filesize && filesize > 0 ) {
+        ide->PopStatus();
+        ide->PushStatus(TR("%s%% loaded...")->format(math.floor(100*editor->GetLength()/filesize)));
+      }
+    });
+  ide->PopStatus();
+
+  // empty or non-existing files don't have bom
+  if( ! file_text ) { editor.bom = false; }
+
+  editor->EndUndoAction();
+  // try one more time with shebang if the type is not known yet
+  if( editor.spec == ide.specs.none ) { editor->SetupKeywords(GetFileExt(filePath)); }
+  editor->Colourise(0, -1);
+  editor->ResetTokenList(); // reset list of tokens if this is a reused editor
+  editor->Thaw();
+
+  // only report errors on existing files
+  if( ! ok && filesize ) {
+    // restore the changes in the editor,
+    // as it may be applied to some other content, for example, in preview
+    editor->Undo();
+    ide->ReportError(TR("Can't open file '%s': %s")->format(filePath, err));
+    return null;
+  }
+
+  var edcfg = ide.config.editor;
+  if( current ) { editor->GotoPos(current); }
+  if( (file_text && edcfg.autotabs) ) {
+    // use tabs if they are already used
+    // or if "usetabs" is set and no space indentation is used in a file
+    editor->SetUseTabs(string.find(file_text, "\t") != null
+      || edcfg.usetabs && (file_text->find("%f[^\r\n] ") || file_text->find("^ ")) == null);
+  }
+  
+  if( (file_text && edcfg.checkeol) ) {
+    // Auto-detect CRLF/LF line-endings
+    var foundcrlf = string.find(file_text,"\r\n") != null;
+    var foundlf = (string.find(file_text,"[^\r]\n") != null)
+      || (string.find(file_text,"^\n") != null); // edge case: file beginning with LF and having no other LF
+    if( foundcrlf && foundlf ) { // file with mixed line-endings
+      ide->Print(("%s: %s")
+        ->format(filePath, TR("Mixed end-of-line encodings detected.")..' '..
+          TR("Use '%s' to show line endings and '%s' to convert them.")
+        ->format("ide:GetEditor():SetViewEOL(1)", "ide:GetEditor():ConvertEOLs(ide:GetEditor():GetEOLMode())")));
+    } else if( foundcrlf ) {
+      editor->SetEOLMode(wxstc.wxSTC_EOL_CRLF);
+    } else if( foundlf ) {
+      editor->SetEOLMode(wxstc.wxSTC_EOL_LF);
+    // else (e.g. file is 1 line long or uses another line-ending): use default EOL mode
+    }
+  }
+
+  editor->EmptyUndoBuffer();
+  var doc = ide->GetDocument(editor);
+  if( doc ) { // existing editor; switch to the tab
+    notebook->SetSelection(doc->GetTabIndex());
+  } else { // the editor has not been added to notebook
+    doc = AddEditor(editor, wx.wxFileName(filePath)->GetFullName() || ide->GetDefaultFileName());
+  }
+  doc.filePath = filePath;
+  doc.fileName = wx.wxFileName(filePath)->GetFullName();
+  doc.modTime = GetFileModTime(filePath);
+
+  doc->SetModified(false);
+  doc->SetTabText(doc->GetFileName());
+
+  // activate the editor; this is needed for those cases when the editor is
+  // created from some other element, for example, from a project tree.
+  if( ! skipselection ) { SetEditorSelection(); }
+
+  PackageEventHandle("onEditorLoad", editor);
+
+  return editor;
+}
+
+function ReLoadFile(filePath, editor, ...) {
+  if( ! editor ) { return LoadFile(filePath, editor, ...); }
+
+  // save all markers
+  var markers = editor->MarkerGetAll();
+  // add the current line content to retrieved markers to compare later if needed
+  for( _, marker in ipairs(markers) ) { marker[3] = editor->GetLineDyn(marker[1]); }
+  var lines = editor->GetLineCount();
+
+  // load file into the same editor
+  editor = LoadFile(filePath, editor, ...);
+  if( ! editor ) { return; }
+
+  if( #markers > 0 ) { // restore all markers
+    // delete all markers as they may be restored by a different mechanism,
+    // which may be limited to only restoring some markers
+    editor->MarkerDeleteAll(-1);
+    var samelinecount = lines == editor->GetLineCount();
+    for( _, marker in ipairs(markers) ) {
+      var line, mask, text = unpack(marker);
+      if( samelinecount ) {
+        // restore marker at the same line number
+        editor->MarkerAddSet(line, mask);
+      } else {
+        // find matching line in the surrounding area and restore marker there
+        for( _, l in ipairs({line, line-1, line-2, line+1, line+2}) ) {
+          if( text == editor->GetLineDyn(l) ) {
+            editor->MarkerAddSet(l, mask);
+            break;
+          }
+        }
+      }
+    }
+    PackageEventHandle("onEditorMarkerUpdate", editor);
+  }
+
+  return editor;
+}
+
+var function getExtsString(ed) {
+  var exts = ed && ed.spec && ed.spec.exts || {};
+  var knownexts = #exts > 0 && "*."..table.concat(exts, ";*.") || null;
+  return (knownexts && TR("Known Files").." ("..knownexts..")|"..knownexts.."|" || "")
+  .. TR("All files").." (*)|*";
+}
+
+function OpenFile(event) {
+  var editor = ide->GetEditor();
+  var path = editor && ide->GetDocument(editor)->GetFilePath() || null;
+  var fileDialog = wx.wxFileDialog(ide.frame, TR("Open file"),
+    (path && GetPathWithSep(path) || ide->GetProject() || ""),
+    "",
+    getExtsString(editor),
+    wx.wxFD_OPEN + wx.wxFD_FILE_MUST_EXIST + wx.wxFD_MULTIPLE);
+  if( fileDialog->ShowModal() == wx.wxID_OK ) {
+    for( _, path in ipairs(fileDialog->GetPaths()) ) {
+      if( ! LoadFile(path, null, true) ) {
+        ide->ReportError(TR("Unable to load file '%s'.")->format(path));
+      }
+    }
+  }
+  fileDialog->Destroy();
+}
+
+// save the file to filePath or if filePath is nil then call SaveFileAs
+function SaveFile(editor, filePath) {
+  // this event can be aborted
+  // as SaveFileAs calls SaveFile, this event may be called two times:
+  // first without filePath and then with filePath
+  if( PackageEventHandle("onEditorPreSave", editor, filePath) == false ) {
+    return false;
+  }
+
+  if( ! filePath ) {
+    return SaveFileAs(editor);
+  } else {
+    if( ide.config.savebak ) {
+      var ok, err = FileRename(filePath, filePath..".bak");
+      if( ! ok ) {
+        ide->ReportError(TR("Unable to save file '%s': %s")->format(filePath..".bak", err));
+        return;
+      }
+    }
+
+    var st = ((editor->GetCodePage() == wxstc.wxSTC_CP_UTF8 && editor.bom || "")
+      .. editor->GetTextDyn());
+    if( GetConfigIOFilter("output") ) {
+      st = GetConfigIOFilter("output")(filePath,st);
+    }
+
+    var ok, err = FileWrite(filePath, st);
+    if( ok ) {
+      editor->SetSavePoint();
+      var doc = ide->GetDocument(editor);
+      doc.filePath = filePath;
+      doc.fileName = wx.wxFileName(filePath)->GetFullName();
+      doc.modTime = GetFileModTime(filePath);
+      doc->SetTabText(doc->GetFileName());
+      SetAutoRecoveryMark();
+      FileTreeMarkSelected(filePath);
+
+      PackageEventHandle("onEditorSave", editor);
+
+      return true;
+    } else {
+      ide->ReportError(TR("Unable to save file '%s': %s")->format(filePath, err));
+    }
+  }
+
+  return false;
+}
+
+function ApproveFileOverwrite() {
+  return wx.wxMessageBox(
+    TR("File already exists.").."\n"..TR("Do you want to overwrite it?"),
+    ide->GetProperty("editormessage"),
+    wx.wxYES_NO + wx.wxCENTRE, ide.frame) == wx.wxYES;
+}
+
+function SaveFileAs(editor) {
+  var id = editor->GetId();
+  var saved = false;
+  var filePath = (openDocuments[id].filePath
+    || ((ide->GetProject() || "")
+        ..(openDocuments[id].fileName || ide.config.default.name)));
+
+  var fn = wx.wxFileName(filePath);
+  fn->Normalize(); // want absolute path for dialog
+
+  var ext = fn->GetExt();
+  if( (! ext || #ext == 0) && editor.spec && editor.spec.exts ) {
+    ext = editor.spec.exts[1];
+    // set the extension on the file if assigned as this is used by OSX/Linux
+    // to present the correct default "save as type" choice.
+    if( ext ) { fn->SetExt(ext); }
+  }
+  var fileDialog = wx.wxFileDialog(ide.frame, TR("Save file as"),
+    fn->GetPath(wx.wxPATH_GET_VOLUME),
+    fn->GetFullName(),
+    // specify the current extension plus all other extensions based on specs
+    (ext && #ext > 0 && "*."..ext.."|*."..ext.."|" || "")..getExtsString(editor),
+    wx.wxFD_SAVE);
+
+  if( fileDialog->ShowModal() == wx.wxID_OK ) {
+    var filePath = fileDialog->GetPath();
+
+    // check if there is another tab with the same name and prepare to close it
+    var existing = (ide->FindDocument(filePath) || {}).index;
+    var cansave = fn->GetFullName() == filePath // saving into the same file
+       || ! wx.wxFileName(filePath)->FileExists() // or a new file
+       || ApproveFileOverwrite();
+
+    if( cansave && SaveFile(editor, filePath) ) {
+      SetEditorSelection(); // update title of the editor
+      // new extension, this will reset keywords and indicators
+      if( ext != GetFileExt(filePath) ) { LoadFile(filePath, editor); }
+      saved = true;
+
+      if( existing ) {
+        // save the current selection as it may change after closing
+        var current = notebook->GetSelection();
+        ClosePage(existing);
+        // restore the selection if it changed
+        if( current != notebook->GetSelection() ) {
+          notebook->SetSelection(current);
+        }
+      }
+    }
+  }
+
+  fileDialog->Destroy();
+  return saved;
+}
+
+function SaveAll(quiet) {
+  for( _, document in pairs(openDocuments) ) {
+    var editor = document.editor;
+    var filePath = document.filePath;
+
+    if( (document->IsModified() || document->IsNew()) // need to save
+    && (filePath || ! quiet) ) { // have path or can ask user
+      SaveFile(editor, filePath); // will call SaveFileAs if necessary
+    }
+  }
+}
+
+var function removePage(index) {
+  var prevIndex = null;
+  var nextIndex = null;
+  
+  // try to preserve old selection
+  var selectIndex = notebook->GetSelection();
+  selectIndex = selectIndex != index && selectIndex;
+
+  var delid = null;
+  for( id, document in pairsSorted(openDocuments,
+    function(a, b) { // sort by document index
+      return openDocuments[a].index < openDocuments[b].index;
+    }) ) {
+    var wasselected = document.index == selectIndex;
+    if( document.index < index ) {
+      prevIndex = document.index;
+    } else if( document.index == index ) {
+      delid = id;
+      document.editor->Destroy();
+    } else if( document.index > index ) {
+      document.index = document.index - 1;
+      if( nextIndex == null ) {
+        nextIndex = document.index;
+      }
+    }
+    if( (wasselected) ) {
+      selectIndex = document.index;
+    }
+  }
+
+  if( (delid) ) {
+    openDocuments[delid] = null;
+  }
+
+  notebook->RemovePage(index);
+  
+  if( selectIndex ) {
+    notebook->SetSelection(selectIndex);
+  } else if( nextIndex ) {
+    notebook->SetSelection(nextIndex);
+  } else if( prevIndex ) {
+    notebook->SetSelection(prevIndex);
+  }
+
+  // need to set editor selection as it's called *after* PAGE_CHANGED event
+  SetEditorSelection();
+}
+
+function ClosePage(selection) {
+  var editor = ide->GetEditor(selection);
+  var id = editor->GetId();
+
+  if( PackageEventHandle("onEditorPreClose", editor) == false ) {
+    return false;
+  }
+
+  if( SaveModifiedDialog(editor, true) != wx.wxID_CANCEL ) {
+    DynamicWordsRemoveAll(editor);
+    var debugger = ide->GetDebugger();
+    // check if the window with the scratchpad running is being closed
+    if( debugger && debugger.scratchpad && debugger.scratchpad.editors
+    && debugger.scratchpad.editors[editor] ) {
+      debugger->ScratchpadOff();
+    }
+    // check if the debugger is running and is using the current window;
+    // abort the debugger if the current marker is in the window being closed
+    if( debugger && debugger->IsConnected() &&
+      (editor->MarkerNext(0, CURRENT_LINE_MARKER_VALUE) >= 0) ) {
+      debugger->Stop();
+    }
+    PackageEventHandle("onEditorClose", editor);
+    removePage(ide.openDocuments[id].index);
+
+    // disable full screen if the last tab is closed
+    if( ! (notebook->GetSelection() >= 0) ) { ide->ShowFullScreen(false); }
+    return true;
+  }
+  return false;
+}
+
+function CloseAllPagesExcept(selection) {
+  var toclose = {};
+  for( _, document in pairs(ide.openDocuments) ) {
+    table.insert(toclose, document.index);
+  }
+
+  table.sort(toclose);
+
+  // close pages for those files that match the project in the reverse order
+  // (as ids shift when pages are closed)
+  for( i = #toclose, 1, -1 ) {
+    if( toclose[i] != selection ) { ClosePage(toclose[i]); }
+  }
+}
+
+// Show a dialog to save a file before closing editor.
+// returns wxID_YES, wxID_NO, or wxID_CANCEL if allow_cancel
+function SaveModifiedDialog(editor, allow_cancel) {
+  var result = wx.wxID_NO;
+  var document = ide->GetDocument(editor);
+  if( document->IsModified() ) {
+    document->GetEditor()->SetFocus();
+    var message = TR("Do you want to save the changes to '%s'?")
+      ->format(document->GetFileName() || ide.config.default.name);
+    var dlg_styles = wx.wxYES_NO + wx.wxCENTRE + wx.wxICON_QUESTION;
+    if( allow_cancel ) { dlg_styles +=   wx.wxCANCEL; }
+    var dialog = wx.wxMessageDialog(ide.frame, message,
+      TR("Save Changes?"),
+      dlg_styles);
+    result = dialog->ShowModal();
+    dialog->Destroy();
+    if( result == wx.wxID_YES ) {
+      if( ! document->Save() ) {
+        return wx.wxID_CANCEL; // cancel if canceled save dialog
+      }
+    }
+  }
+
+  return result;
+}
+
+function SaveOnExit(allow_cancel) {
+  for( _, document in pairs(openDocuments) ) {
+    if( (SaveModifiedDialog(document.editor, allow_cancel) == wx.wxID_CANCEL) ) {
+      return false;
+    }
+  }
+
+  // if all documents have been saved or refused to save, then mark those that
+  // are still modified as not modified (they don't need to be saved)
+  // to keep their tab names correct
+  for( _, document in pairs(openDocuments) ) {
+    if( document->IsModified() ) { document->SetModified(false); }
+  }
+
+  return true;
+}
+
+function SetAllEditorsReadOnly(enable) {
+  for( _, document in pairs(openDocuments) ) {
+    document.editor->SetReadOnly(enable);
+  }
+}
+
+//---------------
+// Debug related
+
+function ClearAllCurrentLineMarkers() {
+  for( _, document in pairs(openDocuments) ) {
+    document.editor->MarkerDeleteAll(CURRENT_LINE_MARKER);
+    document.editor->Refresh(); // needed for background markers that don't get refreshed (wx2.9.5)
+  }
+}
+
+// remove shebang line (#!) as it throws a compilation error as
+// loadstring() doesn't allow it even though lua/loadfile accepts it.
+// replace with a new line to keep the number of lines the same.
+function StripShebang(code) { return (code->gsub("^#!.-\n", "\n")); }
+
+var compileOk, compileTotal = 0, 0;
+function CompileProgram(editor, params) {
+  params = {
+    jumponerror = (params || {}).jumponerror != false,
+    reportstats = (params || {}).reportstats != false,
+    keepoutput = (params || {}).keepoutput,
+  };
+  var doc = ide->GetDocument(editor);
+  var filePath = doc->GetFilePath() || doc->GetFileName();
+  var func, err = loadstring(StripShebang(editor->GetTextDyn()), '@'..filePath);
+  var line = ! func && tonumber(err->match(":(%d+)%s*:")) || null;
+
+  if( ! params.keepoutput ) { ClearOutput(); }
+
+  compileTotal +=   1;
+  if( func ) {
+    compileOk +=   1;
+    if( params.reportstats ) {
+      ide->Print(TR("Compilation successful; %.0f%% success rate (%d/%d).")
+        ->format(compileOk/compileTotal*100, compileOk, compileTotal));
+    }
+  } else {
+    ide->GetOutput()->Activate();
+    ide->Print(TR("Compilation error").." "..TR("on line %d")->format(line)..":");
+    ide->Print((err->gsub("\n$", "")));
+    // check for escapes invalid in LuaJIT/Lua 5.2 that are allowed in Lua 5.1
+    if( err->find('invalid escape sequence') ) {
+      var s = editor->GetLineDyn(line-1);
+      var cleaned = s
+        ->gsub('\\[abfnrtv\\"\']', '  ')
+        ->gsub('(\\x[0-9a-fA-F][0-9a-fA-F])', function(s) { return string.rep(' ', #s); })
+        ->gsub('(\\%d%d?%d?)', function(s) { return string.rep(' ', #s); })
+        ->gsub('(\\z%s*)', function(s) { return string.rep(' ', #s); });
+      var invalid = cleaned->find("\\");
+      if( invalid ) {
+        ide->Print(TR("Consider removing backslash from escape sequence '%s'.")
+          ->format(s->sub(invalid,invalid+1)));
+      }
+    }
+    if( line && params.jumponerror && line-1 != editor->GetCurrentLine() ) {
+      editor->GotoLine(line-1);
+    }
+  }
+
+  return func != null; // return true if it compiled ok
+}
+
+//----------------
+// Save & Close
+
+function SaveIfModified(editor) {
+  var doc = ide->GetDocument(editor);
+  if( doc->IsModified() || doc->IsNew() ) {
+    var saved = false;
+    if( doc->IsNew() ) {
+      var ret = wx.wxMessageBox(
+        TR("You must save the program first.").."\n"..TR("Press cancel to abort."),
+        TR("Save file?"), wx.wxOK + wx.wxCANCEL + wx.wxCENTRE, ide.frame);
+      if( ret == wx.wxOK ) {
+        saved = SaveFileAs(editor);
+      }
+    } else {
+      saved = doc->Save();
+    }
+    return saved;
+  }
+
+  return true; // saved
+}
+
+function GetOpenFiles() {
+  var opendocs = {};
+  for( _, document in pairs(ide.openDocuments) ) {
+    if( (document.filePath) ) {
+      var wxfname = wx.wxFileName(document.filePath);
+      wxfname->Normalize();
+
+      table.insert(opendocs, {filename=wxfname->GetFullPath(),
+        id=document.index, cursorpos = document.editor->GetCurrentPos()});
+    }
+  }
+
+  // to keep tab order
+  table.sort(opendocs,function(a,b) { return (a.id < b.id); });
+
+  var id = ide->GetEditor();
+  id = id && id->GetId();
+  return opendocs, {index = (id && openDocuments[id].index || 0)};
+}
+
+function SetOpenFiles(nametab,params) {
+  for( _, doc in ipairs(nametab) ) {
+    var editor = LoadFile(doc.filename,null,true,true); // skip selection
+    if( editor ) { editor->GotoPosDelayed(doc.cursorpos || 0); }
+  }
+  notebook->SetSelection(params && params.index || 0);
+  SetEditorSelection();
+}
+
+function ProjectConfig(dir, config) {
+  if( config ) { ide.session.projects[dir] = config;
+  } else { return unpack(ide.session.projects[dir] || {}); }
+}
+
+function SetOpenTabs(params) {
+  var recovery, nametab = LoadSafe("return "..params.recovery);
+  if( ! recovery || ! nametab ) {
+    ide->Print(TR("Can't process auto-recovery record; invalid format: %s.")->format(nametab || "unknown"));
+    return;
+  }
+  if( ! params.quiet ) {
+    ide->Print(TR("Found auto-recovery record and restored saved session."));
+  }
+  for( _,doc in ipairs(nametab) ) {
+    // check for missing file if no content is stored
+    if( doc.filepath && ! doc.content && ! wx.wxFileExists(doc.filepath) ) {
+      ide->Print(TR("File '%s' is missing and can't be recovered.")->format(doc.filepath));
+    } else {
+      var editor = (doc.filepath && LoadFile(doc.filepath,null,true,true)
+        || findUnusedEditor() || NewFile(doc.filename));
+      var opendoc = ide->GetDocument(editor);
+      if( doc.content ) {
+        editor->SetTextDyn(doc.content);
+        if( doc.filepath && opendoc.modTime && doc.modified < opendoc.modTime->GetTicks() ) {
+          ide->Print(TR("File '%s' has more recent timestamp than restored '%s'; please review before saving.")
+            ->format(doc.filepath, opendoc->GetTabText()));
+        }
+      }
+      editor->GotoPosDelayed(doc.cursorpos || 0);
+    }
+  }
+  notebook->SetSelection(params && params.index || 0);
+  SetEditorSelection();
+}
+
+var function getOpenTabs() {
+  var opendocs = {};
+  for( _, document in pairs(ide.openDocuments) ) {
+    var editor = document->GetEditor();
+    table.insert(opendocs, {
+      filename = document->GetFileName(),
+      filepath = document->GetFilePath(),
+      tabname = document->GetTabText(),
+      // get number of seconds
+      modified = document->GetFileModifiedTime() && document->GetFileModifiedTime()->GetTicks(),
+      content = document->IsModified() && editor->GetTextDyn() || null,
+      id = document->GetTabIndex(),
+      cursorpos = editor->GetCurrentPos()});
+  }
+
+  // to keep tab order
+  table.sort(opendocs, function(a,b) { return (a.id < b.id); });
+
+  var ed = ide->GetEditor();
+  var doc = ed && ide->GetDocument(ed);
+  return opendocs, {index = (doc && doc->GetTabIndex() || 0)};
+}
+
+function SetAutoRecoveryMark() {
+  ide.session.lastupdated = os.time();
+}
+
+var function saveHotExit() {
+  var opentabs, params = getOpenTabs();
+  if( #opentabs > 0 ) {
+    params.recovery = DumpPlain(opentabs);
+    params.quiet = true;
+    SettingsSaveFileSession({}, params);
+  }
+}
+
+var function saveAutoRecovery(force) {
+  if( ! ide.config.autorecoverinactivity ) { return; }
+
+  var lastupdated = ide.session.lastupdated;
+  if( ! force ) {
+    if( ! lastupdated || lastupdated < (ide.session.lastsaved || 0) ) { return; }
+  }
+
+  var now = os.time();
+  if( ! force && lastupdated + ide.config.autorecoverinactivity > now ) { return; }
+
+  // find all open modified files and save them
+  var opentabs, params = getOpenTabs();
+  if( #opentabs > 0 ) {
+    params.recovery = DumpPlain(opentabs);
+    SettingsSaveAll();
+    SettingsSaveFileSession({}, params);
+    ide.settings->Flush();
+  }
+  ide.session.lastsaved = now;
+  ide->SetStatus(TR("Saved auto-recover at %s.")->format(os.date("%H:%M:%S")));
+}
+
+var function fastWrap(func, ...) {
+  // ignore SetEditorSelection that is not needed as `func` may work on
+  // multipe files, but editor needs to be selected once.
+  var SES = SetEditorSelection;
+  SetEditorSelection = function() { };
+  func(...);
+  SetEditorSelection = SES;
+}
+
+function StoreRestoreProjectTabs(curdir, newdir, intfname) {
+  var win = ide.osname == 'Windows';
+  var interpreter = intfname || ide.interpreter.fname;
+  var current, closing, restore = notebook->GetSelection(), 0, false;
+
+  if( ide.osname != 'Macintosh' ) { notebook->Freeze(); }
+
+  if( curdir && #curdir > 0 ) {
+    var lowcurdir = win && string.lower(curdir) || curdir;
+    var lownewdir = win && string.lower(newdir) || newdir;
+    var projdocs, closdocs = {}, {};
+    for( _, document in ipairs(GetOpenFiles()) ) {
+      var dpath = win && string.lower(document.filename) || document.filename;
+      // check if the filename is in the same folder
+      if( dpath->find(lowcurdir, 1, true) == 1
+      && dpath->find("^[\\/]", #lowcurdir+1) ) {
+        table.insert(projdocs, document);
+        closing +=   (document.id < current && 1 || 0);
+        // only close if the file is not in new project as it would be reopened
+        if( ! dpath->find(lownewdir, 1, true)
+        || ! dpath->find("^[\\/]", #lownewdir+1) ) {
+          table.insert(closdocs, document);
+        }
+      } else if( document.id == current ) { restore = true; }
+    }
+
+    // adjust for the number of closing tabs on the left from the current one
+    current -=   closing;
+
+    // save opened files from this project
+    ProjectConfig(curdir, {projdocs,
+      {index = notebook->GetSelection() - current, interpreter = interpreter}});
+
+    // close pages for those files that match the project in the reverse order
+    // (as ids shift when pages are closed)
+    for( i = #closdocs, 1, -1 ) { fastWrap(ClosePage, closdocs[i].id); }
+  }
+
+  var files, params = ProjectConfig(newdir);
+  if( files ) {
+    // provide fake index so that it doesn't activate it as the index may be not
+    // quite correct if some of the existing files are already open in the IDE.
+    fastWrap(SetOpenFiles, files, {index = #files + notebook->GetPageCount()});
+  }
+
+  // either interpreter is chosen for the project or the default value is set
+  if( (params && params.interpreter) || (! params && ide.config.interpreter) ) {
+    ProjectSetInterpreter(params && params.interpreter || ide.config.interpreter);
+  }
+
+  if( ide.osname != 'Macintosh' ) { notebook->Thaw(); }
+
+  var index = params && params.index;
+  if( notebook->GetPageCount() == 0 ) { NewFile();
+  } else if( restore && current >= 0 ) { notebook->SetSelection(current);
+  } else if( index && index >= 0 && files[index+1] ) {
+    // move the editor tab to the front with the file from the config
+    LoadFile(files[index+1].filename, null, true);
+    SetEditorSelection(); // activate the editor in the active tab
+  }
+
+  // remove current config as it may change; the current configuration is
+  // stored with the general config.
+  // The project configuration will be updated when the project is changed.
+  ProjectConfig(newdir, {});
+}
+
+var function closeWindow(event) {
+  // if the app is already exiting, then help it exit; wxwidgets on Windows
+  // is supposed to report Shutdown/logoff events by setting CanVeto() to
+  // false, but it doesn't happen. We simply leverage the fact that
+  // CloseWindow is called several times in this case and exit. Similar
+  // behavior has been also seen on Linux, so this logic applies everywhere.
+  if( ide.exitingProgram ) { os.exit(); }
+
+  ide.exitingProgram = true; // don't handle focus events
+
+  if( ! ide.config.hotexit && ! SaveOnExit(event->CanVeto()) ) {
+    event->Veto();
+    ide.exitingProgram = false;
+    return;
+  }
+
+  ide->ShowFullScreen(false);
+
+  if( ide->GetProject() ) { PackageEventHandle("onProjectClose", ide->GetProject()); }
+  PackageEventHandle("onAppClose");
+
+  // first need to detach all processes IDE has launched as the current
+  // process is likely to terminate before child processes are terminated,
+  // which may lead to a crash when EVT_END_PROCESS event is called.
+  DetachChildProcess();
+  ide->GetDebugger()->Shutdown();
+
+  SettingsSaveAll();
+  if( ide.config.hotexit ) { saveHotExit(); }
+  ide.settings->Flush();
+
+  { // hide all floating panes first
+    var panes = frame.uimgr->GetAllPanes();
+    for( index = 0, panes->GetCount()-1 ) {
+      var pane = frame.uimgr->GetPane(panes->Item(index).name);
+      if( pane->IsFloating() ) { pane->Hide(); }
+    }
+  }
+  frame.uimgr->Update(); // hide floating panes
+  frame.uimgr->UnInit();
+  frame->Hide(); // hide the main frame while the IDE exits
+
+  wx.wxClipboard->Get()->Flush(); // keep the clipboard content after exit
+
+  // stop all the timers
+  for( _, timer in pairs(ide.timers) ) { timer->Stop(); }
+  wx.wxGetApp()->Disconnect(wx.wxEVT_TIMER);
+
+  event->Skip();
+
+  PackageEventHandle("onAppShutdown");
+}
+frame->Connect(wx.wxEVT_CLOSE_WINDOW, closeWindow);
+
+var function restoreFocus() {
+  // check if the window is shown before returning focus to it,
+  // as it may lead to a recursion in event handlers on OSX (wxwidgets 2.9.5).
+  if( ide->IsWindowShown(ide.infocus) ) {
+    ide.infocus->SetFocus();
+    // if switching to the editor, then also call SetSTCFocus,
+    // otherwise the cursor is not shown in the editor on OSX.
+    if( ide.infocus->GetClassInfo()->GetClassName() == "wxStyledTextCtrl" ) {
+      ide.infocus->DynamicCast("wxStyledTextCtrl")->SetSTCFocus(true);
+    }
+  }
+}
+
+// in the presence of wxAuiToolbar, when (1) the app gets focus,
+// (2) a floating panel is closed or (3) a toolbar dropdown is closed,
+// the focus is always on the toolbar when the app gets focus,
+// so to restore the focus correctly, need to track where the control is
+// and to set the focus to the last element that had focus.
+// it would be easier to track KILL_FOCUS events, but controls on OSX
+// don't always generate KILL_FOCUS events (see relevant wxwidgets
+// tickets: http://trac.wxwidgets.org/ticket/14142
+// and http://trac.wxwidgets.org/ticket/14269)
+
+ide.editorApp->Connect(wx.wxEVT_SET_FOCUS, function(event) {
+  if( ide.exitingProgram ) { return; }
+
+  var win = ide.frame->FindFocus();
+  if( win ) {
+    var class = win->GetClassInfo()->GetClassName();
+    // don't set focus on the main frame or toolbar
+    if( ide.infocus && (class == "wxAuiToolBar" || class == "wxFrame") ) {
+      pcall(restoreFocus);
+      return;
+    }
+
+    // keep track of the current control in focus, but only on the main frame
+    // don't try to "remember" any of the focus changes on various dialog
+    // windows as those will disappear along with their controls
+    var grandparent = win->GetGrandParent();
+    var frameid = ide.frame->GetId();
+    var mainwin = grandparent && grandparent->GetId() == frameid;
+    var parent = win->GetParent();
+    while( parent ) {
+      var class = parent->GetClassInfo()->GetClassName();
+      if( (class == "wxFrame" || class->find("^wx.*Dialog$"))
+      && parent->GetId() != frameid ) {
+        mainwin = false; break;
+      }
+      parent = parent->GetParent();
+    }
+    if( mainwin ) {
+      if( ide.osname == "Macintosh"
+      && ide->IsValidCtrl(ide.infocus) && ide.infocus->DynamicCast("wxWindow") != win ) {
+        // kill focus on the control that had the focus as wxwidgets on OSX
+        // doesn't do it: http://trac.wxwidgets.org/ticket/14142;
+        // wrap into pcall in case the window is already deleted
+        var ev = wx.wxFocusEvent(wx.wxEVT_KILL_FOCUS);
+        pcall(function() { ide.infocus->GetEventHandler()->ProcessEvent(ev); });
+      }
+      ide.infocus = win;
+    }
+  }
+
+  event->Skip();
+});
+
+var updateInterval = 250; // time in ms
+wx.wxUpdateUIEvent.SetUpdateInterval(updateInterval);
+
+ide.editorApp->Connect(wx.wxEVT_ACTIVATE_APP,
+  function(event) {
+    if( ! ide.exitingProgram ) {
+      var active = event->GetActive();
+      // restore focus to the last element that received it;
+      // wrap into pcall in case the element has disappeared
+      // while the application was out of focus
+      if( ide.osname == "Macintosh" && active && ide.infocus ) { pcall(restoreFocus); }
+
+      // save auto-recovery record when making the app inactive
+      if( ! active ) { saveAutoRecovery(true); }
+
+      // disable UI refresh when app is inactive, but only when not running
+      wx.wxUpdateUIEvent.SetUpdateInterval(
+        (active || ide->GetLaunchedProcess()) && updateInterval || -1);
+
+      PackageEventHandle(active && "onAppFocusSet" || "onAppFocusLost", ide.editorApp);
+    }
+    event->Skip();
+  });
+
+if( ide.config.autorecoverinactivity ) {
+  ide.timers.session = ide->AddTimer(frame, function() { saveAutoRecovery(); });
+  // check at least 5s to be never more than 5s off
+  ide.timers.session->Start(math.min(5, ide.config.autorecoverinactivity)*1000);
+}
+
+function PaneFloatToggle(window) {
+  var pane = uimgr->GetPane(window);
+  if( pane->IsFloating() ) {
+    pane->Dock();
+  } else {
+    pane->Float();
+    pane->FloatingPosition(pane.window->GetScreenPosition());
+    pane->FloatingSize(pane.window->GetSize());
+  }
+  uimgr->Update();
+}
+
+var cma, cman = 0, 1;
+frame->Connect(wx.wxEVT_IDLE,
+  function(event) {
+    if( ide->GetDebugger()->Update() ) { event->RequestMore(true); }
+    // there is a chance that the current debugger can change after `Update` call
+    // (as the debugger may be suspended during initial socket connection),
+    // so retrieve the current debugger again to make sure it's properly set up.
+    var debugger = ide->GetDebugger();
+    if( (debugger.scratchpad) ) { debugger->ScratchpadRefresh(); }
+    if( IndicateIfNeeded() ) { event->RequestMore(true); }
+    PackageEventHandleOnce("onIdleOnce", event);
+    PackageEventHandle("onIdle", event);
+
+    // process onidle events if any
+    if( #ide.onidle > 0 ) { table.remove(ide.onidle, 1)(); }
+    if( #ide.onidle > 0 ) { event->RequestMore(true); } // request more if anything left
+
+    if( ide.config.showmemoryusage ) {
+      var mem = collectgarbage("count");
+      var alpha = math.max(tonumber(ide.config.showmemoryusage) || 0, 1/cman);
+      cman +=   1;
+      cma = alpha * mem + (1-alpha) * cma;
+      ide->SetStatus(("cur: %sKb; avg: %sKb")->format(math.floor(mem), math.floor(cma)));
+    }
+
+    event->Skip(); // let other EVT_IDLE handlers to work on the event
+  });

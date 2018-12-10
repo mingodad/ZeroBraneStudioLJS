@@ -1,0 +1,152 @@
+// Copyright 2011-12 Paul Kulchenko, ZeroBrane LLC
+
+var pathcache;
+var win = ide.osname == "Windows";
+var mac = ide.osname == "Macintosh";
+
+var function isValidPid(bid, cmd) {
+  if( ! bid || bid == -1 || bid == 0 ) {
+    ide->Print(("Program unable to run as '%s'.")->format(cmd));
+    return;
+  }
+  return bid;
+}
+
+var function waitToComplete(bid) {
+  while( wx.wxProcess.Exists(bid) ) {
+    wx.wxSafeYield();
+    wx.wxWakeUpIdle();
+    wx.wxMilliSleep(100);
+  }
+}
+
+return {
+  name = "Gideros",
+  description = "Gideros mobile platform",
+  api = {"baselib", "gideros"},
+  frun = function(this,wfilename,rundebug) {
+    var gideros = ide.config.path.gideros || pathcache; // check if the path is configured
+    if( ! gideros ) {
+      var sep = win && ';' || ':';
+      var default =
+           win && (GenerateProgramFilesPath('Gideros', sep)..sep)
+        || mac && ('/Applications/Gideros Studio/Gideros Player.app/Contents/MacOS'..sep)
+        || '';
+      var path = default
+                 ..(os.getenv('PATH') || '')..sep
+                 ..(os.getenv('HOME') && os.getenv('HOME') .. '/bin' || '');
+      var paths = {};
+      for( p in path->gmatch("[^"..sep.."]+") ) {
+        gideros = gideros || GetFullPathIfExists(p, win && 'GiderosPlayer.exe' || 'Gideros Player');
+        table.insert(paths, p);
+      }
+      if( ! gideros ) {
+        ide->Print("Can't find gideros executable in any of the folders in PATH: "
+          ..table.concat(paths, ", "));
+        return;
+      }
+      pathcache = gideros;
+    }
+    if( gideros && ! wx.wxFileName(gideros)->FileExists() ) {
+      ide->Print("Can't find the specified gideros executable '"..gideros.."'.");
+      return;
+    }
+
+    var giderostools = wx.wxFileName.DirName(wx.wxFileName(gideros)
+      ->GetPath(wx.wxPATH_GET_VOLUME)
+      ..(win && '/Tools' || '/../../../Gideros Studio.app/Contents/Tools'));
+    giderostools->Normalize();
+    var giderospath = giderostools->GetPath(wx.wxPATH_GET_VOLUME);
+    var gdrbridge = GetFullPathIfExists(giderospath, win && 'gdrbridge.exe' || 'gdrbridge');
+    if( ! gdrbridge ) {
+      ide->Print("Can't find gideros bridge executable in '"..giderospath.."'.");
+      return;
+    }
+
+    // find *.gproj file in the project directory
+    var file;
+    for( _, proj in ipairs(FileSysGetRecursive(this->fworkdir(wfilename), false, "*.gproj")) ) {
+      if( file ) {
+        ide->Print("Found multiple .gproj files in the project directory; ignored '"..proj.."'.");
+      }
+      file = file || proj;
+    }
+    if( ! file ) {
+      ide->Print("Can't find gideros project file in the project directory.");
+      return;
+    }
+
+    if( rundebug ) {
+      ide->GetDebugger()->SetOptions(
+        {redirect = "c", runstart = ide.config.debugger.runonstart != false});
+    }
+
+    var pid;
+    var remote = ide.config.gideros && ide.config.gideros.remote;
+    if( remote ) {
+      var cmd = ('"%s" %s "%s"')->format(gdrbridge, 'setip', remote);
+      ide->Print(("Configuring remote player at %s.")->format(remote));
+      var bid = wx.wxExecute(cmd, wx.wxEXEC_ASYNC);
+      if( ! isValidPid(bid, cmd) ) { return; }
+      waitToComplete(bid); // wait for a bit to give Gideros chance to connect
+    } else {
+      var cmd = ('"%s"')->format(gideros);
+      // CommandLineRun(cmd,wdir,tooutput,nohide,stringcallback,uid,endcallback)
+      pid = CommandLineRun(cmd,this->fworkdir(wfilename),! mac,true,null,null,function() {
+          // get any pending messages (including errors) from the last session
+          var cmd = ('"%s" %s')->format(gdrbridge, 'getlog');
+          ide->ExecuteCommand(cmd,this->fworkdir(wfilename),function(s) {
+              // remove all "status" messages from the output
+              s = s->gsub("%f[\r\n]%s*%*.-[\r\n]","")->gsub("^%s*%*.-[\r\n]+","");
+              ide->GetOutput()->Write(s);
+            });
+        });
+      if( ! pid ) { return; }
+    }
+
+    {
+      ide->Print("Starting the player and waiting for the bridge to connect at '"..gdrbridge.."'.");
+      var cmd = ('"%s" %s')->format(gdrbridge, 'isconnected');
+      var attempts, connected = 15;
+      for( _ = 1, attempts ) {
+        var proc = wx.wxProcess();
+        proc->Redirect();
+        proc->Connect(wx.wxEVT_END_PROCESS, function(event) { proc = null; });
+        var bid = wx.wxExecute(cmd, wx.wxEXEC_ASYNC + wx.wxEXEC_MAKE_GROUP_LEADER, proc);
+        if( ! isValidPid(bid, cmd) ) { return; }
+
+        var streamin = proc->GetInputStream();
+        for( _ = 1, 30 ) {
+          if( streamin->CanRead() ) {
+            connected = tonumber(streamin->Read(4096)) == 1;
+            break; }
+          wx.wxSafeYield();
+          wx.wxWakeUpIdle();
+          wx.wxMilliSleep(250);
+        }
+
+        if( connected ) { break; }
+        if( connected == null && proc ) {
+          wx.wxProcess.Kill(bid, wx.wxSIGKILL, wx.wxKILL_CHILDREN);
+          if( ! remote ) { wx.wxProcess.Kill(pid, wx.wxSIGKILL, wx.wxKILL_CHILDREN); }
+          ide->Print("Couldn't connect to the player. Try again or check starting the player and the bridge manually.");
+          return;
+        }
+      }
+      if( ! connected ) {
+        if( ! remote ) { wx.wxProcess.Kill(pid, wx.wxSIGKILL, wx.wxKILL_CHILDREN); }
+        ide->Print("Couldn't connect after "..attempts.." attempts. Try again or check starting the player manually.");
+        return;
+      }
+
+      cmd = ('"%s" %s "%s"')->format(gdrbridge, 'play', file);
+      ide->Print(("Starting project file '%s'.")->format(file));
+      var bid = wx.wxExecute(cmd, wx.wxEXEC_ASYNC);
+      if( ! isValidPid(bid, cmd) ) { return; }
+    }
+    return pid;
+  },
+  hasdebugger = true,
+  scratchextloop = true,
+  skipcompile = true, // skip compilation as Gideros 2016.08+ includes bitops and macros
+};

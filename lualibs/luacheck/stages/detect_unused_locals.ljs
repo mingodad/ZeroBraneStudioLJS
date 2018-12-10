@@ -1,0 +1,330 @@
+var utils = require ("luacheck.utils");
+
+var stage = {};
+
+var function unused_local_message_format(warning) {
+   if( warning.func ) {
+      if( warning.recursive ) {
+         return "unused recursive function {name!}";
+      } else if( warning.mutually_recursive ) {
+         return "unused mutually recursive function {name!}";
+      } else {
+         return "unused function {name!}";
+      }
+   } else {
+      return "unused variable {name!}";
+   }
+}
+
+var function unused_arg_message_format(warning) {
+   if( warning.name == "..." ) {
+      return "unused variable length argument";
+   } else {
+      return "unused argument {name!}";
+   }
+}
+
+var function unused_or_overwritten_warning(message_format) {
+   return {
+      message_format = function(warning) {
+         if( warning.overwritten_line ) {
+            return message_format .. " is overwritten on line {overwritten_line} before use";
+         } else {
+            return message_format .. " is unused";
+         }
+      },
+      fields = {"name", "secondary", "overwritten_line", "overwritten_column", "overwritten_end_column"}
+   };
+}
+
+stage.warnings = {
+   ["211"] = {message_format = unused_local_message_format,
+      fields = {"name", "func", "secondary", "useless", "recursive", "mutually_recursive"}},
+   ["212"] = {message_format = unused_arg_message_format, fields = {"name", "self"}},
+   ["213"] = {message_format = "unused loop variable {name!}", fields = {"name"}},
+   ["221"] = {message_format = "variable {name!} is never set", fields = {"name", "secondary"}},
+   ["231"] = {message_format = "variable {name!} is never accessed", fields = {"name", "secondary"}},
+   ["232"] = {message_format = "argument {name!} is never accessed", fields = {"name"}},
+   ["233"] = {message_format = "loop variable {name!} is never accessed", fields = {"name"}},
+   ["241"] = {message_format = "variable {name!} is mutated but never accessed", fields = {"name", "secondary"}},
+   ["311"] = unused_or_overwritten_warning("value assigned to variable {name!}"),
+   ["312"] = unused_or_overwritten_warning("value of argument {name!}"),
+   ["313"] = unused_or_overwritten_warning("value of loop variable {name!}"),
+   ["331"] = {message_format = "value assigned to variable {name!} is mutated but never accessed",
+      fields = {"name", "secondary"}}
+};
+
+var function is_secondary(value) {
+   return value.secondaries && value.secondaries.used;
+}
+
+var type_codes = {
+   _v_var = "1",
+   func = "1",
+   arg = "2",
+   loop = "3",
+   loopi = "3"
+};
+
+var function warn_unused_var(chstate, value, is_useless) {
+   chstate->warn_value("21" .. type_codes[value._v_var.type], value, {
+      secondary = is_secondary(value) || null,
+      func = value.type == "func" || null,
+      this = value._v_var.this,
+      useless = value._v_var.name == "_" && is_useless || null
+   });
+}
+
+var function warn_unaccessed_var(chstate, _v_var, is_mutated) {
+   // Mark as secondary if all assigned values are secondary.
+   // It is guaranteed that there are at least two values.
+   var secondary = true;
+
+   for( _, value in ipairs(_v_var.values) ) {
+      if( ! value.empty && ! is_secondary(value) ) {
+         secondary = null;
+         break;
+      }
+   }
+
+   chstate->warn_var("2" .. (is_mutated && "4" || "3") .. type_codes[_v_var.type], _v_var, {
+      secondary = secondary
+   });
+}
+
+var function warn_unused_value(chstate, value, overwriting_node) {
+   var warning = chstate->warn_value("3" .. (value.mutated && "3" || "1") .. type_codes[value.type], value, {
+      secondary = is_secondary(value) || null
+   });
+
+   if( overwriting_node ) {
+      warning.overwritten_line = overwriting_node.line;
+      warning.overwritten_column = chstate->offset_to_column(overwriting_node.line, overwriting_node.offset);
+      warning.overwritten_end_column = chstate->offset_to_column(overwriting_node.line, overwriting_node.end_offset);
+   }
+}
+
+// Returns `true` if a variable should be reported as a function instead of simply local,
+// `false` otherwise.
+// A variable is considered a function if it has a single assignment and the value is a function,
+// or if there is a forward declaration with a function assignment later.
+var function is_function_var(_v_var) {
+   return (#_v_var.values == 1 && _v_var.values[1].type == "func") || (
+      #_v_var.values == 2 && _v_var.values[1].empty && _v_var.values[2].type == "func");
+}
+
+var externally_accessible_tags = utils.array_to_set({"Id", "Index", "Call", "Invoke", "Op", "Paren", "Dots"});
+
+var function is_externally_accessible(value) {
+   return value.type != "var" || (value.node && externally_accessible_tags[value.node.tag]);
+}
+
+var function get_overwriting_lhs_node(item, value) {
+   for( _, node in ipairs(item.lhs) ) {
+      if( node._v_var == value._v_var ) {
+         return node;
+      }
+   }
+}
+
+var function get_second_overwriting_lhs_node(item, value) {
+   var after_value_node;
+
+   for( _, node in ipairs(item.lhs) ) {
+      if( node._v_var == value._v_var ) {
+         if( after_value_node ) {
+            return node;
+         } else if( node == value.var_node ) {
+            after_value_node = true;
+         }
+      }
+   }
+}
+
+var function detect_unused_local(chstate, _v_var) {
+   if( is_function_var(_v_var) ) {
+      var value = _v_var.values[2] || _v_var.values[1];
+
+      if( ! value.used ) {
+         warn_unused_var(chstate, value);
+      }
+   } else if( #_v_var.values == 1 ) {
+      var value = _v_var.values[1];
+
+      if( ! value.used ) {
+         if( value.mutated ) {
+            if( ! is_externally_accessible(value) ) {
+               warn_unaccessed_var(chstate, _v_var, true);
+            }
+         } else {
+            warn_unused_var(chstate, value, value.empty);
+         }
+      } else if( value.empty ) {
+         chstate->warn_var("221", _v_var);
+      }
+   } else if( ! _v_var.accessed && ! _v_var.mutated ) {
+      warn_unaccessed_var(chstate, _v_var);
+   } else {
+      var no_values_externally_accessible = true;
+
+      for( _, value in ipairs(_v_var.values) ) {
+         if( is_externally_accessible(value) ) {
+            no_values_externally_accessible = false;
+         }
+      }
+
+      if( ! _v_var.accessed && no_values_externally_accessible ) {
+         warn_unaccessed_var(chstate, _v_var, true);
+      }
+
+      for( _, value in ipairs(_v_var.values) ) {
+         if( ! value.empty ) {
+            if( ! value.used ) {
+               if( ! value.mutated ) {
+                  var overwriting_node;
+
+                  if( value.overwriting_item ) {
+                     if( value.overwriting_item != value.item ) {
+                        overwriting_node = get_overwriting_lhs_node(value.overwriting_item, value);
+                     }
+                  } else {
+                     overwriting_node = get_second_overwriting_lhs_node(value.item, value);
+                  }
+
+                  warn_unused_value(chstate, value, overwriting_node);
+               } else if( ! is_externally_accessible(value) ) {
+                  if( _v_var.accessed || ! no_values_externally_accessible ) {
+                     warn_unused_value(chstate, value);
+                  }
+               }
+            }
+         }
+      }
+   }
+}
+
+var function detect_unused_locals_in_line(chstate, line) {
+   for( _, item in ipairs(line.items) ) {
+      if( item.tag == "Local" ) {
+         for( _v_var in pairs(item.set_variables) ) {
+            // Do not check the implicit top level vararg.
+            if( _v_var.node.line ) {
+               detect_unused_local(chstate, _v_var);
+            }
+         }
+      }
+   }
+}
+
+var function detect_unused_locals(chstate) {
+   for( _, line in ipairs(chstate.lines) ) {
+      detect_unused_locals_in_line(chstate, line);
+   }
+}
+
+var function mark_reachable_lines(edges, marked, line) {
+   for( connected_line in pairs(edges[line]) ) {
+      if( ! marked[connected_line] ) {
+         marked[connected_line] = true;
+         mark_reachable_lines(edges, marked, connected_line);
+      }
+   }
+}
+
+var function detect_unused_rec_funcs(chstate) {
+   // Build a graph of usage relations of all closures.
+   // Closure A is used by closure B iff either B is parent
+   // of A and A is not assigned to a local/upvalue, or
+   // B uses local/upvalue value that is A.
+   // Closures not reachable from root closure are unused,
+   // report corresponding values/variables if not done already.
+
+   var line = chstate.top_line;
+
+   // Initialize edges maps.
+   var forward_edges = {[line] = {}};
+   var backward_edges = {[line] = {}};
+
+   for( _, nested_line in ipairs(line.lines) ) {
+      forward_edges[nested_line] = {};
+      backward_edges[nested_line] = {};
+   }
+
+   // Add edges leading to each nested line.
+   for( _, nested_line in ipairs(line.lines) ) {
+      if( nested_line.node.value ) {
+         for( using_line in pairs(nested_line.node.value.using_lines) ) {
+            forward_edges[using_line][nested_line] = true;
+            backward_edges[nested_line][using_line] = true;
+         }
+      } else if( nested_line.parent ) {
+         forward_edges[nested_line.parent][nested_line] = true;
+         backward_edges[nested_line][nested_line.parent] = true;
+      }
+   }
+
+   // Recursively mark all closures reachable from root closure and unused closures.
+   // Closures reachable from main chunk are used; closure reachable from unused closures
+   // depend on that closure; that is, fixing warning about parent unused closure
+   // fixes warning about the child one, so issuing a warning for the child is superfluous.
+   var marked = {[line] = true};
+   mark_reachable_lines(forward_edges, marked, line);
+
+   for( _, nested_line in ipairs(line.lines) ) {
+      if( nested_line.node.value && ! nested_line.node.value.used ) {
+         marked[nested_line] = true;
+         mark_reachable_lines(forward_edges, marked, nested_line);
+      }
+   }
+
+   // Deal with unused closures.
+   for( _, nested_line in ipairs(line.lines) ) {
+      var value = nested_line.node.value;
+
+      if( value && value.used && ! marked[nested_line] ) {
+         // This closure is used by some closure, but is not marked as reachable
+         // from main chunk or any of reported closures.
+         // Find candidate group of mutually recursive functions containing this one:
+         // mark sets of closures reachable from it by forward and backward edges,
+         // intersect them. Ignore already marked closures in the process to avoid
+         // issuing superfluous, dependent warnings.
+         var forward_marked = setmetatable({}, {__index = marked});
+         var backward_marked = setmetatable({}, {__index = marked});
+         mark_reachable_lines(forward_edges, forward_marked, nested_line);
+         mark_reachable_lines(backward_edges, backward_marked, nested_line);
+
+         // Iterate over closures in the group.
+         for( mut_rec_line in pairs(forward_marked) ) {
+            if( rawget(backward_marked, mut_rec_line) ) {
+               marked[mut_rec_line] = true;
+               value = mut_rec_line.node.value;
+
+               if( value ) {
+                  // Report this closure as self recursive or mutually recursive.
+                  var is_self_recursive = forward_edges[mut_rec_line][mut_rec_line];
+
+                  if( is_function_var(value._v_var) ) {
+                     chstate->warn_value("211", value, {
+                        func = true,
+                        mutually_recursive = ! is_self_recursive || null,
+                        recursive = is_self_recursive || null
+                     });
+                  } else {
+                     chstate->warn_value("311", value);
+                  }
+               }
+            }
+         }
+      }
+   }
+}
+
+// Warns about unused local variables and their values as well as locals that
+// are accessed but never set or set but never accessed.
+// Warns about unused recursive functions.
+function stage.run(chstate) {
+   detect_unused_locals(chstate);
+   detect_unused_rec_funcs(chstate);
+}
+
+return stage;

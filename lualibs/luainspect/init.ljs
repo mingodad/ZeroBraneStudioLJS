@@ -1,0 +1,1454 @@
+// luainspect.init - core LuaInspect source analysis.
+//
+// This module is a bit more high level than luainspect.ast.  It deals more with
+// interpretation/inference of semantics of an AST.  It also uses luainspect.globals,
+// which does the basic semantic interpretation of globals/locals.
+//
+// (c) 2010 David Manura, MIT License.
+
+var M = {};
+
+// This is the API version.  It is an ISO8601 date expressed as a fraction.
+M.APIVERSION = 0.20100805;
+
+var LA = require ("luainspect.ast");
+var LD = require ("luainspect.dump");
+var LG = require ("luainspect.globals");
+var LS = require ("luainspect.signatures");
+var T = require ("luainspect.types");
+var COMPAT = require ("luainspect.compat_env");
+
+//! require 'luainspect.typecheck' (context)
+
+var ENABLE_RETURN_ANALYSIS = true;
+var DETECT_DEADCODE = false; // may require more validation (false positives)
+
+
+// Functional forms of Lua operators.
+// Note: variable names like _1 are intentional.  These affect debug info and
+// will display in any error messages.
+var ops = {};
+ops['add'] = function(_1,_2) { return _1+_2; };
+ops['sub'] = function(_1,_2) { return _1-_2; };
+ops['mul'] = function(_1,_2) { return _1*_2; };
+ops['div'] = function(_1,_2) { return _1/_2; };
+ops['mod'] = function(_1,_2) { return _1%_2; };
+ops['pow'] = function(_1,_2) { return _1**_2; };
+ops['concat'] = function(_1,_2) { return _1.._2; };
+ops['eq'] = function(_1,_2) { return _1==_2; };
+ops['lt'] = function(_1,_2) { return _1<_2; };
+ops['le'] = function(_1,_2) { return _1<=_2; };
+ops['and'] = function(_1,_2) { return _1 && _2; };
+ops['or'] = function(_1,_2) { return _1 || _2; };
+ops['not'] = function(_1) { return ! _1; };
+ops['len'] = function(_1) { return #_1; };
+ops['unm'] = function(_1) { return -_1; };
+
+
+// Performs binary operation.  Supports types.
+var function dobinop(opid, a, b) {
+  if( (a == T.number || b == T.number) &&
+     (a == T.number || type(a) == 'number' ) &&
+     (b == T.number || type(b) == 'number' )
+  ) {
+    if( opid == 'eq' || opid == 'lt' || opid == 'le' ) {
+      return T.boolean;
+    } else if( opid == 'concat' ) {
+      return T.string;
+    } else {
+      return T.number;
+    }
+  } else if( (a == T.string || b == T.string) &&
+           (a == T.string || type(a) == 'string' ) &&
+           (b == T.string || type(b) == 'string' )
+  ) {
+    if( opid == 'concat' || opid == 'and' || opid == 'or' ) {
+      return T.string;
+    } else if( opid == 'eq' || opid == 'lt' || opid == 'le' ) {
+      return T.boolean;
+    } else {
+      return T.number;
+    }
+  } else if( (a == T.boolean || b == T.boolean) &&
+           (a == T.boolean || type(a) == 'boolean' ) &&
+           (b == T.boolean || type(b) == 'boolean' )
+  ) {
+    if( opid == 'eq' || opid == 'and' || opid == 'or' ) {
+      return T.boolean;
+    } else {
+      error('invalid operation on booleans: ' .. opid, 0);
+    }
+  } else if( T.istype[a] || T.istype[b] ) {
+    return T.universal;
+  } else {
+    return ops[opid](a, b);
+  }
+}
+
+
+// Performs unary operation.  Supports types.
+var function dounop(opid, a) {
+  if( opid == 'not' ) {
+    if( T.istype[a] ) {
+      return T.boolean;
+    } else {
+      return ops[opid](a);
+    }
+  } else if( a == T.number ) {
+    if( opid == 'unm' ) {
+      return T.number;
+    } else { // 'len'
+      error('invalid operation on number: ' .. opid, 0);
+    }
+  } else if( a == T.string ) {
+    return T.number;
+  } else if( a == T.boolean ) {
+    error('invalid operation on boolean: ' .. opid, 0);
+  } else if( T.istype[a] ) {
+    return null, 'unknown';
+  } else {
+    return ops[opid](a);
+  }
+}
+
+// Like info in debug.getinfo but inferred by static analysis.
+// object -> {fpos=fpos, source="@" .. source, fast=ast, tokenlist=tokenlist}
+// Careful: value may reference key (affects pre-5.2 which lacks emphemerons).
+//   See also ast.nocollect.
+M.debuginfo = setmetatable({}, {__mode='v'});
+
+// Modules loaded via require_inspect.
+// module name string -> {return value, AST node}
+// note: AST node is maintained to prevent nocollect fields in ast being collected.
+// note: not a weak table.
+M.package_loaded = {};
+
+// Stringifies interpreted value for debugging.
+// CATEGORY: debug
+var function debugvalue(ast) {
+  var s;
+  if( ast ) {
+    s = ast.value != T.universal && 'known:' .. tostring(ast.value) || 'unknown';
+  } else {
+    s = '?';
+  }
+  return s;
+}
+
+
+// Reads contents of text file in path, in binary mode.
+// On error, returns nil and error message.
+var function readfile(path) {
+  var fh, err = io.open(path, 'rb');
+  if( fh ) {
+    var data; data, err = fh->read('*a');
+    if( data ) { return data; }
+  }
+  return null, err;
+}
+
+// Similar to string.gsub but with plain replacement (similar to option in string.match)
+// http://lua-users.org/lists/lua-l/2002-04/msg00118.html
+// CATEGORY: utility/string
+var function plain_gsub(s, pattern, repl) {
+  repl = repl->gsub('(%%)', '%%%%');
+  return s->gsub(pattern, repl);
+}
+
+// Infer name of variable or literal that AST node represents.
+// This is for debugging messages.
+var function infer_name(ast) {
+  if( ast == null ) { return null;
+  } else if( ast.tag == 'Id' ) { return "'"..ast[1].."'";
+  } else if( ast.tag == 'Number' ) { return 'number';
+  } else if( ast.tag == 'String' ) { return 'string';
+  } else if( ast.tag == 'True' ) { return 'true';
+  } else if( ast.tag == 'False' ) { return 'false';
+  } else if( ast.tag == 'Nil' ) { return 'nil';
+  } else { return null; }
+}
+
+/*
+ This is like `pcall` but any error string returned does not contain the
+ "chunknamem:currentline: " prefix (based on luaL_where) if the error occurred
+ in the current file.  This avoids error messages in user code (f)
+ being reported as being inside this module if this module calls user code.
+ Also, local variable names _1, _2, etc. in error message are replaced with names
+ inferred (if any) from corresponding AST nodes in list `asts` (note: nil's in asts skip replacement).
+--*/
+var _prefix;
+var _clean;
+var function pzcall(f, asts, ...) {
+  _prefix = _prefix || select(2, pcall(function() { error(''); }))->gsub(':%d+: *$', ''); // note: specific to current file.
+  _clean = _clean || function(asts, ok, ...) {
+    if( ok ) { return true, ...;
+    } else {
+      var err = ...;
+      if( type(err) == 'string' ) {
+        if( err->sub(1,#_prefix) == _prefix ) {
+          var more = err->match('^:%d+: *(.*)', #_prefix+1);
+          if( more ) {
+            err = more;
+            err = err->gsub([=[local '_(%d+)']=], function(name) { return infer_name(asts[tonumber(name)]); });
+          }
+        }
+      }
+      return ok, err;
+    }
+  };
+  return _clean(asts, pcall(f, ...));
+}
+
+// Loads source code of given module name.
+// Returns code followed by path.
+// note: will also search in the directory `spath` and its parents.
+//   This should preferrably be an absolute path or it might not work correctly.
+//   It must be slash terminated.
+// CATEGORY: utility/package
+var function load_module_source(name, spath) {
+  // Append parent directories to list of paths to search.
+  var package_path = package.path;
+  var ppath = spath;
+  do {
+    package_path = package_path .. ';' .. ppath .. '?.ljs;' .. ppath .. '?/init.ljs';
+    var nsub;
+    ppath, nsub = ppath->gsub('[^\\/]+[\\/]$', '');
+  } while(!( nsub == 0) );
+
+  for( spec in package_path->gmatch('[^;]+') ) {
+    var testpath = plain_gsub(spec, '%?', (name->gsub('%.', '/')));
+    var src, err_ = readfile(testpath);
+    if( src ) { return src, testpath; }
+  }
+  return null;
+}
+
+
+// Clears global state.
+// This includes cached inspected modules.
+function M.clear_cache() {
+  for( k,v in pairs(M.package_loaded) ) {
+    M.package_loaded[k] = null;
+  }
+}
+
+
+// Gets all keywords related to AST `ast`, where `top_ast` is the root of `ast`
+// and `src` is source code of `top_ast`
+// Related keywords are defined as all keywords directly associated with block containing node
+// `ast`.  Furthermore, break statements are related to containing loop statements,
+// and return statements are related to containing function statement (if any).
+// function declaration syntactic sugar is handled specially too to ensure the 'function' keyword
+// is highlighted even though it may be outside of the `Function AST.
+//
+// Returns token list or nil if not applicable.  Returned `ast` is AST containing related keywords.
+// CATEGORY: keyword comprehension
+var iskeystat = {Do=true, While=true, Repeat=true, If=true, Fornum=true, Forin=true,
+    Local=true, Localrec=true, Return=true, Break=true, Function=true,
+    Set=true // note: Set for `function name`
+};
+var isloop = {While=true, Repeat=true, Fornum=true, Forin=true};
+var isblock = {Do=true, While=true, Repeat=true, If=true, Fornum=true, Forin=true, Function=true};
+function M.related_keywords(ast, top_ast, tokenlist, src) {
+  // Expand or contract AST for certain contained statements.
+  var more;
+  if( ast.tag == 'Return' ) {
+    // if `return` selected, that consider containing function selected (if any)
+    if( ! ast.parent ) { LA.mark_parents(top_ast); }
+    var ancestor_ast = ast.parent;
+    while( ancestor_ast != null && ancestor_ast.tag != 'Function' ) {
+      ancestor_ast = ancestor_ast.parent;
+    }
+    if( ancestor_ast ) { ast = ancestor_ast; } // but only change if exists
+  } else if( ast.tag == 'Break' ) {
+    // if `break` selected, that consider containing loop selected
+    if( ! ast.parent ) { LA.mark_parents(top_ast); }
+    var ancestor_ast = ast.parent;
+    while( ancestor_ast != null && ! isloop[ancestor_ast.tag] ) {
+      ancestor_ast = ancestor_ast.parent;
+    }
+    ast = ancestor_ast;
+  } else if( ast.tag == 'Set' ) {
+    var val1_ast = ast[2][1];
+    if( val1_ast.tag == 'Function' ) {
+      var token = tokenlist[LA.ast_idx_range_in_tokenlist(tokenlist, ast)];
+      if( token.tag == 'Keyword' && token[1] == 'function' ) { // function with syntactic sugar `function f`
+        ast = ast[2][1]; // select `Function node
+      } else {
+        more = true;
+      }
+    } else {
+      more = true;
+    }
+  } else if( ast.tag == 'Localrec' && ast[2][1].tag == 'Function' ) {
+    // if `local function f` selected, which becomes a `Localrec, consider `Function node.
+    ast = ast[2][1];
+    //IMPROVE: only contract ast if `function` part of `local function` is selected.
+  } else {
+    more = true;
+  }
+  if( more ) { // not yet handled
+    // Consider containing block.
+    if( ! ast.parent ) { LA.mark_parents(top_ast); }
+    var ancestor_ast = ast;
+    while( ancestor_ast != top_ast && ! isblock[ancestor_ast.tag] ) {
+      ancestor_ast = ancestor_ast.parent;
+    }
+    ast = ancestor_ast;
+  }
+
+  //  keywords in statement/block.
+  if( iskeystat[ast.tag] ) {
+    var keywords = {};
+    for( i=1,#tokenlist ) {
+     var token = tokenlist[i];
+     if( token.ast == ast && token.tag == 'Keyword' ) {
+       keywords[#keywords+1] = token;
+     }
+    }
+
+    // Expand keywords for certaining statements.
+    if( ast.tag == 'Function' ) {
+      // if `Function, also select 'function' and 'return' keywords
+      var function f(ast) {
+        for( _,cast in ipairs(ast) ) {
+          if( type(cast) == 'table' ) {
+            if( cast.tag == 'Return' ) {
+              var token = tokenlist[LA.ast_idx_range_in_tokenlist(tokenlist, cast)];
+              keywords[#keywords+1] = token;
+            } else if( cast.tag != 'Function' ) { f(cast); }
+          }
+        }
+      }
+      f(ast);
+      if( ! ast.parent ) { LA.mark_parents(top_ast); }
+      var grand_ast = ast.parent.parent;
+      if( grand_ast.tag == 'Set' ) {
+        var token = tokenlist[LA.ast_idx_range_in_tokenlist(tokenlist, grand_ast)];
+        if( token.tag == 'Keyword' && token[1] == 'function' ) {
+          keywords[#keywords+1] = token;
+        }
+      } else if( grand_ast.tag == 'Localrec' ) {
+        var tidx = LA.ast_idx_range_in_tokenlist(tokenlist, grand_ast);
+        do { tidx +=   1; } while(!( ! tokenlist[tidx] || (tokenlist[tidx].tag == 'Keyword' && tokenlist[tidx][1] == 'function')) );
+        var token = tokenlist[tidx];
+        keywords[#keywords+1] = token;
+      }
+    } else if( isloop[ast.tag] ) {
+      // if loop, also select 'break' keywords
+      var function f(ast) {
+        for( _,cast in ipairs(ast) ) {
+          if( type(cast) == 'table' ) {
+            if( cast.tag == 'Break' ) {
+              var tidx = LA.ast_idx_range_in_tokenlist(tokenlist, cast);
+              keywords[#keywords+1] = tokenlist[tidx];
+            } else if( ! isloop[cast.tag]  ) { f(cast); }
+          }
+        }
+      }
+      f(ast);
+    }
+
+    return keywords, ast;
+  }
+  return null, ast;
+}
+
+
+// Mark tokenlist (top_ast/tokenlist/src) with keywordid AST attributes.
+// All keywords related to each other have the same keyword ID integer.
+// NOTE: This is not done/undone by inspect/uninspect.
+// CATEGORY: keyword comprehension
+function M.mark_related_keywords(top_ast, tokenlist, src) {
+  var id = 0;
+  var idof = {};
+  for( _, token in ipairs(tokenlist) ) {
+    if( token.tag == 'Keyword' && ! idof[token] ) {
+      id +=   1;
+      var match_ast =
+        LA.smallest_ast_containing_range(top_ast, tokenlist, token.fpos, token.lpos);
+      var ktokenlist = M.related_keywords(match_ast, top_ast, tokenlist, src);
+      if( ktokenlist ) {
+         for( _, ktoken in ipairs(ktokenlist) ) {
+          ktoken.keywordid = id;
+          idof[ktoken] = true;
+        }
+      }
+      // note: related_keywords may return a keyword set not containing given keyword.
+    }
+  }
+}
+
+
+// function for t[k]
+var function tindex(_1, _2) { return _1[_2]; }
+
+var unescape = {['d'] = '.'};
+
+
+
+// Sets known value on ast to v if ast not pegged.
+// CATEGORY: utility function for infer_values.
+var function set_value(ast, v) {
+  if( ! ast.isvaluepegged ) {
+    ast.value = v;
+  }
+}
+
+
+var function known(o) {
+  return ! T.istype[o];
+}
+var function unknown(o) {
+  return T.istype[o];
+}
+
+
+// CATEGORY: utility function for infer_values.
+var function tastnewindex(t_ast, k_ast, v_ast) {
+  if( known(t_ast.value) && known(k_ast.value) && known(v_ast.value) ) {
+    var _1, _2, _3 = t_ast.value, k_ast.value, v_ast.value;
+    if( _1[_2] != null && _3 != _1[_2] ) { // multiple values
+      return T.universal;
+    } else {
+      _1[_2] = _3;
+      return _3;
+    }
+  } else {
+    return T.universal;
+  }
+}
+
+
+// Gets expected number of parameters for function (min, max) values.
+// In case of vararg, max is unknown and set to nil.
+var function function_param_range(ast) {
+  var names_ast = ast[1];
+  if( #names_ast >= 1 && names_ast[#names_ast].tag == 'Dots' ) {
+    return #names_ast-1, null;
+  } else {
+    return #names_ast, #names_ast;
+  }
+}
+
+// Gets number of arguments to function call: (min, max) range.
+// In case of trailing vararg or function call, max is unknown and set to nil.
+var function call_arg_range(ast) {
+  if( ast.tag == 'Invoke' ) {
+    if( #ast >= 3 &&
+      (ast[#ast].tag == 'Dots' || ast[#ast].tag == 'Call' || ast[#ast].tag == 'Invoke')
+    ) {
+      return #ast-2, null;
+    } else {
+      return #ast-1, #ast-1;
+    }
+  } else {
+    if( #ast >= 2 &&
+      (ast[#ast].tag == 'Dots' || ast[#ast].tag == 'Call' || ast[#ast].tag == 'Invoke')
+    ) {
+      return #ast-2, null;
+    } else {
+      return #ast-1, #ast-1;
+    }
+  }
+}
+
+
+// Reports warning. List of strings.
+var function warn(report, ...) {
+  report('warning: ' .. table.concat({...}, ' '));
+}
+
+// Reports status messages. List of strings.
+var function status(report, ...) {
+  report('status: ' .. table.concat({...}, ' '));
+}
+
+// unique value used to detect require loops (A require B require A)
+var REQUIRE_SENTINEL = function() { };
+
+// Gets single return value of chunk ast.  Assumes ast is inspected.
+var function chunk_return_value(ast) {
+  var vinfo;
+      if( ENABLE_RETURN_ANALYSIS ) {
+        var info = M.debuginfo[ast.value];
+        var retvals = info && info.retvals;
+        if( retvals ) {
+          vinfo = retvals[1];
+        } else {
+          vinfo = T.universal;
+        }
+      } else {
+        if( ast[#ast] && ast[#ast].tag == 'Return' && ast[#ast][1] ) {
+          vinfo = ast[#ast][1];
+        } else {
+          vinfo = T.universal;
+        }
+      }
+  return vinfo;
+}
+
+// Version of require that does source analysis (inspect) on module.
+function M.require_inspect(name, report, spath) {
+  var plinfo = M.package_loaded[name];
+  if( plinfo == REQUIRE_SENTINEL ) {
+     warn(report, "loop in require when loading " .. name);
+     return null;
+  }
+  if( plinfo ) { return plinfo[1]; }
+  status(report, 'loading:' .. name);
+  M.package_loaded[name] = REQUIRE_SENTINEL; // avoid recursion on require loops
+  var msrc, mpath = load_module_source(name, spath);
+  var vinfo, mast;
+  if( msrc ) {
+    var err; mast, err = LA.ast_from_string(msrc, mpath);
+    if( mast ) {
+      var mtokenlist = LA.ast_to_tokenlist(mast, msrc);
+      M.inspect(mast, mtokenlist, msrc, report);
+      vinfo = chunk_return_value(mast);
+    } else {
+      vinfo = T.error(err);
+      warn(report, err, " ", mpath); //Q:error printing good?
+    }
+  } else {
+    warn(report, 'module not found: ' .. name);
+    vinfo = T.error('module not found'); //IMPROVE: include search paths?
+  }
+  M.package_loaded[name] = {vinfo, mast};
+  return vinfo, mast;
+}
+
+
+// Marks AST node and all children as dead (ast.isdead).
+var function mark_dead(ast) {
+  LA.walk(ast, function(bast) { bast.isdead = true; });
+}
+
+// Gets list of `Return statement ASTs in `Function (or chunk) f_ast, not including
+// return's in nested functions.  Also returns boolean `has_implicit` indicating
+// whether function may return by exiting the function without a return statement.
+// Returns that are never exected are omitted (e.g. last return is omitted in
+// `function f() if x then return 1 else return 2 end return 3 end`).
+// Also marks AST nodes with ast.isdead (dead-code).
+var function get_func_returns(f_ast) {
+  var isalwaysreturn = {};
+  var returns = {};
+  var function f(ast, isdead) {
+    for( _,cast in ipairs(ast) ) { if( type(cast) == 'table' ) {
+      if( isdead ) { mark_dead(cast); } // even if DETECT_DEADCODE disabled
+      if( cast.tag != 'Function' && ! isdead ) { // skip nested functions
+        f(cast, isdead); // depth-first traverse
+      }
+      if( ast.tag != 'If' && isalwaysreturn[cast] ) { isdead = true; }
+        // subsequent statements in block never executed
+    } }
+
+    // Code on walking up AST: propagate children to parents
+    if( ast.tag == 'Return' ) {
+      returns[#returns+1] = ast;
+      isalwaysreturn[ast] = true;
+    } else if( ast.tag == 'If' ) {
+      if( #ast%2 != 0 ) { // has 'else' block
+        var isreturn = true;
+        for( i=2,#ast ) {
+          if( (i%2==0 || i==#ast) && ! isalwaysreturn[ast[i]] ) { isreturn = null; break; }
+        }
+        isalwaysreturn[ast] = isreturn;
+      }
+    } else { // note: iterates not just blocks, but should be ok
+      for( i=1,#ast ) {
+        if( isalwaysreturn[ast[i]] ) {
+          isalwaysreturn[ast] = true; break;
+        }
+      }
+    }
+  }
+  f(f_ast, false);
+  var block_ast = f_ast.tag == 'Function' && f_ast[2] || f_ast;
+  var has_implicit = ! isalwaysreturn[block_ast];
+  return returns, has_implicit;
+}
+
+// temporary hack?
+var function valnode_normalize(valnode) {
+  if( valnode ) {
+    return valnode.value;
+  } else {
+    return T.none;
+  }
+}
+
+
+// Gets return value at given return argument index, given list of `Return statements.
+// Return value is a superset of corresponding types in list of statements.
+// Example: {`Return{1,2,3}, `Return{1,3,'z'}} would return
+// 1, T.number, and T.universal for retidx 1, 2 and 3 respectively.
+var function get_return_value(returns, retidx) {
+  if( #returns == 0 ) { return T.none;
+  } else if( #returns == 1 ) {
+    return valnode_normalize(returns[1][retidx]);
+  } else {
+    var combined_value = valnode_normalize(returns[1][retidx]);
+    for( i=2,#returns ) {
+      var cur_value = valnode_normalize(returns[i][retidx]);
+      combined_value = T.superset_types(combined_value, cur_value);
+      if( combined_value == T.universal ) { // can't expand set further
+          return combined_value;
+      }
+    }
+    return combined_value;
+    //TODO: handle values with possibly any number of return values, like f()
+  }
+}
+
+
+// Gets return values (or types) on `Function (or chunk) represented by given AST.
+var function get_func_return_values(f_ast) {
+  var returns, has_implicit = get_func_returns(f_ast);
+  if( has_implicit ) { returns[#returns+1] = {tag='Return'}; }
+  var returnvals = {n=0};
+  for( retidx=1,math.huge ) {
+    var value = get_return_value(returns, retidx);
+    if( value == T.none ) { break; }
+    returnvals[#returnvals+1] = value;
+    returnvals.n = returnvals.n + 1;
+  }
+  return returnvals;
+}
+// Example: AST of `function(x) if x then return 1,2,3 else return 1,3,"z" end end`
+// returns {1, T.number, T.universal}.
+
+
+// Given list of values, return the first nvalues values plus the rest of the values
+// as a tuple.   Useful for things like
+//  local ok, values = valuesandtuple(1, pcall(f))
+// CATEGORY: utility function (list)
+var function valuesandtuple(nvalues, ...) {
+  if( nvalues >= 1 ) {
+    return (...), valuesandtuple(nvalues-1, select(2, ...));
+  } else {
+    return {n=select('#', ...), ...};
+  }
+}
+
+
+// Infers values of variables. Also marks dead code (ast.isdead).
+//FIX/WARNING - this probably needs more work
+// Sets top_ast.valueglobals, ast.value, ast.valueself
+// CATEGORY: code interpretation
+function M.infer_values(top_ast, tokenlist, src, report) {
+  if( ! top_ast.valueglobals ) { top_ast.valueglobals = {}; }
+
+
+  // infer values
+  LA.walk(top_ast, function(ast) { // walk down
+    if( ast.tag == 'Function' ) {
+      var paramlist_ast = ast[1];
+      for( i=1,#paramlist_ast ) { var param_ast = paramlist_ast[i];
+        if( param_ast.value == null ) { param_ast.value = T.universal; }
+      }
+    }
+  }, function(ast) { // walk up
+    // process `require` statements.
+    if( ast.tag == 'Local' || ast.tag == 'Localrec' ) {
+      var vars_ast, values_ast = ast[1], ast[2];
+      var valuelist = #values_ast > 0 && values_ast[#values_ast].valuelist;
+      for( i=1,#vars_ast ) {
+        var var_ast, value_ast = vars_ast[i], values_ast[i];
+        var value;
+        if( value_ast ) {
+          value = value_ast.value;
+        } else if( valuelist ) {
+          var vlidx = i - #values_ast + 1;
+          value = valuelist.sizeunknown && vlidx > valuelist.n && T.universal || valuelist[vlidx];
+        }
+        set_value(var_ast, value);
+      }
+    } else if( ast.tag == 'Set' ) { // note: implementation similar to 'Local'
+      var vars_ast, values_ast = ast[1], ast[2];
+      var valuelist = #values_ast > 0 && values_ast[#values_ast].valuelist;
+      for( i=1,#vars_ast ) {
+        var var_ast, value_ast = vars_ast[i], values_ast[i];
+        var value;
+        if( value_ast ) {
+          value = value_ast.value;
+        } else if( valuelist ) {
+          var vlidx = i - #values_ast + 1;
+          value = valuelist.sizeunknown && vlidx > valuelist.n && T.universal || valuelist[vlidx];
+        }
+        if( var_ast.tag == 'Index' ) {
+          var t_ast, k_ast = var_ast[1], var_ast[2];
+          if( ! T.istype[t_ast.value] ) { // note: don't mutate types
+            var v_ast = {value=value};
+            var ok;  ok, var_ast.value = pzcall(tastnewindex, {t_ast, k_ast, v_ast}, t_ast, k_ast, v_ast);
+            if( ! ok ) { var_ast.value = T.error(var_ast.value); }
+              //FIX: propagate to localdefinition?
+          }
+        } else {
+          assert(var_ast.tag == 'Id', var_ast.tag);
+          if( var_ast.localdefinition ) {
+            set_value(var_ast, value);
+          } else { // global
+            var name = var_ast[1];
+            top_ast.valueglobals[name] = value;
+          }
+        }
+        //FIX: propagate to definition or localdefinition?
+      }
+    } else if( ast.tag == 'Fornum' ) {
+      var var_ast = ast[1];
+      set_value(var_ast, T.number);
+    } else if( ast.tag == 'Forin' ) {
+      var varlist_ast, iter_ast = ast[1], ast[2];
+      if( #iter_ast == 1 && iter_ast[1].tag == 'Call' && iter_ast[1][1].value == ipairs ) {
+        for( i, var_ast in ipairs(varlist_ast) ) {
+          if( i == 1 ) { set_value(var_ast, T.number);
+          // handle the type of the value as the type of the first element
+          // in the table that is a parameter for ipairs
+          } else if( i == 2 ) {
+            var t_ast = iter_ast[1][2];
+            var value = T.universal;
+            if( (known(t_ast.value) || T.istabletype[t_ast.value]) ) {
+              var ok; ok, value = pzcall(tindex, {t_ast, {tag='Number', 1}}, t_ast.value, 1);
+              if( ! ok ) { value = T.error(t_ast.value); }
+            }
+            set_value(var_ast, value);
+          } else { set_value(var_ast, null); }
+        }
+      } else if( #iter_ast == 1 && iter_ast[1].tag == 'Call' && iter_ast[1][1].value == pairs ) {
+        var t_ast = iter_ast[1][2];
+        var value = T.universal;
+        var key;
+        if( t_ast.value && (known(t_ast.value) || T.istabletype[t_ast.value]) ) {
+          key = next(t_ast.value);
+          var ok; ok, value = pzcall(tindex, {t_ast, {tag='String', key}}, t_ast.value, key);
+          if( ! ok ) { value = T.error(t_ast.value); }
+        }
+
+        for( i, var_ast in ipairs(varlist_ast) ) {
+          if( i == 1 ) { set_value(var_ast, type(key));
+          } else if( i == 2 ) { set_value(var_ast, value);
+          } else { set_value(var_ast, null); }
+        }
+      } else { // general case, unknown iterator
+        for( _, var_ast in ipairs(varlist_ast) ) {
+          set_value(var_ast, T.universal);
+        }
+      }
+    } else if( ast.tag == 'Id' ) {
+      if( ast.localdefinition ) {
+        var localdefinition = ast.localdefinition;
+        if( ! localdefinition.isset ) { // IMPROVE: support non-const (isset false) too
+          set_value(ast, localdefinition.value);
+        }
+      } else { // global
+        var name = ast[1];
+        var v = top_ast.valueglobals[name];
+        if( v != null ) {
+          ast.value = v;
+        } else {
+          var ok; ok, ast.value = pzcall(tindex, {{tag='Id', '_G'}, {tag='String', name}}, _G, name);
+          if( ! ok ) { ast.value = T.error(ast.value); }
+        }
+      }
+    } else if( ast.tag == 'Index' ) {
+      var t_ast, k_ast = ast[1], ast[2];
+      if( (known(t_ast.value) || T.istabletype[t_ast.value]) && known(k_ast.value) ) {
+        var ok; ok, ast.value = pzcall(tindex, {t_ast, k_ast}, t_ast.value, k_ast.value);
+        if( ! ok ) { ast.value = T.error(ast.value); }
+      }
+    } else if( ast.tag == 'Call' || ast.tag == 'Invoke' ) {
+      // Determine function to call (infer via index if method call).
+      var isinvoke = ast.tag == 'Invoke';
+      if( isinvoke ) {
+        var t, k = ast[1].value, ast[2].value;
+        if( known(t) && known(k) ) {
+          var ok; ok, ast.valueself = pzcall(tindex, {ast[1], ast[2]}, t, k);
+          if( ! ok ) { ast.valueself = T.error(ast.valueself); }
+        }
+      }
+      var func; if( isinvoke ) { func = ast.valueself; } else { func = ast[1].value; }
+
+      // Handle function call.
+      var argvalues_concrete = true; {  // true iff all arguments known precisely.
+        if( #ast >= 2 ) {
+          var firstargvalue; if( isinvoke ) { firstargvalue = ast.valueself; } else { firstargvalue = ast[2].value; }
+          if( unknown(firstargvalue) ) {
+            argvalues_concrete = false;
+          } else {  // test remaining args
+            for( i=3,#ast ) { if( unknown(ast[i].value) ) { argvalues_concrete = false; break; } }
+          }
+        }
+      }
+      var found;
+      if( known(func) && argvalues_concrete ) { // attempt call with concrete args
+        // Get list of values of arguments.
+        var argvalues; {
+          argvalues = {n=#ast-1}; for( i=1,argvalues.n ) { argvalues[i] = ast[i+1].value; }
+          if( isinvoke ) { argvalues[1] = ast.valueself; } // `self`
+        }
+        // Any call to require is handled specially (source analysis).
+        if( func == require && type(argvalues[1]) == 'string' ) {
+          var spath = tostring(ast.lineinfo.first)->gsub('<C|','<')->match('<([^|]+)'); // a HACK? relies on AST lineinfo
+          var val, mast = M.require_inspect(argvalues[1], report, spath->gsub('[^\\/]+$', ''));
+          if( known(val) && val != null ) {
+            ast.value = val;
+            found = true;
+          } // note: on nil value, assumes analysis failed (not found). This is a heuristic only.
+          if( mast && mast.valueglobals ) { ast.valueglobals = mast.valueglobals; }
+        }
+        // Attempt call if safe.
+        if( ! found && (LS.safe_function[func] || func == pcall && LS.safe_function[argvalues[1]]) ) {
+          var ok; ok, ast.valuelist = valuesandtuple(1, pcall(func, unpack(argvalues,1,argvalues.n)));
+          ast.value = ast.valuelist[1]; if( ! ok ) { ast.value = T.error(ast.value); }
+          found = true;
+        }
+      }
+      if( ! found ) {
+        // Attempt mock function.  Note: supports nonconcrete args too.
+        var mf = LS.mock_functions[func];
+        if( mf ) {
+          ast.valuelist = mf.outputs; ast.value = ast.valuelist[1];
+        } else {
+          // Attempt infer from return statements in function source.
+          var info = M.debuginfo[func];
+          if( ! info ) { // try match from dynamic debug info
+            var dinfo = type(func) == 'function' && debug.getinfo(func);
+            if( dinfo ) {
+              var source, linedefined = dinfo.source, dinfo.linedefined;
+              if( source && linedefined ) {
+                var sourceline = source .. ':' .. linedefined;
+                info = M.debuginfo[sourceline];
+              }
+            }
+          }
+          var retvals = info && info.retvals;
+          if( retvals ) {
+            ast.valuelist = retvals; ast.value = ast.valuelist[1];
+          } else {
+            // Could not infer.
+            ast.valuelist = {n=0, sizeunknown=true}; ast.value = T.universal;
+          }
+        }
+      }
+    } else if( ast.tag == 'String' || ast.tag == 'Number' ) {
+      ast.value = ast[1];
+    } else if( ast.tag == 'True' || ast.tag == 'False' ) {
+      ast.value = (ast.tag == 'True');
+    } else if( ast.tag == 'Function' || ast == top_ast ) { // includes chunk
+      if( ast.value == null ) { // avoid redefinition
+        var x;
+        var val = function() { x=null; };
+        var fpos = LA.ast_pos_range(ast, tokenlist);
+        var source, linenum = tostring(ast.lineinfo.first)->gsub('<C|','<')->match('<([^|]+)|L(%d+)'); // a HACK? relies on AST lineinfo
+        var retvals;
+        if( ENABLE_RETURN_ANALYSIS ) {
+          retvals = get_func_return_values(ast); //Q:move outside of containing conditional?
+        }
+        var info = {fpos=fpos, source="@" .. source, fast=ast, tokenlist=tokenlist, retvals=retvals, top_ast = top_ast};
+        M.debuginfo[val] = info;
+        var sourceline = '@' .. source .. ':' .. linenum;
+        var oldinfo = M.debuginfo[sourceline];
+        if( oldinfo ) {
+          if( oldinfo.fast != ast ) {
+            // Two functions on the same source line cannot necessarily be disambiguated.
+            // Unfortuntely, Lua debuginfo lacks exact character position.
+            //   http://lua-users.org/lists/lua-l/2010-08/msg00273.html
+            // So, just disable info if ambiguous.  Note: a slight improvement is to use the lastlinedefined.
+            M.debuginfo[sourceline] = false;
+          }
+        } else {
+          if( oldinfo == null ) {
+            M.debuginfo[sourceline] = info;  // store by sourceline too for quick lookup from dynamic debug info
+          }  // else false (do nothing)
+        }
+        ast.value = val;
+        ast.nocollect = info; // prevents garbage collection while ast exists
+      }
+    } else if( ast.tag == 'Table' ) {
+      if( ast.value == null ) { // avoid redefinition
+        var value = {};
+        var n = 1;
+        for( _,east in ipairs(ast) ) {
+          if( east.tag == 'Pair' ) {
+            var kast, vast = east[1], east[2];
+            if( known(kast.value) && known(vast.value) ) {
+              if( kast.value == null ) {
+                // IMPROVE? warn in some way?
+              } else {
+                value[kast.value] = vast.value;
+              }
+            }
+          } else {
+            if( known(east.value) ) {
+              value[n] = east.value;
+            }
+            n +=   1;
+          }
+        }
+        //table.foreach(value, print)
+        ast.value = value;
+      }
+    } else if( ast.tag == 'Paren' ) {
+      ast.value = ast[1].value;
+    } else if( ast.tag == 'Op' ) {
+      var opid, aast, bast = ast[1], ast[2], ast[3];
+      var ok;
+      if( bast ) {
+        ok, ast.value = pzcall(dobinop, {aast, bast}, opid, aast.value, bast.value);
+      } else {
+        ok, ast.value = pzcall(dounop, {aast}, opid, aast.value);
+      }
+      if( ! ok ) { ast.value = T.error(ast.value); }
+    } else if( ast.tag == 'If' ) {
+      // detect dead-code
+      if( DETECT_DEADCODE ) {
+        for( i=2,#ast,2 ) { var valnode = ast[i-1];
+          var bval = T.boolean_cast(valnode.value);
+          if( bval == false ) { // certainly false
+            mark_dead(ast[i]);
+          } else if( bval == true ) { // certainly true
+            for( ii=i+1,#ast ) { if( ii%2 == 0 || ii==#ast ) { // following blocks are dead
+              mark_dead(ast[ii]);
+            } }
+            break;
+          }
+        }
+      }
+      // IMPROVE? `if true return end; f()` - f could be marked as deadcode
+    } else if( ast.tag == 'While' ) {
+      // detect dead-code
+      if( DETECT_DEADCODE ) {
+        var expr_ast, body_ast = ast[1], ast[2];
+        if( T.boolean_cast(expr_ast.value) == false ) {
+          mark_dead(body_ast);
+        }
+      }
+    }
+  });
+}
+
+
+// Labels variables with unique identifiers.
+// Sets ast.id, ast.resolvedname
+// CATEGORY: code interpretation
+function M.mark_identifiers(ast) {
+  var id = 0;
+  var seen_globals = {};
+  LA.walk(ast, function(ast) {
+    if( ast.tag == 'Id' || ast.isfield ) {
+      if( ast.localdefinition ) {
+        if( ast.localdefinition == ast ) { // lexical definition
+          id +=   1;
+          ast.id = id;
+        } else {
+          ast.id = ast.localdefinition.id;
+        }
+      } else if( ast.isfield ) {
+        var previousid = ast.previous.id;
+        if( ! previousid ) { // note: ("abc"):upper() has no previous ID
+          id +=   1;
+          previousid = id;
+        }
+        var name = previousid .. '.' .. ast[1]->gsub('%%', '%%')->gsub('%.', '%d');
+        if( ! seen_globals[name] ) {
+          id +=   1;
+          seen_globals[name] = id;
+        }
+        ast.id = seen_globals[name];
+
+        // also resolve name
+        var previousresolvedname = ast.previous.resolvedname;
+        if( previousresolvedname ) {
+          ast.resolvedname = previousresolvedname .. '.' .. ast[1]->gsub('%%', '%%')->gsub('%.', '%d');
+        }
+      } else { // global
+        var name = ast[1];
+        if( ! seen_globals[name] ) {
+          id +=   1;
+          seen_globals[name] = id;
+        }
+        ast.id = seen_globals[name];
+
+        // also resolve name
+        ast.resolvedname = ast[1];
+      }
+    }
+  });
+}
+
+
+// Environment in which to execute special comments (see below).
+var env = setmetatable({}, {__index=_G});
+env.context = env;
+
+env.number = T.number;
+env.string = T.string;
+env.boolean = T.boolean;
+env.error = T.error;
+
+
+// Applies value to all identifiers with name matching pattern.
+// This command is callable inside special comments.
+// CATEGORY: code interpretation / special comment command
+function env.apply_value(pattern, val) {
+  var function f(ast) {
+    if( ast.tag == 'Id' && ast[1]->match(pattern) ) {
+      ast.value = val; ast.isvaluepegged = true;
+    }
+    for( _,bast in ipairs(ast) ) {
+      if( type(bast) == 'table' ) {
+        f(bast);
+      }
+    }
+  }
+  f(env.ast); // ast from environment
+  //UNUSED:
+  // for i=env.asti, #env.ast do
+  //  local bast = env.ast[i]
+  //  if type(bast) == 'table' then f(bast) end
+  //end
+}
+
+
+// Evaluates all special comments (i.e. comments prefixed by '!') in code.
+// This is similar to luaanalyze.
+// CATEGORY: code interpretation / special comments
+function M.eval_comments(ast, tokenlist, report) {
+  var function eval(command, ast) {
+    //DEBUG('!', command:gsub('%s+$', ''), ast.tag)
+    var f, err = COMPAT.load(command, null, 't', env);
+    if( f ) {
+      env.ast = ast;
+      var ok, err = pcall(f, ast);
+      if( ! ok ) { warn(report, err, ': ', command); }
+      env.ast = null;
+   } else {
+     warn(report, err, ': ', command);
+    }
+  }
+
+  for( idx=1,#tokenlist ) {
+    var token = tokenlist[idx];
+    if( token.tag == 'Comment' ) {
+      var command = token[1]->match('^!(.*)');
+      if( command ) {
+        var mast = LA.smallest_ast_containing_range(ast, tokenlist, token.fpos, token.lpos);
+        eval(command, mast);
+      }
+    }
+  }
+}
+//IMPROVE: in `do f() --[[!g()]] h()` only apply g to h.
+
+
+
+
+// Partially undoes effects of inspect().
+// Note: does not undo mark_tag2 and mark_parents (see replace_statements).
+// CATEGORY: code interpretation
+function M.uninspect(top_ast) {
+  // remove ast from M.debuginfo
+  for( k, info in pairs(M.debuginfo) ) {
+    if( info && info.top_ast == top_ast ) {
+      M.debuginfo[k] = null;
+    }
+  }
+
+  // Clean ast.
+  LA.walk(top_ast, function(ast) {
+    // undo inspect_globals.globals
+    ast.localdefinition = null;
+    ast.functionlevel = null;
+    ast.isparam = null;
+    ast.isset = null;
+    ast.isused = null;
+    ast.isignore = null;
+    ast.isfield = null;
+    ast.previous = null;
+    ast.localmasked = null;
+    ast.localmasking = null;
+
+    // undo mark_identifiers
+    ast.id = null;
+    ast.resolvedname = null;
+
+    // undo infer_values
+    ast.value = null;
+    ast.valueself = null;
+    ast.valuelist = null;
+    ast.isdead = null;   // via get_func_returns
+    ast.isvaluepegged = null;
+
+    // undo walk setting ast.seevalue
+    ast.seevalue = null;
+
+    // undo walk setting ast.definedglobal
+    ast.definedglobal = null;
+
+    // undo notes
+    ast.note = null;
+
+    ast.nocollect = null;
+
+    // undo infer_values
+    ast.valueglobals = null;
+  });
+}
+
+
+// Main inspection routine.  Inspects top_ast/tokenlist.
+// Error/status messages are sent to function `report`.
+// CATEGORY: code interpretation
+function M.inspect(top_ast, tokenlist, src, report) {
+  //DEBUG: local t0 = os.clock()
+  if( ! report ) { // compat for older version of lua-inspect
+    assert('inspect signature changed; please upgrade your code');
+  }
+
+  report = report || function() { };
+
+  var globals = LG.globals(top_ast);
+
+  M.mark_identifiers(top_ast);
+
+  M.eval_comments(top_ast, tokenlist, report);
+
+  M.infer_values(top_ast, tokenlist, src, report);
+  M.infer_values(top_ast, tokenlist, src, report); // two passes to handle forward declarations of globals (IMPROVE: more passes?)
+
+  // Make some nodes as having values related to its parent.
+  // This allows clicking on `bar` in `foo.bar` to display
+  // the value of `foo.bar` rather than just "bar".
+  LA.walk(top_ast, function(ast) {
+    if( ast.tag == 'Index' ) {
+      ast[2].seevalue = ast;
+    } else if( ast.tag == 'Invoke' ) {
+      ast[2].seevalue = {value=ast.valueself, parent=ast};
+    }
+  });
+
+  var function eval_name_helper(name) {
+    var _v_var = _G;
+    for( part in (name .. '.')->gmatch("([^.]*)%.") ) {
+      part = part->gsub('%%(.)', unescape);
+      if( type(_v_var) != 'table' && type(_v_var) != 'userdata' ) { return null; }  //TODO:improve?
+      _v_var = _v_var[part];
+      if( _v_var == null ) { return null; }
+    }
+    return _v_var;
+  }
+  var function eval_name(name) {
+    var ok, o = pzcall(eval_name_helper, {}, name);
+    if( ok ) { return o; } else { return null; }
+  }
+
+  LA.walk(top_ast, function(ast) {
+    if( top_ast != ast && ast.valueglobals ) {
+      for( k in pairs(ast.valueglobals) ) { globals[k] = {set = ast}; }
+      ast.valueglobals = null;
+    }
+    if( ast.tag == 'Id' || ast.isfield ) {
+      var vname = ast[1];
+      //TODO: rename definedglobal to definedfield for clarity
+      var atype = ast.localdefinition && 'local' || ast.isfield && 'field' || 'global';
+      var definedglobal = ast.resolvedname && eval_name(ast.resolvedname) != null ||
+                 atype == 'global' && (globals[vname] && globals[vname].set) || null;
+      ast.definedglobal = definedglobal;
+      // FIX: _G includes modules imported by inspect.ljs, which is not desired
+    } else if( ast.tag == 'Call' || ast.tag == 'Invoke' ) {
+      // Argument count check.
+      var value = ast.valueself || ast[1].value;
+      var info = M.debuginfo[value];
+      var fast = info && info.fast;
+      if( fast || LS.argument_counts[value] ) {
+        var nparammin, nparammax;
+        if( fast ) {
+          nparammin, nparammax = function_param_range(info.fast);
+        } else {
+          nparammin, nparammax = unpack(LS.argument_counts[value]);
+        }
+        var nargmin, nargmax = call_arg_range(ast);
+        //print('DEBUG:', nparammin, nparammax, nargmin, nargmax)
+        var iswarn;
+        var target_ast = ast.tag == 'Call' && ast[1] || ast[2];
+        if( (nargmax || math.huge) < nparammin ) {
+          ast.note = "Too few arguments; ";
+          iswarn = true;
+        } else if( nargmin > (nparammax || math.huge) ) {
+          ast.note = "Too many arguments; ";
+          iswarn = true;
+        }
+        if( iswarn ) {
+          ast.note = ast.note ..  "expected "
+            .. nparammin .. (nparammax == nparammin && "" || " to " .. (nparammax || "infinity"))
+            .. " but got "
+            .. nargmin .. (nargmax == nargmin && "" || " to " .. (nargmax || "infinity")) .. ".";
+        }
+      }
+    }
+  });
+}
+
+
+// Resolves identifier to value [*]
+function M.resolve_id(id, scope, valueglobals, _G) {
+  var val;
+  if( scope[id] ) {
+    val = scope[id].value;
+  } else if( valueglobals[id] != null ) {
+    val = valueglobals[id];
+  } else {
+    val = _G[id]; // assumes not raise
+  }
+  return val;
+}
+
+// Resolves prefix chain expression to value. [*]
+// On error returns nil and error object
+function M.resolve_prefixexp(ids, scope, valueglobals, _G) {
+  var _1 = M.resolve_id(ids[1], scope, valueglobals, _G);
+  var ok, err = pzcall(function() {
+    for( i=2,#ids ) {
+      _1 = _1[ids[i]];
+    }
+  }, {});
+  if( err ) { return null, err || '?'; }
+  return _1;
+}
+
+// Gets local scope at given 1-indexed char position
+function M.get_scope(pos1, ast, tokenlist) {
+  var mast, isafter = LA.current_statementblock(ast, tokenlist, pos1);
+  var scope = LG.variables_in_scope(mast, isafter);
+  return scope;
+}
+
+// Gets names in prefix expression ids (as returned by resolve_prefixexp). [*]
+function M.names_in_prefixexp(ids, pos, ast, tokenlist) {
+  var scope = M.get_scope(pos, ast, tokenlist);
+  //FIX: above does not handle `for x=1,2 do| print(x) end` where '|' is cursor position.
+  var names = {};
+  if( #ids == 0 ) { // global
+    for( name in pairs(scope) ) { names[#names+1] = name; }
+    for( name in pairs(ast.valueglobals) ) { names[#names+1] = name; }
+    for( name in pairs(_G) ) { names[#names+1] = name; }
+  } else {  // field
+    var t, err_ = M.resolve_prefixexp(ids, scope, ast.valueglobals, _G);
+    if( type(t) == 'table' ) {  // note: err_ implies false here
+      for( name in pairs(t) ) { names[#names+1] = name; }
+    }
+  }
+  return names;
+}
+
+// Gets signature (function argument string or helpinfo string) on value.
+// Returns nil on not found.
+function M.get_signature_of_value(value) {
+  var info = M.debuginfo[value]; // first try this
+  if( info && info.fast ) {
+    var fidx, lidx = LA.ast_idx_range_in_tokenlist(info.tokenlist, info.fast[1]);
+    var ts = {};
+    if( fidx ) {
+      for( i=fidx,lidx ) {
+        var token = info.tokenlist[i];
+        ts[#ts+1] = token.tag == 'Dots' && '...' || token[1];
+      }
+    }
+    var sig = 'function(' .. table.concat(ts, ' ') .. ')';
+    if( info.retvals ) {
+      var vals = info.retvals;
+      var ts = {};
+      if( vals.n == 0 ) {
+        sig = sig .. " no returns";
+      } else {
+        for( i=1,vals.n ) { var val = vals[i];
+          ts[#ts+1] = T.istype[val] && tostring(val) || LD.dumpstring(val); //Q:dumpstring too verbose?
+        }
+        sig = sig .. " returns " .. table.concat(ts, ", ");
+      }
+    }
+    return sig;
+  }
+  var sig = LS.value_signatures[value]; // else try this
+  return sig;
+}
+
+
+// Gets signature (function argument string or helpinfo string) on variable ast.
+// Returns nil on not found.
+function M.get_signature(ast) {
+  if( known(ast.value) ) {
+    return M.get_signature_of_value(ast.value);
+  }
+}
+
+
+// Gets 1-indexed character (or line) position and filename of
+// definition associated with AST node (if any).
+function M.ast_to_definition_position(ast, tokenlist) {
+  var local_ast = ast.localdefinition;
+  var fpos, fline, path;
+  if( local_ast ) {
+    var tidx = LA.ast_idx_range_in_tokenlist(tokenlist, local_ast);
+    if( tidx ) {
+      var spath = tostring(ast.lineinfo.first)->gsub('<C|','<')->match('<([^|]+)'); // a HACK? using lineinfo
+      fpos = tokenlist[tidx].fpos; path = spath;
+    }
+  }
+  if( ! fpos ) {
+    var valueast = ast.seevalue || ast;
+    var val = valueast && valueast.value;
+    var info = M.debuginfo[val] || type(val) == 'function' && debug.getinfo(val);
+    if( info ) {
+      if( info.source->match('^@') ) {
+        path = info.source->match('@(.*)');
+        if( info.linedefined ) {
+          fline = info.linedefined;
+        } else {
+          fpos = info.fpos;
+        }
+      }
+    }
+  }
+  return fpos, fline, path;
+}
+
+
+// Returns true iff value in ast node is known in some way.
+function M.is_known_value(ast) {
+  var vast = ast.seevalue || ast;
+  return vast.definedglobal || known(vast.value) && vast.value != null;
+}
+
+
+// Gets list of variable attributes for AST node.
+function M.get_var_attributes(ast) {
+  var vast = ast.seevalue || ast;
+  var attributes = {};
+  if( ast.localdefinition ) {
+    attributes[#attributes+1] = "local";
+    if( ast.localdefinition.functionlevel < ast.functionlevel ) {
+      attributes[#attributes+1] = 'upvalue';
+    }
+    if( ast.localdefinition.isparam ) {
+      attributes[#attributes+1] = "param";
+    }
+    if( ! ast.localdefinition.isused ) { attributes[#attributes+1] = 'unused'; }
+    if( ast.isignore ) { attributes[#attributes+1] = 'ignore'; }
+    if( ast.localdefinition.isset ) { attributes[#attributes+1] = 'mutatebind';
+    } else { attributes[#attributes+1] = 'constbind'; }
+    if( ast.localmasking ) {
+      attributes[#attributes+1] = "masking";
+    }
+    if( ast.localmasked ) {
+      attributes[#attributes+1] = "masked";
+    }
+  } else if( ast.tag == 'Id' ) { // global
+    attributes[#attributes+1] = (M.is_known_value(vast) && "known" || "unknown");
+    attributes[#attributes+1] = "global";
+  } else if( ast.isfield ) {
+    attributes[#attributes+1] = (M.is_known_value(vast) && "known" || "unknown");
+    attributes[#attributes+1] = "field";
+  } else {
+    attributes[#attributes+1] = "FIX"; // shouldn't happen?
+  }
+  if( vast.parent && (vast.parent.tag == 'Call' || vast.parent.tag == 'Invoke')
+         && vast.parent.note
+  ) {
+    attributes[#attributes+1] = 'warn';
+  }
+  return attributes;
+}
+
+
+// Gets detailed information about value in AST node, as string.
+function M.get_value_details(ast, tokenlist, src) {
+  var lines = {};
+
+  if( ! ast ) { return '?'; }
+
+  var vast = ast.seevalue || ast;
+
+  lines[#lines+1] = "attributes: " .. table.concat(M.get_var_attributes(ast), " ");
+
+  lines[#lines+1] = "value: " .. tostring(vast.value);
+
+  var sig = M.get_signature(vast);
+  if( sig ) {
+    var kind = sig->find ('%w%s*%b()$')  && 'signature' || 'description';
+    lines[#lines+1] = kind .. ": " .. sig;
+  }
+
+  var fpos, fline, path = M.ast_to_definition_position(ast, tokenlist);
+  if( fpos || fline ) {
+    var fcol;
+    if( fpos ) {
+      fline, fcol = LA.pos_to_linecol(fpos, src);
+    }
+    var location = path .. ":" .. (fline) .. (fcol && ":" .. fcol || "");
+    lines[#lines+1] = "location defined: " .. location;
+  }
+  
+  if( ast.localdefinition && ast.localmasking ) {
+      var fpos = LA.ast_pos_range(ast.localmasking, tokenlist);
+      if( fpos ) {
+        var linenum = LA.pos_to_linecol(fpos, src);
+        lines[#lines+1] = "masking definition at line: " .. linenum;
+      }
+  }
+
+  // Render warning notes attached to calls/invokes.
+  var note = vast.parent && (vast.parent.tag == 'Call' || vast.parent.tag == 'Invoke')
+                    && vast.parent.note;
+  if( note ) {
+    lines[#lines+1] = "WARNING: " .. note;
+  }
+
+  return table.concat(lines, "\n");
+}
+
+
+// Gets list of all warnings, as strings.
+// In HTML Tidy format (which supports column numbers in SciTE, although is
+// slightly verbose and lacks filename).
+function M.list_warnings(tokenlist, src) {
+  var warnings = {};
+  var ttoken;
+  var function warn(msg) {
+    var linenum, colnum = LA.pos_to_linecol(ttoken.fpos, src);
+    warnings[#warnings+1] = "line " .. linenum .. " column " .. colnum .. " - " .. msg;
+  }
+  var isseen = {};
+  for( i,token in ipairs(tokenlist) ) { ttoken = token;
+    if( token.ast ) {
+      var ast = token.ast;
+      if( ast.localmasking ) {
+        var pos = LA.ast_pos_range(ast.localmasking, tokenlist);
+        var linenum = pos && LA.pos_to_linecol(pos, src);
+        warn("local " .. ast[1] .. " masks another local" .. (pos && " on line " .. linenum || ""));
+      }
+      if( ast.localdefinition == ast && ! ast.isused && ! ast.isignore ) {
+        warn("unused local " .. ast[1]);
+      }
+      if( ast.isfield && !(known(ast.seevalue.value) && ast.seevalue.value != null) ) {
+        warn("unknown field " .. ast[1]);
+      } else if( ast.tag == 'Id' && ! ast.localdefinition && ! ast.definedglobal ) {
+        warn("unknown global " .. ast[1]);
+      }
+      var vast = ast.seevalue || ast;
+      var note = vast.parent && (vast.parent.tag == 'Call' || vast.parent.tag == 'Invoke')
+                    && vast.parent.note;
+      if( note && ! isseen[vast.parent] ) {
+        isseen[vast.parent] = true;
+        var esrc = LA.ast_to_text(vast.parent, tokenlist, src);
+           // IMPROVE: large items like `f(function() ... end)` may be shortened.
+        warn(note .. (esrc && "for " .. esrc || ""));
+      }
+    }
+  }
+  return warnings;
+}
+
+
+return M;

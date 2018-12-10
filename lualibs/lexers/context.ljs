@@ -1,0 +1,59 @@
+// Copyright 2006-2013 Robert Gieseke. See LICENSE.
+// ConTeXt LPeg lexer.
+
+var l = require('lexer');
+var token, word_match = l.token, l.word_match;
+var P, R, S = lpeg.P, lpeg.R, lpeg.S;
+
+var M = {_NAME = 'context'};
+
+// Whitespace.
+var ws = token(l.WHITESPACE, l.space**1);
+
+// Comments.
+var comment = token(l.COMMENT, '%' * l.nonnewline**0);
+
+// Commands.
+var command = token(l.KEYWORD, '\\' * (l.alpha**1 + S('#$&~_^%{}')));
+
+// Sections.
+var section = token('section', '\\' * word_match({
+  'part', 'chapter', 'section', 'subsection', 'subsubsection', 'title',
+  'subject', 'subsubject', 'subsubsubject'
+}));
+
+// ConTeXt environments.
+var environment = token('environment', '\\' * (P('start') + 'stop') * l.word);
+
+// Operators.
+var operator = token(l.OPERATOR, S('$&#{}[]'));
+
+M._rules = {
+  {'whitespace', ws},
+  {'comment', comment},
+  {'environment', environment},
+  {'section', section},
+  {'keyword', command},
+  {'operator', operator},
+};
+
+M._tokenstyles = {
+  environment = l.STYLE_KEYWORD,
+  section = l.STYLE_CLASS
+};
+
+M._foldsymbols = {
+  _patterns = {'\\start', '\\stop', '[{}]', '%%'},
+  ['environment'] = {['\\start'] = 1, ['\\stop'] = -1},
+  [l.OPERATOR] = {['{'] = 1, ['}'] = -1},
+  [l.COMMENT] = {['%'] = l.fold_line_comments('%')}
+};
+
+// Embedded Lua.
+var luatex = l.load('lua');
+var luatex_start_rule = #P('\\startluacode') * environment;
+var luatex_end_rule = #P('\\stopluacode') * environment;
+l.embed_lexer(M, luatex, luatex_start_rule, luatex_end_rule);
+
+
+return M;

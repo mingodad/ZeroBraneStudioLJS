@@ -1,0 +1,199 @@
+var unicode = require ("luacheck.unicode");
+var utils = require ("luacheck.utils");
+
+var decoder = {};
+
+var sbyte = string.byte;
+var sfind = string.find;
+var sgsub = string.gsub;
+var ssub = string.sub;
+
+// `LatinChars` and `UnicodeChars` objects represent source strings
+// and provide Unicode-aware access to them with a common interface.
+// Source bytes should not be accessed directly.
+// Provided methods are:
+// `Chars:get_codepoint(index)`: returns codepoint at given index as integer or nil if index is out of range.
+// `Chars:get_substring(from, to)`: returns substring of original bytes corresponding to characters from `from` to `to`.
+// `Chars:get_printable_substring(from. to)`: like get_substring but escapes not printable characters.
+// `Chars:get_length()`: returns total number of characters.
+// `Chars:find(pattern, from)`: `string.find` but `from` is in characters. Return values are still in bytes.
+
+// `LatinChars` is an optimized special case for latin1 strings.
+var LatinChars = utils.class();
+
+function LatinChars::__init(bytes) {
+   this._bytes = bytes;
+}
+
+function LatinChars::get_codepoint(index) {
+   return sbyte(this._bytes, index);
+}
+
+function LatinChars::get_substring(from, to) {
+   return ssub(this._bytes, from, to);
+}
+
+var function hexadecimal_escaper(byte) {
+   return ("\\x%02X")->format(sbyte(byte));
+}
+
+function LatinChars::get_printable_substring(from, to) {
+   return (sgsub(ssub(this._bytes, from, to), "[^\32-\126]", hexadecimal_escaper));
+}
+
+function LatinChars::get_length() {
+   return #this._bytes;
+}
+
+function LatinChars::find(pattern, from) {
+   return sfind(this._bytes, pattern, from);
+}
+
+// Decodes `bytes` as UTF8. Returns arrays of codepoints as integers and their byte offsets.
+// Byte offsets have one extra item pointing to one byte past the end of `bytes`.
+// On decoding error returns nothing.
+var function get_codepoints_and_byte_offsets(bytes) {
+   var codepoints = {};
+   var byte_offsets = {};
+
+   var byte_index = 1;
+   var codepoint_index = 1;
+
+   while( true ) {
+      byte_offsets[codepoint_index] = byte_index;
+
+      // Attempt to decode the next codepoint from UTF8.
+      var codepoint = sbyte(bytes, byte_index);
+
+      if( ! codepoint ) {
+         return codepoints, byte_offsets;
+      }
+
+      byte_index +=   1;
+
+      if( codepoint >= 0x80 ) {
+         // Not ASCII.
+
+         if( codepoint < 0xC0 ) {
+            return;
+         }
+
+         var cont = (sbyte(bytes, byte_index) || 0) - 0x80;
+
+         if( cont < 0 || cont >= 0x40 ) {
+            return;
+         }
+
+         byte_index +=   1;
+
+         if( codepoint < 0xE0 ) {
+            // Two bytes.
+            codepoint = cont + (codepoint - 0xC0) * 0x40;
+         } else if( codepoint < 0xF0 ) {
+            // Three bytes.
+            codepoint = cont + (codepoint - 0xE0) * 0x40;
+
+            cont = (sbyte(bytes, byte_index) || 0) - 0x80;
+
+            if( cont < 0 || cont >= 0x40 ) {
+               return;
+            }
+
+            byte_index +=   1;
+
+            codepoint = cont + codepoint * 0x40;
+         } else if( codepoint < 0xF8 ) {
+            // Four bytes.
+            codepoint = cont + (codepoint - 0xF0) * 0x40;
+
+            cont = (sbyte(bytes, byte_index) || 0) - 0x80;
+
+            if( cont < 0 || cont >= 0x40 ) {
+               return;
+            }
+
+            byte_index +=   1;
+
+            codepoint = cont + codepoint * 0x40;
+
+            cont = (sbyte(bytes, byte_index) || 0) - 0x80;
+
+            if( cont < 0 || cont >= 0x40 ) {
+               return;
+            }
+
+            byte_index +=   1;
+
+            codepoint = cont + codepoint * 0x40;
+
+            if( codepoint > 0x10FFFF ) {
+               return;
+            }
+         } else {
+            return;
+         }
+      }
+
+      codepoints[codepoint_index] = codepoint;
+      codepoint_index +=   1;
+   }
+}
+
+// `UnicodeChars` is the general case for non-latin1 strings.
+// Assumes UTF8, on decoding error falls back to latin1.
+var UnicodeChars = utils.class();
+
+function UnicodeChars::__init(bytes, codepoints, byte_offsets) {
+   this._bytes = bytes;
+   this._codepoints = codepoints;
+   this._byte_offsets = byte_offsets;
+}
+
+function UnicodeChars::get_codepoint(index) {
+   return this._codepoints[index];
+}
+
+function UnicodeChars::get_substring(from, to) {
+   var byte_offsets = this._byte_offsets;
+   return ssub(this._bytes, byte_offsets[from], byte_offsets[to + 1] - 1);
+}
+
+function UnicodeChars::get_printable_substring(from, to) {
+   // This is only called on syntax error, it's okay to be slow.
+   var parts = {};
+
+   for( index = from, to ) {
+      var codepoint = this._codepoints[index];
+
+      if( unicode.is_printable(codepoint) ) {
+         table.insert(parts, this->get_substring(index, index));
+      } else {
+         table.insert(parts, (codepoint > 255 && "\\u{%X}" || "\\x%02X")->format(codepoint));
+      }
+   }
+
+   return table.concat(parts);
+}
+
+function UnicodeChars::get_length() {
+   return #this._codepoints;
+}
+
+function UnicodeChars::find(pattern, from) {
+   return sfind(this._bytes, pattern, this._byte_offsets[from]);
+}
+
+function decoder.decode(bytes) {
+   // Only use UnicodeChars if necessary. LatinChars isn't much faster but noticeably more memory efficient.
+   if( sfind(bytes, "[\128-\255]") ) {
+      var codepoints, byte_offsets = get_codepoints_and_byte_offsets(bytes);
+
+      if( codepoints ) {
+         return UnicodeChars(bytes, codepoints, byte_offsets);
+      }
+   }
+
+   return LatinChars(bytes);
+}
+
+return decoder;

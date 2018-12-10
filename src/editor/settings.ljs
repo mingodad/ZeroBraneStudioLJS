@@ -1,0 +1,574 @@
+// Copyright 2011-16 Paul Kulchenko, ZeroBrane LLC
+// authors: Lomtik Software (J. Winwood & John Labenski)
+// Luxinia Dev (Eike Decker & Christoph Kubisch)
+//-------------------------------------------------------
+
+var ide = ide;
+var layoutlabel = {
+  UIMANAGER = "uimgrlayout",
+  NOTEBOOK = "nblayout",
+  NOTEBOOKOUTPUT = "nbbtmlayout",
+  NOTEBOOKPROJECT = "nbprojlayout",
+  DOCKNOTEBOOK = "nbdocklayout",
+  DOCKNOTEBOOKOUTPUT = "nbbtmdocklayout",
+  DOCKNOTEBOOKPROJECT = "nbprojdocklayout",
+  STATUSBAR = "statusbar",
+};
+
+// ----------------------------------------------------------------------------
+// Initialize the wxConfig for loading/saving the preferences
+
+var ini = ide.config.ini;
+// if ini path is relative and includes a directory name, make it relative to the IDE location
+ini = ini && (! wx.wxIsAbsolutePath(ini) && wx.wxFileName(ini)->GetDirCount() > 0
+  && MergeFullPath(GetPathWithSep(ide.editorFilename), ini) || ini);
+// check that the ini file doesn't point to a directory
+if( ini && (wx.wxFileName(ini)->IsDir() || wx.wxIsAbsolutePath(ini) && wx.wxDirExists(ini)) ) {
+  ide->Print(("Can't use 'ini' configuration setting '%s' that points to a directory instead of a file; ignored.")
+    ->format(ini));
+  ini = null;
+}
+// check that the directory is writable
+if( ini && wx.wxIsAbsolutePath(ini) && ! wx.wxFileName(ini)->IsDirWritable() ) {
+  ide->Print(("Can't use 'ini' configuration setting '%s' that points to a non-writable directory; ignored.")
+    ->format(ini));
+  ini = null;
+}
+
+var settings = wx.wxFileConfig(
+  ide->GetProperty("settingsapp"), ide->GetProperty("settingsvendor"), ini || "");
+ide.settings = settings;
+
+var function settingsReadSafe(settings,what,default) {
+  var cr,out = settings->Read(what,default);
+  return cr && out || default;
+}
+
+// ----------------------------------------------------------------------------
+// wxConfig load/save preferences functions
+
+function SettingsRestoreFramePosition(window, windowName) {
+  var path = settings->GetPath();
+  settings->SetPath("/"..windowName);
+
+  var s = tonumber(select(2,settings->Read("s", -1)));
+  var x = tonumber(select(2,settings->Read("x", 0)));
+  var y = tonumber(select(2,settings->Read("y", 0)));
+  var w = tonumber(select(2,settings->Read("w", 1100)));
+  var h = tonumber(select(2,settings->Read("h", 700)));
+
+  if( (s != -1) ) {
+    var clientX, clientY, clientWidth, clientHeight = wx.wxClientDisplayRect();
+
+    // if left-top corner outside of the left-top side, reset it to the screen side
+    if( x < clientX ) { x = clientX; }
+    if( y < clientY ) { y = clientY; }
+
+    // if the window is too wide for the screen, reset it to the screen size
+    if( w > clientWidth ) { w = clientWidth; }
+    if( h > clientHeight ) { h = clientHeight; }
+
+    // if the right-bottom corner is still outside and there is only one display,
+    // then reposition left-top corner, keeping the window centered
+    if( wx.wxDisplay()->GetCount() == 1 ) {
+      var outx = (x + w) - (clientX + clientWidth);
+      var outy = (y + h) - (clientY + clientHeight);
+      if( outx > 0 ) { x = math.floor(0.5+(x - outx)/2); }
+      if( outy > 0 ) { y = math.floor(0.5+(y - outy)/2); }
+    }
+
+    window->SetSize(x, y, w, h);
+  }
+
+  // maximize after setting window position to make sure it's maximized on the correct monitor
+  if( s == 1 ) { window->Maximize(true); }
+
+  settings->SetPath(path);
+}
+
+function SettingsSaveFramePosition(window, windowName) {
+  var path = settings->GetPath();
+  settings->SetPath("/"..windowName);
+
+  var s = 0;
+  var w, h = window->GetSizeWH();
+  var x, y = window->GetPositionXY();
+
+  if( window->IsMaximized() ) {
+    s = 1;
+  } else if( window->IsIconized() ) {
+    s = 2;
+  }
+
+  settings->Write("s", s==2 && 0 || s); // iconized maybe - but that shouldnt be saved
+  settings->Write("x", x);
+  settings->Write("y", y);
+  settings->Write("w", w);
+  settings->Write("h", h);
+
+  settings->SetPath(path);
+}
+
+//-
+// (table) SettingsRestoreFileHistory (function)
+// restores a list of recently loaded documents from the settings table
+// a table is returned which contains tables each with a filename key, pointing to
+// the filename
+function SettingsRestoreFileHistory(fntab) {
+  var path = settings->GetPath();
+  var listname = "/filehistory";
+  settings->SetPath(listname);
+
+  var outtab = {};
+  var inlist = {};
+  for( id=1,ide.config.filehistorylength ) {
+    var couldread, name = settings->Read(tostring(id), "");
+    if( ! couldread || name == "" ) { break; }
+    if( ! inlist[name] ) {
+      inlist[name] = true;
+      table.insert(outtab,{filename = name});
+    }
+  }
+
+  if( fntab ) { fntab(outtab); }
+
+  settings->SetPath(path);
+
+  return outtab;
+}
+
+function SettingsSaveFileHistory (filehistory) {
+  var listname = "/filehistory";
+  var path = settings->GetPath();
+  settings->DeleteGroup(listname);
+  settings->SetPath(listname);
+
+  for( i,doc in ipairs(filehistory) ) {
+    settings->Write(tostring(i), doc.filename);
+  }
+
+  settings->SetPath(path);
+}
+
+//-
+// () SettingsRestoreFileSession (function [, string section])
+// restores a list of opened files from the file settings
+// calls the given function with the restored table, a list
+// of tables containing tables like
+// {filename = "filename", cursorpos = <cursor position>}
+function SettingsRestoreFileSession(fntab, section) {
+  var listname = section || "/session";
+  var path = settings->GetPath();
+  settings->SetPath(listname);
+  var outtab = {};
+  var params = {};
+  var ismore, key, index = settings->GetFirstEntry("", 0);
+  while( (ismore) ) {
+    var couldread, value = settings->Read(key, "");
+    if( tonumber(key) ) {
+      var fname,cursorpos = value->match("^(.+);(.-)$");
+      if( (couldread && value != "") ) {
+        outtab[tonumber(key)] =
+          {filename = fname || value, cursorpos = tonumber(cursorpos) || 0};
+      }
+    } else {
+      params[key] = tonumber(value) || value;
+    }
+    ismore, key, index = settings->GetNextEntry(index);
+  }
+
+  if( fntab ) { fntab(outtab, params); }
+
+  settings->SetPath(path);
+
+  return outtab;
+}
+
+//-
+// () SettingsSaveFileSession (table opendocs, table params [, string section])
+// saves the list of currently opened documents (passed in the opendocs table)
+// in the settings.
+function SettingsSaveFileSession(opendocs, params, section) {
+  var listname = section || "/session";
+  var path = settings->GetPath();
+  settings->DeleteGroup(listname);
+  settings->SetPath(listname);
+
+  for( i,doc in ipairs(opendocs) ) {
+    settings->Write(tostring(i), doc.filename..";"..doc.cursorpos);
+  }
+
+  // save all other parameters
+  for( k,v in pairs(params) ) { settings->Write(k, v); }
+
+  settings->SetPath(path);
+}
+
+//-
+// () SettingsRestoreProjectSession (function)
+function SettingsRestoreProjectSession(fntab) {
+  var listname = "/projectsession";
+  var path = settings->GetPath();
+  settings->SetPath(listname);
+  var outtab = {};
+  var couldread = true;
+  var id = 1;
+  var name;
+  while( (couldread) ) {
+    couldread, name = settings->Read(tostring(id), "");
+    couldread = couldread && name != "";
+    if( (couldread) ) {
+      if( (wx.wxDirExists(name)) ) {
+        table.insert(outtab,name);
+
+        var function projsession(...) { ProjectConfig(name, {...}); }
+        SettingsRestoreFileSession(projsession, listname .. "/" .. tostring(id));
+      }
+      id +=   1;
+    }
+  }
+
+  if( fntab ) { fntab(outtab); }
+
+  settings->SetPath(path);
+
+  return outtab;
+}
+
+//-
+// () SettingsSaveProjectSession (table projdirs)
+// saves the list of currently active projects
+// in the settings.
+function SettingsSaveProjectSession(projdirs) {
+  var listname = "/projectsession";
+  var path = settings->GetPath();
+  settings->DeleteGroup(listname);
+  settings->SetPath(listname);
+
+  for( i,dir in ipairs(projdirs) ) {
+    settings->Write(tostring(i), dir);
+
+    var opendocs, params = ProjectConfig(dir);
+    if( opendocs ) {
+      SettingsSaveFileSession(opendocs, params, listname .. "/" .. tostring(i));
+    }
+  }
+
+  settings->SetPath(path);
+}
+
+function SettingsRestorePackage(package) {
+  var packagename = "/package/"..package;
+  var path = settings->GetPath();
+  settings->SetPath(packagename);
+  var outtab = {};
+  var ismore, key, index = settings->GetFirstEntry("", 0);
+  while( (ismore) ) {
+    var couldread, value = settings->Read(key, "");
+    if( couldread ) {
+      var ok, res = LoadSafe("return "..value);
+      if( ok ) { outtab[key] = res;
+      } else {
+        outtab[key] = null;
+        ide->Print(("Couldn't load and ignored '%s' settings for package '%s': %s")
+          ->format(key, package, res));
+      }
+    }
+    ismore, key, index = settings->GetNextEntry(index);
+  }
+  settings->SetPath(path);
+  return outtab;
+}
+
+function SettingsSavePackage(package, values, opts) {
+  var packagename = "/package/"..package;
+  var path = settings->GetPath();
+
+  settings->DeleteGroup(packagename);
+  settings->SetPath(packagename);
+  for( k,v in pairs(values || {}) ) { settings->Write(k, DumpPlain(v, opts)); }
+  settings->SetPath(path);
+}
+
+//---------------------------------
+
+var function saveNotebook(nb) {
+  var cnt = nb->GetPageCount();
+  
+  var function addTo(tab,key,value) {
+    var out = tab[key] || {};
+    table.insert(out,value);
+    tab[key] = out;
+  }
+  
+  var pagesX = {};
+  var pagesY = {};
+  
+  var str = "nblayout|";
+  
+  for( i=1,cnt ) {
+    var id = nb->GetPageText(i-1);
+    var pg = nb->GetPage(i-1);
+    var x,y = pg->GetPosition()->GetXY();
+    addTo(pagesX,x,id);
+    addTo(pagesY,y,id);
+  }
+  
+  var function sortedPages(tab) {
+    var t = {};
+    for( i in pairs(tab) ) {
+      table.insert(t,i);
+    }
+    table.sort(t);
+    return t;
+  }
+  
+  var sortedX = sortedPages(pagesX);
+  var sortedY = sortedPages(pagesY);
+  
+  // for now only support "1D" splits and prefer
+  // dimension which has more, anything else
+  // requires a more complex algorithm, yet to do
+  
+  var pagesUse;
+  var sortedUse;
+  var split;
+  
+  if( ( #sortedX >= #sortedY) ) {
+    pagesUse  = pagesX;
+    sortedUse = sortedX;
+    split = "<X>";
+  } else {
+    pagesUse  = pagesY;
+    sortedUse = sortedY;
+    split = "<Y>";
+  }
+  
+  for( _, v in ipairs(sortedUse) ) {
+    var pages = pagesUse[v];
+    for( _, id in ipairs(pages) ) {
+      str = str..id.."|";
+    }
+    str = str..split.."|";
+  }
+  
+  return str;
+}
+
+var function loadNotebook(nb,str,fnIdConvert) {
+  str = str->match("nblayout|(.+)");
+  if( (! str) ) { return; }
+  var cnt = nb->GetPageCount();
+  var sel = nb->GetSelection();
+
+  // store old pages
+  var currentpages, order = {}, {};
+  for( i=1,cnt ) {
+    var id = nb->GetPageText(i-1);
+    var newid = fnIdConvert && fnIdConvert(id) || id;
+    currentpages[newid] = currentpages[newid] || {};
+    table.insert(currentpages[newid], {page = nb->GetPage(i-1), text = id, index = i-1});
+    order[i] = newid;
+  }
+
+  // remove them
+  for( i=cnt,1,-1 ) { nb->RemovePage(i-1); }
+
+  // read them and perform splits
+  var t = 0;
+  var newsel;
+  var function finishPage(page) {
+    if( (page.index == sel) ) {
+      newsel = t;
+    }
+    t +=   1;
+  }
+
+  var direction;
+  var splits = { X = wx.wxRIGHT, Y = wx.wxBOTTOM };
+  for( cmd in str->gmatch("([^|]+)") ) {
+    var instr = cmd->match("<(%w)>");
+    if( (! instr) ) {
+      var id = fnIdConvert && fnIdConvert(cmd) || cmd;
+      var pageind = next(currentpages[id] || {});
+      if( (pageind) ) {
+        var page = currentpages[id][pageind];
+        currentpages[id][pageind] = null;
+
+        nb->AddPage(page.page, page.text);
+        if( (direction) ) { nb->Split(t, direction); }
+        finishPage(page);
+      }
+    }
+    direction = instr && splits[instr];
+  }
+  
+  // add anything we forgot; make sure page groups are in the order specified
+  for( i=1,cnt ) {
+    var pagelist = currentpages[order[i]];
+    for( _,page in pairs(pagelist) ) {
+      nb->AddPage(page.page, page.text);
+      finishPage(page);
+    }
+  }
+  
+  // set the active page as it was before
+  if( (newsel) ) { nb->SetSelection(newsel); }
+}
+
+function SettingsRestoreView() {
+  var listname = "/view";
+  var path = settings->GetPath();
+  settings->SetPath(listname);
+
+  var frame = ide->GetMainFrame();
+  var uimgr = ide->GetUIManager();
+  
+  var layoutcur = uimgr->SavePerspective();
+  var layout = settingsReadSafe(settings,layoutlabel.UIMANAGER,"");
+  if( (layout != layoutcur) ) {
+    // save the current toolbar besth and re-apply after perspective is loaded
+    // bestw and besth have two separate issues:
+    // (1) layout includes bestw that is only as wide as the toolbar size,
+    // this leaves default background on the right side of the toolbar;
+    // fix it by explicitly replacing with the screen width.
+    // (2) besth may be wrong after icon size changes.
+    var toolbar = uimgr->GetPane("toolbar");
+    var besth = toolbar->IsOk() && tonumber(uimgr->SavePaneInfo(toolbar)->match("besth=([^;]+)"));
+
+    // reload the perspective if the saved one is not empty as it's different from the default
+    if( #layout > 0 ) { uimgr->LoadPerspective(layout, true); }
+
+    var screenw = frame->GetClientSize()->GetWidth();
+    if( toolbar->IsOk() ) { toolbar->BestSize(screenw, besth || -1); }
+
+    // check if debugging panes are not mentioned and float them
+    for( _, name in pairs({"stackpanel", "watchpanel"}) ) {
+      var pane = uimgr->GetPane(name);
+      if( pane->IsOk() && ! layout->find(name) ) { pane->Float(); }
+    }
+
+    // check if the toolbar is not mentioned in the layout and show it
+    for( _, name in pairs({"toolbar"}) ) {
+      var pane = uimgr->GetPane(name);
+      if( pane->IsOk() && ! layout->find(name) ) { pane->Show(); }
+    }
+
+    // remove captions from all panes
+    var panes = uimgr->GetAllPanes();
+    for( index = 0, panes->GetCount()-1 ) {
+      uimgr->GetPane(panes->Item(index).name)->CaptionVisible(false);
+    }
+  }
+
+  frame->GetStatusBar()->Show(settingsReadSafe(settings,layoutlabel.STATUSBAR,true));
+
+  uimgr->Update();
+  
+  layoutcur = saveNotebook(ide->GetOutputNotebook());
+  layout = settingsReadSafe(settings,layoutlabel.NOTEBOOKOUTPUT,layoutcur);
+  if( (layout != layoutcur) ) {
+    loadNotebook(ide->GetOutputNotebook(),layout,
+      // treat "Output (running)" same as "Output"
+      function(name) { return name->match(TR("Output")) || name->match("Output") || name; });
+  }
+
+  layoutcur = saveNotebook(ide->GetProjectNotebook());
+  layout = settingsReadSafe(settings,layoutlabel.NOTEBOOKPROJECT,layoutcur);
+  if( (layout != layoutcur) ) {
+    loadNotebook(ide->GetProjectNotebook(),layout);
+  }
+
+  // always select Output tab
+  var bottomnotebook = ide->GetOutputNotebook();
+  var index = bottomnotebook->GetPageIndex(bottomnotebook.errorlog);
+  if( index >= 0 ) { bottomnotebook->SetSelection(index); }
+
+  layoutcur = saveNotebook(frame.notebook);
+  layout = settingsReadSafe(settings,layoutlabel.NOTEBOOK,layoutcur);
+  if( (layout != layoutcur) ) {
+    loadNotebook(ide.frame.notebook,layout);
+    var openDocuments = ide.openDocuments;
+    var nb = frame.notebook;
+    var cnt = nb->GetPageCount();
+    for( i=0,cnt-1 ) {
+      openDocuments[nb->GetPage(i)->GetId()].index = i;
+    }
+  }
+
+  // restore configuration for notebook pages that have been split;
+  // load saved dock_size values and update current values with saved ones
+  // where dock_size configuration matches
+  for( l, m in pairs({
+    [layoutlabel.DOCKNOTEBOOK] = ide->GetEditorNotebook()->GetAuiManager(),
+    [layoutlabel.DOCKNOTEBOOKOUTPUT] = ide->GetOutputNotebook()->GetAuiManager(),
+    [layoutlabel.DOCKNOTEBOOKPROJECT] = ide->GetProjectNotebook()->GetAuiManager(),
+  }) ) {
+    // ...|dock_size(5,0,0)=20|dock_size(2,1,0)=200|...
+    var prevlayout = settingsReadSafe(settings, l, "");
+    var curlayout = m->SavePerspective();
+    var newlayout = curlayout->gsub('(dock_size[^=]+=)(%d+)', function(t,v) {
+        var val = prevlayout->match(EscapeMagic(t)..'(%d+)');
+        return t..(val || v);
+      });
+    if( newlayout != curlayout ) { m->LoadPerspective(newlayout); }
+  }
+
+  var editor = ide->GetEditor();
+  if( editor ) { editor->SetFocus(); }
+
+  settings->SetPath(path);
+}
+
+function SettingsSaveView() {
+  var listname = "/view";
+  var path = settings->GetPath();
+  settings->DeleteGroup(listname);
+  settings->SetPath(listname);
+
+  var frame = ide.frame;
+  var uimgr = frame.uimgr;
+  
+  settings->Write(layoutlabel.UIMANAGER, uimgr->SavePerspective());
+  settings->Write(layoutlabel.NOTEBOOK, saveNotebook(ide->GetEditorNotebook()));
+  settings->Write(layoutlabel.NOTEBOOKOUTPUT, saveNotebook(ide->GetOutputNotebook()));
+  settings->Write(layoutlabel.NOTEBOOKPROJECT, saveNotebook(ide->GetProjectNotebook()));
+  settings->Write(layoutlabel.DOCKNOTEBOOK, ide->GetEditorNotebook()->GetAuiManager()->SavePerspective());
+  settings->Write(layoutlabel.DOCKNOTEBOOKOUTPUT, ide->GetOutputNotebook()->GetAuiManager()->SavePerspective());
+  settings->Write(layoutlabel.DOCKNOTEBOOKPROJECT, ide->GetProjectNotebook()->GetAuiManager()->SavePerspective());
+  settings->Write(layoutlabel.STATUSBAR, frame->GetStatusBar()->IsShown());
+
+  settings->SetPath(path);
+}
+
+function SettingsRestoreEditorSettings() {
+  var listname = "/editor";
+  var path = settings->GetPath();
+  settings->SetPath(listname);
+
+  var interpreter = settingsReadSafe(settings, "interpreter",
+    ide.config.interpreter || ide.config.default.interpreter);
+  ProjectSetInterpreter(interpreter);
+
+  settings->SetPath(path);
+}
+
+function SettingsSaveEditorSettings() {
+  var listname = "/editor";
+  var path = settings->GetPath();
+  settings->DeleteGroup(listname);
+  settings->SetPath(listname);
+
+  settings->Write("interpreter", ide.interpreter && ide.interpreter.fname || ide.config.default.interpreter);
+
+  settings->SetPath(path);
+}
+
+function SettingsSaveAll() {
+  SettingsSaveFileSession(GetOpenFiles());
+  SettingsSaveEditorSettings();
+  SettingsSaveProjectSession(FileTreeGetProjects());
+  SettingsSaveFileHistory(GetFileHistory());
+  SettingsSaveView();
+  SettingsSaveFramePosition(ide.frame, "MainFrame");
+}

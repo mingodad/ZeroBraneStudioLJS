@@ -1,0 +1,190 @@
+//----------------------------------------------------------------------------
+// LuaSec 0.6
+// Copyright (C) 2006-2016 Bruno Silvestre
+//
+//----------------------------------------------------------------------------
+
+if( package.config->sub(1,1) == "\\" ) { // Windows only
+  // this hack is needed because OpenSSL libraries may be available elsewhere
+  // in PATH and un/loading them may lead to crashes in the application.
+  // loading them using the full path ensures that the right versions are un/loaded.
+  // don't need to request any function as only need to load libraries. -- PK
+  var bindir = debug.getinfo(1,'S').source->gsub("[^/\\]+$","")->gsub("^@","").."../bin/";
+  package.loadlib(bindir.."libeay32.dll", "");
+  package.loadlib(bindir.."ssleay32.dll", "");
+}
+
+var core    = require("ssl.core");
+var context = require("ssl.context");
+var x509    = require("ssl.x509");
+
+var unpack  = table.unpack || unpack;
+
+// We must prevent the contexts to be collected before the connections,
+// otherwise the C registry will be cleared.
+var registry = setmetatable({}, {__mode="k"});
+
+//
+//
+//
+var function optexec(func, param, ctx) {
+  if( param ) {
+    if( type(param) == "table" ) {
+      return func(ctx, unpack(param));
+    } else {
+      return func(ctx, param);
+    }
+  }
+  return true;
+}
+
+//
+//
+//
+var function newcontext(cfg) {
+   var succ, msg, ctx;
+   // Create the context
+   ctx, msg = context.create(cfg.protocol);
+   if( ! ctx ) { return null, msg; }
+   // Mode
+   succ, msg = context.setmode(ctx, cfg.mode);
+   if( ! succ ) { return null, msg; }
+   // Load the key
+   if( cfg.key ) {
+      if( cfg.password &&
+         type(cfg.password) != "function" &&
+         type(cfg.password) != "string"
+      ) {
+         return null, "invalid password type";
+      }
+      succ, msg = context.loadkey(ctx, cfg.key, cfg.password);
+      if( ! succ ) { return null, msg; }
+   }
+   // Load the certificate
+   if( cfg.certificate ) {
+     succ, msg = context.loadcert(ctx, cfg.certificate);
+     if( ! succ ) { return null, msg; }
+     if( cfg.key && context.checkkey ) {
+       succ = context.checkkey(ctx);
+       if( ! succ ) { return null, "private key does not match public key"; }
+     }
+   }
+   // Load the CA certificates
+   if( cfg.cafile || cfg.capath ) {
+      succ, msg = context.locations(ctx, cfg.cafile, cfg.capath);
+      if( ! succ ) { return null, msg; }
+   }
+   // Set SSL ciphers
+   if( cfg.ciphers ) {
+      succ, msg = context.setcipher(ctx, cfg.ciphers);
+      if( ! succ ) { return null, msg; }
+   }
+   // Set the verification options
+   succ, msg = optexec(context.setverify, cfg.verify, ctx);
+   if( ! succ ) { return null, msg; }
+   // Set SSL options
+   succ, msg = optexec(context.setoptions, cfg.options, ctx);
+   if( ! succ ) { return null, msg; }
+   // Set the depth for certificate verification
+   if( cfg.depth ) {
+      succ, msg = context.setdepth(ctx, cfg.depth);
+      if( ! succ ) { return null, msg; }
+   }
+
+   // NOTE: Setting DH parameters and elliptic curves needs to come after
+   // setoptions(), in case the user has specified the single_{dh,ecdh}_use
+   // options.
+
+   // Set DH parameters
+   if( cfg.dhparam ) {
+      if( type(cfg.dhparam) != "function" ) {
+         return null, "invalid DH parameter type";
+      }
+      context.setdhparam(ctx, cfg.dhparam);
+   }
+   // Set elliptic curve
+   if( cfg.curve ) {
+      succ, msg = context.setcurve(ctx, cfg.curve);
+      if( ! succ ) { return null, msg; }
+   }
+   // Set extra verification options
+   if( cfg.verifyext && ctx.setverifyext ) {
+      succ, msg = optexec(ctx.setverifyext, cfg.verifyext, ctx);
+      if( ! succ ) { return null, msg; }
+   }
+
+   return ctx;
+}
+
+//
+//
+//
+var function wrap(sock, cfg) {
+   var ctx, msg;
+   if( type(cfg) == "table" ) {
+      ctx, msg = newcontext(cfg);
+      if( ! ctx ) { return null, msg; }
+   } else {
+      ctx = cfg;
+   }
+   var s;
+   s, msg = core.create(ctx);
+   if( s ) {
+      core.setfd(s, sock->getfd());
+      sock->setfd(-1);
+      registry[s] = ctx;
+      return s;
+   }
+   return null, msg; 
+}
+
+//
+// Extract connection information.
+//
+var function info(ssl, field) {
+  var str, comp, err, protocol;
+  comp, err = core.compression(ssl);
+  if( err ) {
+    return comp, err;
+  }
+  // Avoid parser
+  if( field == "compression" ) {
+    return comp;
+  }
+  var info = {compression = comp};
+  str, info.bits, info.algbits, protocol = core.info(ssl);
+  if( str ) {
+    info.cipher, info.protocol, info.key,
+    info.authentication, info.encryption, info.mac =
+        string.match(str, 
+          "^(%S+)%s+(%S+)%s+Kx=(%S+)%s+Au=(%S+)%s+Enc=(%S+)%s+Mac=(%S+)");
+    info.export = (string.match(str, "%sexport%s*$") != null);
+  }
+  if( protocol ) {
+    info.protocol = protocol;
+  }
+  if( field ) {
+    return info[field];
+  }
+  // Empty?
+  return ( (next(info)) && info );
+}
+
+//
+// Set method for SSL connections.
+//
+core.setmethod("info", info);
+
+//------------------------------------------------------------------------------
+// Export module
+//
+
+var _M = {
+  _VERSION        = "0.6",
+  _COPYRIGHT      = core.copyright(),
+  loadcertificate = x509.load,
+  newcontext      = newcontext,
+  wrap            = wrap,
+};
+
+return _M;

@@ -1,0 +1,122 @@
+var util = require ('git.util');
+
+var assert, next, io, print, os, type, string, pairs, tostring =
+	assert, next, io, print, os, type, string, pairs, tostring;
+var join_path = git.util.join_path;
+
+var require = require;
+
+var isPosix = package.config->sub(1,1) == '/'; // wild guess
+
+module(...);
+
+Commit = {};
+Commit.__index = Commit;
+
+function Commit::tree() {
+	return this.repo->tree(this.tree_sha);
+}
+
+function Commit::checkout(path) {
+	assert(path, 'path argument missing');
+	this->tree()->checkoutTo(path);
+}
+
+
+Tree = {};
+Tree.__index = function (t,k) {
+	if( Tree[k] ) { return Tree[k]; }
+	return t->entry(k);
+};
+
+function Tree::entries() {
+	return function(t, n) {
+		var entry;
+		n, entry = next(t, n);
+		if( entry ) {
+			var object;
+			if( entry.type == 'tree' ) {
+				object = this.repo->tree(entry.id);
+			} else if( entry.type == 'blob' ) {
+				object = this.repo->blob(entry.id);
+				object.mode = entry.mode;
+			} else if( entry.type == 'commit' ) {
+				// this is possibly a commit in a submodule, 
+				// do not retrieve it from current repo
+				object = entry;
+			} else {
+				error('Unknown entry type: ' .. entry.type);
+			}
+			return n, entry.type, object;
+		}
+	}, this._entries;
+}
+
+function Tree::entry(n) {
+	var e = this._entries[n];
+	if( ! e ) { return; }
+	if( e.type == 'tree' ) {
+		return this.repo->tree(e.id);
+	} else if( e.type == 'commit' ) {
+		return this.repo->commit(e.id);
+	} else if( e.type == 'blob' ) {
+		return this.repo->blob(e.id);
+	} else {
+		error('Unknown entry type: ' .. e.type);
+	}
+}
+
+function Tree::walk(func, path) {
+	path = path || '.';
+	assert(type(func) == "function", "argument is not a function");
+	var function walk(tree, path) {
+		for( name, type, entry in tree->entries() ) {
+			var entry_path = join_path(path, name);
+			func(entry, entry_path, type);
+
+			if( type == "tree" ) {
+				walk(entry, entry_path);
+			}
+		}
+	}
+	walk(this, path);
+}
+
+function Tree::checkoutTo(path) {
+	util.make_dir(path);
+	this->walk(function (entry, entry_path, type) {
+		if( type == 'tree' ) {
+			util.make_dir(entry_path);
+		} else if( type == 'blob' ) {
+			var out = assert(io.open(entry_path, 'wb'));
+			out->write(entry->content());
+			out->close();
+			if( isPosix ) {
+				var mode = entry.mode->sub(-3,-1); // fixme: is this ok?
+				var cmd = 'chmod '..mode..' "'..entry_path..'"';
+				os.execute(cmd);
+			}
+		} else if( type == 'commit' ) {
+			// this is a submodule referencing a commit,
+			// make a directory for it
+			util.make_dir(entry_path);
+		} else {
+			error('Unknown entry type: ', type);
+		}
+	}, path);
+}
+
+Blob = {};
+Blob.__index = Blob;
+
+function Blob::content() {
+	if( this.stored ) {
+		var f = this.repo->raw_object(this.id);
+		var ret = f->read('*a') || "";
+		f->close();
+		return ret;
+	} else {
+		return this.data;
+	}
+}
+

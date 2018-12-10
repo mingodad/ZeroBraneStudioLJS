@@ -1,0 +1,298 @@
+//---------------------------------------------------------------------------
+// LTN12 - Filters, sources, sinks and pumps.
+// LuaSocket toolkit.
+// Author: Diego Nehab
+//---------------------------------------------------------------------------
+
+//---------------------------------------------------------------------------
+// Declare module
+//---------------------------------------------------------------------------
+var string = require("string");
+var table = require("table");
+var base = _G;
+var _M = {};
+if( module ) { // heuristic for exporting a global package table
+    ltn12 = _M;
+}
+var filter,source,sink,pump = {},{},{},{};
+
+_M.filter = filter;
+_M.source = source;
+_M.sink = sink;
+_M.pump = pump;
+
+// 2048 seems to be better in windows...
+_M.BLOCKSIZE = 2048;
+_M._VERSION = "LTN12 1.0.3";
+
+//---------------------------------------------------------------------------
+// Filter stuff
+//---------------------------------------------------------------------------
+// returns a high level filter that cycles a low-level filter
+function filter.cycle(low, ctx, extra) {
+    base.assert(low);
+    return function(chunk) {
+        var ret;
+        ret, ctx = low(ctx, chunk, extra);
+        return ret;
+    };
+}
+
+// chains a bunch of filters together
+// (thanks to Wim Couwenberg)
+function filter.chain(...) {
+    var xarg = {...};
+    var n = select('#',...);
+    var top, index = 1, 1;
+    var retry = "";
+    return function(chunk) {
+        retry = chunk && retry;
+        while( true ) {
+            if( index == top ) {
+                chunk = xarg[index](chunk);
+                if( chunk == "" || top == n ) { return chunk;
+                } else if( chunk ) { index +=   1;
+                } else {
+                    top += 1;
+                    index = top;
+                }
+            } else {
+                chunk = xarg[index](chunk || "");
+                if( chunk == "" ) {
+                    index -=   1;
+                    chunk = retry;
+                } else if( chunk ) {
+                    if( index == n ) { return chunk;
+                    } else { index +=   1; }
+                } else { base.error("filter returned inappropriate nil"); }
+            }
+        }
+    };
+}
+
+//---------------------------------------------------------------------------
+// Source stuff
+//---------------------------------------------------------------------------
+// create an empty source
+var function empty() {
+    return null;
+}
+
+function source.empty() {
+    return empty;
+}
+
+// returns a source that just outputs an error
+function source.error(err) {
+    return function() {
+        return null, err;
+    };
+}
+
+// creates a file source
+function source.file(handle, io_err) {
+    if( handle ) {
+        return function() {
+            var chunk = handle->read(_M.BLOCKSIZE);
+            if( ! chunk ) { handle->close(); }
+            return chunk;
+        };
+    } else { return source.error(io_err || "unable to open file"); }
+}
+
+// turns a fancy source into a simple source
+function source.simplify(src) {
+    base.assert(src);
+    return function() {
+        var chunk, err_or_new = src();
+        src = err_or_new || src;
+        if( ! chunk ) { return null, err_or_new;
+        } else { return chunk; }
+    };
+}
+
+// creates string source
+function source.string(s) {
+    if( s ) {
+        var i = 1;
+        return function() {
+            var chunk = string.sub(s, i, i+_M.BLOCKSIZE-1);
+            i +=   _M.BLOCKSIZE;
+            if( chunk != "" ) { return chunk;
+            } else { return null; }
+        };
+    } else { return source.empty(); }
+}
+
+// creates rewindable source
+function source.rewind(src) {
+    base.assert(src);
+    var t = {};
+    return function(chunk) {
+        if( ! chunk ) {
+            chunk = table.remove(t);
+            if( ! chunk ) { return src();
+            } else { return chunk; }
+        } else {
+            table.insert(t, chunk);
+        }
+    };
+}
+
+function source.chain(src, f) {
+    base.assert(src && f);
+    var last_in, last_out = "", "";
+    var state = "feeding";
+    var err;
+    return function() {
+        if( ! last_out ) {
+            base.error('source is empty!', 2);
+        }
+        while( true ) {
+            if( state == "feeding" ) {
+                last_in, err = src();
+                if( err ) { return null, err; }
+                last_out = f(last_in);
+                if( ! last_out ) {
+                    if( last_in ) {
+                        base.error('filter returned inappropriate nil');
+                    } else {
+                        return null;
+                    }
+                } else if( last_out != "" ) {
+                    state = "eating";
+                    if( last_in ) { last_in = ""; }
+                    return last_out;
+                }
+            } else {
+                last_out = f(last_in);
+                if( last_out == "" ) {
+                    if( last_in == "" ) {
+                        state = "feeding";
+                    } else {
+                        base.error('filter returned ""');
+                    }
+                } else if( ! last_out ) {
+                    if( last_in ) {
+                        base.error('filter returned inappropriate nil');
+                    } else {
+                        return null;
+                    }
+                } else {
+                    return last_out;
+                }
+            }
+        }
+    };
+}
+
+// creates a source that produces contents of several sources, one after the
+// other, as if they were concatenated
+// (thanks to Wim Couwenberg)
+function source.cat(...) {
+    var xarg = {...};
+    var src = table.remove(xarg, 1);
+    return function() {
+        while( src ) {
+            var chunk, err = src();
+            if( chunk ) { return chunk; }
+            if( err ) { return null, err; }
+            src = table.remove(xarg, 1);
+        }
+    };
+}
+
+//---------------------------------------------------------------------------
+// Sink stuff
+//---------------------------------------------------------------------------
+// creates a sink that stores into a table
+function sink.table(t) {
+    t = t || {};
+    var f = function(chunk, err) {
+        if( chunk ) { table.insert(t, chunk); }
+        return 1;
+    };
+    return f, t;
+}
+
+// turns a fancy sink into a simple sink
+function sink.simplify(snk) {
+    base.assert(snk);
+    return function(chunk, err) {
+        var ret, err_or_new = snk(chunk, err);
+        if( ! ret ) { return null, err_or_new; }
+        snk = err_or_new || snk;
+        return 1;
+    };
+}
+
+// creates a file sink
+function sink.file(handle, io_err) {
+    if( handle ) {
+        return function(chunk, err) {
+            if( ! chunk ) {
+                handle->close();
+                return 1;
+            } else { return handle->write(chunk); }
+        };
+    } else { return sink.error(io_err || "unable to open file"); }
+}
+
+// creates a sink that discards data
+var function snull() {
+    return 1;
+}
+
+function sink.snull() {
+    return snull;
+}
+
+// creates a sink that just returns an error
+function sink.error(err) {
+    return function() {
+        return null, err;
+    };
+}
+
+// chains a sink with a filter
+function sink.chain(f, snk) {
+    base.assert(f && snk);
+    return function(chunk, err) {
+        if( chunk != "" ) {
+            var filtered = f(chunk);
+            var done = chunk && "";
+            while( true ) {
+                var ret, snkerr = snk(filtered, err);
+                if( ! ret ) { return null, snkerr; }
+                if( filtered == done ) { return 1; }
+                filtered = f(done);
+            }
+        } else { return 1; }
+    };
+}
+
+//---------------------------------------------------------------------------
+// Pump stuff
+//---------------------------------------------------------------------------
+// pumps one chunk from the source to the sink
+function pump.step(src, snk) {
+    var chunk, src_err = src();
+    var ret, snk_err = snk(chunk, src_err);
+    if( chunk && ret ) { return 1;
+    } else { return null, src_err || snk_err; }
+}
+
+// pumps all data from a source to a sink, using a step function
+function pump.all(src, snk, step) {
+    base.assert(src && snk);
+    step = step || pump.step;
+    while( true ) {
+        var ret, err = step(src, snk);
+        if( ! ret ) {
+            if( err ) { return null, err;
+            } else { return 1; }
+        }
+    }
+}
+
+return _M;

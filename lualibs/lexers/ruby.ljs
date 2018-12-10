@@ -1,0 +1,148 @@
+// Copyright 2006-2016 Mitchell mitchell.att.foicica.com. See LICENSE.
+// Ruby LPeg lexer.
+
+var l = require('lexer');
+var token, word_match = l.token, l.word_match;
+var P, R, S = lpeg.P, lpeg.R, lpeg.S;
+
+var M = {_NAME = 'ruby'};
+
+// Whitespace.
+var ws = token(l.WHITESPACE, l.space**1);
+
+// Comments.
+var line_comment = '#' * l.nonnewline_esc**0;
+var block_comment = l.starts_line('=begin') * (l.any - l.newline * '=end')**0 *
+                      (l.newline * '=end')**-1;
+var comment = token(l.COMMENT, block_comment + line_comment);
+
+var delimiter_matches = {['('] = ')', ['['] = ']', ['{'] = '}'};
+var literal_delimitted = P(function(input, index) {
+  var delimiter = input->sub(index, index);
+  if( ! delimiter->find('[%w\r\n\f\t ]') ) { // only non alpha-numerics
+    var match_pos, patt;
+    if( delimiter_matches[delimiter] ) {
+      // Handle nested delimiter/matches in strings.
+      var s, e = delimiter, delimiter_matches[delimiter];
+      patt = l.delimited_range(s..e, false, false, true);
+    } else {
+      patt = l.delimited_range(delimiter);
+    }
+    match_pos = lpeg.match(patt, input, index);
+    return match_pos || #input + 1;
+  }
+});
+
+// Strings.
+var cmd_str = l.delimited_range('`');
+var lit_cmd = '%x' * literal_delimitted;
+var lit_array = '%w' * literal_delimitted;
+var sq_str = l.delimited_range("'");
+var dq_str = l.delimited_range('"');
+var lit_str = '%' * S('qQ')**-1 * literal_delimitted;
+var heredoc = '<<' * P(function(input, index) {
+  var s, e, indented, _, delimiter =
+    input->find('(%-?)(["`]?)([%a_][%w_]*)%2[\n\r\f;]+', index);
+  if( s == index && delimiter ) {
+    var end_heredoc = (#indented > 0 && '[\n\r\f]+ *' || '[\n\r\f]+');
+    var _, e = input->find(end_heredoc..delimiter, e);
+    return e && e + 1 || #input + 1;
+  }
+});
+// TODO: regex_str fails with `obj.method /patt/` syntax.
+var regex_str = #P('/') * l.last_char_includes('!%^&*([{-=+|:;,?<>~') *
+                  l.delimited_range('/', true, false) * S('iomx')**0;
+var lit_regex = '%r' * literal_delimitted * S('iomx')**0;
+var string = token(l.STRING, (sq_str + dq_str + lit_str + heredoc + cmd_str +
+                                lit_cmd + lit_array) * S('f')**-1) +
+               token(l.REGEX, regex_str + lit_regex);
+
+var word_char = l.alnum + S('_!?');
+
+// Numbers.
+var dec = l.digit**1 * ('_' * l.digit**1)**0 * S('ri')**-1;
+var bin = '0b' * S('01')**1 * ('_' * S('01')**1)**0;
+var integer = S('+-')**-1 * (bin + l.hex_num + l.oct_num + dec);
+// TODO: meta, control, etc. for numeric_literal.
+var numeric_literal = '?' * (l.any - l.space) * -word_char;
+var number = token(l.NUMBER, l.float * S('ri')**-1 + integer + numeric_literal);
+
+// Keywords.
+var keyword = token(l.KEYWORD, word_match({
+  'BEGIN', 'END', 'alias', 'and', 'begin', 'break', 'case', 'class', 'def',
+  'defined?', 'do', 'else', 'elsif', 'end', 'ensure', 'false', 'for', 'if',
+  'in', 'module', 'next', 'nil', 'not', 'or', 'redo', 'rescue', 'retry',
+  'return', 'self', 'super', 'then', 'true', 'undef', 'unless', 'until', 'when',
+  'while', 'yield', '__FILE__', '__LINE__'
+}, '?!'));
+
+// Functions.
+var func = token(l.FUNCTION, word_match({
+  'at_exit', 'autoload', 'binding', 'caller', 'catch', 'chop', 'chop!', 'chomp',
+  'chomp!', 'eval', 'exec', 'exit', 'exit!', 'fail', 'fork', 'format', 'gets',
+  'global_variables', 'gsub', 'gsub!', 'iterator?', 'lambda', 'load',
+  'local_variables', 'loop', 'open', 'p', 'print', 'printf', 'proc', 'putc',
+  'puts', 'raise', 'rand', 'readline', 'readlines', 'require', 'select',
+  'sleep', 'split', 'sprintf', 'srand', 'sub', 'sub!', 'syscall', 'system',
+  'test', 'trace_var', 'trap', 'untrace_var'
+}, '?!')) * -S('.:|');
+
+// Identifiers.
+var word = (l.alpha + '_') * word_char**0;
+var identifier = token(l.IDENTIFIER, word);
+
+// Variables.
+var global_var = '$' * (word + S('!@L+`\'=~/\\,.;<>_*"$?:') + l.digit + '-' *
+                   S('0FadiIKlpvw'));
+var class_var = '@@' * word;
+var inst_var = '@' * word;
+var variable = token(l.VARIABLE, global_var + class_var + inst_var);
+
+// Symbols.
+var symbol = token('symbol', ':' * P(function(input, index) {
+  if( input->sub(index - 2, index - 2) != ':' ) { return index; }
+}) * (word_char**1 + sq_str + dq_str));
+
+// Operators.
+var operator = token(l.OPERATOR, S('!%^&*()[]{}-=+/|:;.,?<>~'));
+
+M._rules = {
+  {'whitespace', ws},
+  {'keyword', keyword},
+  {'function', func},
+  {'identifier', identifier},
+  {'comment', comment},
+  {'string', string},
+  {'number', number},
+  {'variable', variable},
+  {'symbol', symbol},
+  {'operator', operator},
+};
+
+M._tokenstyles = {
+  symbol = l.STYLE_CONSTANT
+};
+
+var function disambiguate(text, pos, line, s) {
+  return line->sub(1, s - 1)->match('^%s*$') &&
+         ! text->sub(1, pos - 1)->match('\\[ \t]*\r?\n$') && 1 || 0;
+}
+
+M._foldsymbols = {
+  _patterns = {'%l+', '[%(%)%[%]{}]', '=begin', '=end', '#'},
+  [l.KEYWORD] = {
+    begin = 1, class = 1, def = 1, ['do'] = 1, ['for'] = 1, ['module'] = 1,
+    case = 1,
+    ['if'] = disambiguate, ['while'] = disambiguate,
+    ['unless'] = disambiguate, ['until'] = disambiguate,
+    ['end'] = -1
+  },
+  [l.OPERATOR] = {
+    ['('] = 1, [')'] = -1, ['['] = 1, [']'] = -1, ['{'] = 1, ['}'] = -1
+  },
+  [l.COMMENT] = {
+    ['=begin'] = 1, ['=end'] = -1, ['#'] = l.fold_line_comments('#')
+  }
+};
+
+return M;

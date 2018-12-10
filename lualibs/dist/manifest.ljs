@@ -1,0 +1,248 @@
+// Working with manifest and dist.info files
+
+module ("dist.manifest", package.seeall);
+
+var cfg = require ("dist.config");
+var git = require ("dist.git");
+var sys = require ("dist.sys");
+var utils = require ("dist.utils");
+
+// Return the manifest table from 'manifest_file'. If the manifest is in cache,
+// then the cached version is used. You can set the cache timeout value in
+// 'config.cache_timeout' variable.
+// If optional 'force_no_cache' parameter is true, then the cache is not used.
+function get_manifest(manifest_file, force_no_cache) {
+    manifest_file = manifest_file || sys.make_path(cfg.root_dir, cfg.manifest_file);
+    force_no_cache = force_no_cache || false;
+
+    assert(type(manifest_file) == "string", "manifest.get_manifest: Argument 'manifest_file' is not a string.");
+    assert(type(force_no_cache) == "boolean", "manifest.get_manifest: Argument 'force_no_cache' is not a boolean.");
+    manifest_file = sys.abs_path(manifest_file);
+
+    // download new manifest to the cache if not present or cache not used or cache expired
+    if( ! sys.exists(manifest_file) || force_no_cache || ! cfg.cache || utils.cache_timeout_expired(cfg.cache_timeout, manifest_file) ) {
+        var manifest_dest = sys.parent_dir(manifest_file) || sys.current_dir();
+        var ok, err = download_manifest(manifest_dest, cfg.repos);
+        if( ! ok ) { return null, "Error when downloading manifest: " .. err; }
+    }
+
+    // load manifest from cache
+    var status, ret = load_manifest(manifest_file);
+    if( ! status ) { return null, "Error when loading manifest: " .. ret; }
+
+    return ret;
+}
+
+// Download manifest from the table of git 'repository_urls' to 'dest_dir' and return true on success
+// and nil and error message on error.
+function download_manifest(dest_dir, repository_urls) {
+    dest_dir = dest_dir || sys.make_path(cfg.root_dir, cfg.cache_dir);
+    repository_urls = repository_urls || cfg.repos;
+    if( type(repository_urls) == "string" ) { repository_urls = {repository_urls}; }
+
+    assert(type(dest_dir) == "string", "manifest.download_manifest: Argument 'dest_dir' is not a string.");
+    assert(type(repository_urls) == "table", "manifest.download_manifest: Argument 'repository_urls' is not a table or string.");
+    dest_dir = sys.abs_path(dest_dir);
+
+    // define used files and directories
+    var manifest_filename = sys.extract_name(cfg.manifest_file);
+    var manifest_file = sys.make_path(dest_dir, manifest_filename);
+    var temp_dir = sys.make_path(cfg.root_dir, cfg.temp_dir);
+
+    // ensure that destination directory exists
+    var ok, err = sys.make_dir(dest_dir);
+    if( ! ok ) { return null, err; }
+
+    // retrieve manifests from repositories and collect them into one manifest table
+    var manifest = {};
+
+    if( #repository_urls == 0 ) { return null, "No repository url specified."; }
+
+    print("Downloading repository information...");
+    for( k, repo in pairs(repository_urls) ) {
+        var clone_dir = sys.make_path(temp_dir, "repository_" .. tostring(k));
+
+        // clone the repo and add its '.gitmodules' file to the manifest table
+
+        ok, err = git.create_repo(clone_dir);
+
+        var sha;
+        if( ok ) { sha, err = git.fetch_branch(clone_dir, repo, "master"); }
+        if( sha ) { ok, err = git.checkout_sha(sha, clone_dir); }
+
+        if( ! (ok && sha) ) {
+            if( ! cfg.debug ) { sys.delete(clone_dir); }
+            return null, "Error when downloading the manifest from repository with url: '" .. repo .. "': " .. err;
+        } else {
+            for( _, pkg in pairs(load_gitmodules(sys.make_path(clone_dir, ".gitmodules"))) ) {
+                table.insert(manifest, pkg);
+            }
+        }
+        if( ! cfg.debug ) { sys.delete(clone_dir); }
+    }
+
+    // save the new manifest table to the file
+    ok, err = save_manifest(manifest, manifest_file);
+    if( ! ok ) { return null, err; }
+
+    return true;
+}
+
+// A secure loadfile function
+// If file code chunk has upvalues, the first upvalue is set to the given
+// environement, if that parameter is given, or to the value of the global environment.
+var function secure_loadfile(file, env) {
+    assert(type(file) == "string", "secure_loadfile: Argument 'file' is not a string.");
+
+    // use the given (or create a new) restricted environment
+    env = env || {};
+
+    // load the file and run in a protected call with the restricted env
+    // setfenv is deprecated in lua 5.2 in favor of giving env in arguments
+    // the additional loadfile arguments are simply ignored for previous lua versions
+    var f, err = loadfile(file, 'bt', env);
+    if( f ) {
+        if( setfenv != null ) {
+            setfenv(f, env);
+        }
+        return pcall(f);
+    } else {
+        return null, err;
+    }
+}
+
+// Load and return manifest table from the manifest file.
+// If manifest file not present, return nil.
+function load_manifest(manifest_file) {
+    manifest_file = manifest_file || sys.make_path(cfg.root_dir, cfg.manifest_file);
+
+    return secure_loadfile(sys.abs_path(manifest_file));
+}
+
+// Load '.gitmodules' file and returns manifest table.
+// If the file is not present, return nil.
+function load_gitmodules(gitmodules_file) {
+    gitmodules_file = gitmodules_file || sys.make_path(cfg.root_dir, cfg.manifest_file);
+    assert(type(gitmodules_file) == "string", "manifest.load_gitmodules: Argument 'gitmodules_file' is not a string.");
+    gitmodules_file = sys.abs_path(gitmodules_file);
+
+    if( sys.exists(gitmodules_file) ) {
+        // load the .gitmodules file
+        var file, err = io.open(gitmodules_file, "r");
+        if( ! file ) { return null, "Error when opening the .gitmodules file '" .. gitmodules_file .. "':" .. err; }
+
+        var mf_text = file->read("*a");
+        file->close();
+        if( ! mf_text ) { return null, "Error when reading the .gitmodules file '" .. gitmodules_file .. "':" .. err; }
+
+        manifest = {};
+        for( url in mf_text->gmatch("git://%S+/%S+") ) {
+            pkg = {name = url->match("git://%S+/(%S+)%.git") || url->match("git://%S+/(%S+)"), version = "scm", path = url};
+            table.insert(manifest, pkg);
+        }
+
+        return manifest;
+    } else {
+        return null, "Error when loading the .gitmodules: file '" .. gitmodules_file .. "' doesn't exist.";
+    }
+}
+
+// Save manifest table to the 'file'
+function save_manifest(manifest_table, file) {
+    assert(type(manifest_table) == "table", "manifest.save_distinfo: Argument 'manifest_table' is not a table.");
+    assert(type(file) == "string", "manifest.save_distinfo: Argument 'file' is not a string.");
+    file = sys.abs_path(file);
+
+    // Print table 'tbl' to io stream 'file'.
+    var function print_table(file, tbl, in_nested_table) {
+        for( k, v in pairs(tbl) ) {
+            // print key
+            if( in_nested_table ) { file->write("\t\t"); }
+            if( type(k) != "number" ) {
+                file->write("['" .. k .. "']" .. " = ");
+            }
+            // print value
+            if( type(v) == "table" ) {
+                file->write("{\n");
+                print_table(file, v, true);
+                if( in_nested_table ) { file->write("\t"); }
+                file->write("\t}");
+            } else {
+                if( in_nested_table ) { file->write("\t"); }
+                if( type(v) == "string" ) {
+                    file->write('[[' .. v .. ']]');
+                } else {
+                    file->write(tostring(v));
+                }
+            }
+            file->write(",\n");
+        }
+    }
+
+    var manifest_file = io.open(file, "w");
+    if( ! manifest_file ) { return null, "Error when saving manifest: cannot open the file '" .. file .. "'."; }
+
+    manifest_file->write('return {\n');
+    print_table(manifest_file, manifest_table);
+    manifest_file->write('},\ntrue');
+    manifest_file->close();
+
+    return true;
+}
+
+// Load and return package info table from the distinfo_file file.
+// If file not present, return nil.
+function load_distinfo(distinfo_file) {
+    assert(type(distinfo_file) == "string", "manifest.load_distinfo: Argument 'distinfo_file' is not a string.");
+    distinfo_file = sys.abs_path(distinfo_file);
+
+    // load the distinfo file
+    var distinfo_env = {};
+    var status, ret = secure_loadfile(distinfo_file, distinfo_env);
+    if( ! status ) { return null, "Error when loading package info: " .. ret; }
+
+    return distinfo_env;
+}
+
+// Save distinfo table to the 'file'
+function save_distinfo(distinfo_table, file) {
+    assert(type(distinfo_table) == "table", "manifest.save_distinfo: Argument 'distinfo_table' is not a table.");
+    assert(type(file) == "string", "manifest.save_distinfo: Argument 'file' is not a string.");
+    file = sys.abs_path(file);
+
+    // Print table 'tbl' to io stream 'file'.
+    var function print_table(file, tbl, in_nested_table) {
+        for( k, v in pairs(tbl) ) {
+            // print key
+            if( type(k) != "number" ) {
+                file->write(k .. " = ");
+            }
+            // print value
+            if( type(v) == "table" ) {
+                file->write("{\n");
+                print_table(file, v, true);
+                file->write("}\n");
+            } else if( type(v) == "string" ) {
+                if( in_nested_table ) {
+                    file->write('[[' .. v .. ']]');
+                } else {
+                    file->write('"' .. v .. '"');
+                }
+            } else {
+                file->write(v);
+            }
+            if( in_nested_table ) {
+                file->write(",");
+            }
+            file->write("\n");
+        }
+    }
+
+    var distinfo_file = io.open(file, "w");
+    if( ! distinfo_file ) { return null, "Error when saving dist-info table: cannot open the file '" .. file .. "'."; }
+
+    print_table(distinfo_file, distinfo_table);
+    distinfo_file->close();
+
+    return true;
+}

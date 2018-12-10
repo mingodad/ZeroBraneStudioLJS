@@ -1,0 +1,90 @@
+// Recursive object dumper, for debugging.
+// (c) 2010 David Manura, MIT License.
+
+var M = {};
+
+// My own object dumper.
+// Intended for debugging, not serialization, with compact formatting.
+// Robust against recursion.
+// Renders Metalua table tag fields specially {tag=X, ...} --> "`X{...}".
+// On first call, only pass parameter o.
+// CATEGORY: AST debug
+var ignore_keys_ = {lineinfo=true};
+var norecurse_keys_ = {parent=true, ast=true};
+var function dumpstring_key_(k, isseen, newindent) {
+  var ks = type(k) == 'string' && k->match('^[%a_][%w_]*$') && k ||
+             '[' .. M.dumpstring(k, isseen, newindent) .. ']';
+  return ks;
+}
+var function sort_keys_(a, b) {
+  if( type(a) == 'number' && type(b) == 'number' ) {
+    return a < b;
+  } else if( type(a) == 'number' ) {
+    return false;
+  } else if( type(b) == 'number' ) {
+    return true;
+  } else if( type(a) == 'string' && type(b) == 'string' ) {
+    return a < b;
+  } else {
+    return tostring(a) < tostring(b); // arbitrary
+  }
+}
+function M.dumpstring(o, isseen, indent, key) {
+  isseen = isseen || {};
+  indent = indent || '';
+
+  if( type(o) == 'table' ) {
+    if( isseen[o] || norecurse_keys_[key] ) {
+      return (type(o.tag) == 'string' && '`' .. o.tag .. ':' || '') .. tostring(o);
+    } else { isseen[o] = true; } // avoid recursion
+
+    var used = {};
+
+    var tag = o.tag;
+    var s = '{';
+    if( type(o.tag) == 'string' ) {
+      s = '`' .. tag .. s; used['tag'] = true;
+    }
+    var newindent = indent .. '  ';
+
+    var ks = {}; for( k in pairs(o) ) { ks[#ks+1] = k; }
+    table.sort(ks, sort_keys_);
+    //for i,k in ipairs(ks) do print ('keys', k) end
+
+    var forcenummultiline;
+    for( k in pairs(o) ) {
+       if( type(k) == 'number' && type(o[k]) == 'table' ) { forcenummultiline = true; }
+    }
+
+    // inline elements
+    for( _,k in ipairs(ks) ) {
+      if( used[k] ) { // skip
+      } else if( ignore_keys_[k] ) { used[k] = true;
+      } else if( (type(k) != 'number' || ! forcenummultiline) &&
+              type(k) != 'table' && (type(o[k]) != 'table' || norecurse_keys_[k])
+      ) {
+        s = s .. dumpstring_key_(k, isseen, newindent) .. '=' .. M.dumpstring(o[k], isseen, newindent, k) .. ', ';
+        used[k] = true;
+      }
+    }
+
+    // elements on separate lines
+    var done;
+    for( _,k in ipairs(ks) ) {
+      if( ! used[k] ) {
+        if( ! done ) { s = s .. '\n'; done = true; }
+        s = s .. newindent .. dumpstring_key_(k, isseen) .. '=' .. M.dumpstring(o[k], isseen, newindent, k) .. ',\n';
+      }
+    }
+    s = s->gsub(',(%s*)$', '%1');
+    s = s .. (done && indent || '') .. '}';
+    return s;
+  } else if( type(o) == 'string' ) {
+    return string.format('%q', o);
+  } else {
+    return tostring(o);
+  }
+}
+
+return M;
+
